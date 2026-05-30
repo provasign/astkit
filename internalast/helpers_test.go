@@ -1,3 +1,4 @@
+package internalast
 package internalast_test
 
 import (
