@@ -65,7 +65,7 @@ func TestNodeText_NodeSpan(t *testing.T) {
 	if internalast.NodeText(nil, src) != "" {
 		t.Error("nil NodeText must be empty")
 	}
-	if (internalast.NodeSpan(nil) != internalast.NodeSpan(nil)) {
+	if internalast.NodeSpan(nil) != internalast.NodeSpan(nil) {
 		t.Error("zero span comparison broken")
 	}
 }
