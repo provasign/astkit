@@ -1,4 +1,3 @@
-package astkit
 package astkit_test
 
 import (
