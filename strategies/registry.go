@@ -40,9 +40,9 @@ func Default() *astkit.Registry {
 
 type goStrategy struct{}
 
-func NewGo() *goStrategy                              { return &goStrategy{} }
-func (g *goStrategy) Language() astkit.LanguageKey   { return astkit.LangGo }
-func (g *goStrategy) Extensions() []string           { return []string{".go"} }
+func NewGo() *goStrategy                           { return &goStrategy{} }
+func (g *goStrategy) Language() astkit.LanguageKey { return astkit.LangGo }
+func (g *goStrategy) Extensions() []string         { return []string{".go"} }
 func (g *goStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
 	if tree == nil {
 		return nil, nil
@@ -167,9 +167,9 @@ func (p *pythonStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit
 
 type javaStrategy struct{}
 
-func NewJava() *javaStrategy                          { return &javaStrategy{} }
-func (j *javaStrategy) Language() astkit.LanguageKey  { return astkit.LangJava }
-func (j *javaStrategy) Extensions() []string          { return []string{".java"} }
+func NewJava() *javaStrategy                         { return &javaStrategy{} }
+func (j *javaStrategy) Language() astkit.LanguageKey { return astkit.LangJava }
+func (j *javaStrategy) Extensions() []string         { return []string{".java"} }
 func (j *javaStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
 	if tree == nil {
 		return nil, nil
@@ -201,9 +201,9 @@ func (j *javaStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.I
 
 type rustStrategy struct{}
 
-func NewRust() *rustStrategy                          { return &rustStrategy{} }
-func (r *rustStrategy) Language() astkit.LanguageKey  { return astkit.LangRust }
-func (r *rustStrategy) Extensions() []string          { return []string{".rs"} }
+func NewRust() *rustStrategy                         { return &rustStrategy{} }
+func (r *rustStrategy) Language() astkit.LanguageKey { return astkit.LangRust }
+func (r *rustStrategy) Extensions() []string         { return []string{".rs"} }
 func (r *rustStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
 	if tree == nil {
 		return nil, nil
@@ -336,9 +336,9 @@ func (c *cStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.Impo
 
 type csharpStrategy struct{}
 
-func NewCSharp() *csharpStrategy                          { return &csharpStrategy{} }
-func (c *csharpStrategy) Language() astkit.LanguageKey   { return astkit.LangCSharp }
-func (c *csharpStrategy) Extensions() []string           { return []string{".cs"} }
+func NewCSharp() *csharpStrategy                       { return &csharpStrategy{} }
+func (c *csharpStrategy) Language() astkit.LanguageKey { return astkit.LangCSharp }
+func (c *csharpStrategy) Extensions() []string         { return []string{".cs"} }
 func (c *csharpStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
 	if tree == nil {
 		return nil, nil
@@ -369,9 +369,9 @@ func (c *csharpStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit
 
 type phpStrategy struct{}
 
-func NewPHP() *phpStrategy                            { return &phpStrategy{} }
-func (p *phpStrategy) Language() astkit.LanguageKey  { return astkit.LangPHP }
-func (p *phpStrategy) Extensions() []string          { return []string{".php"} }
+func NewPHP() *phpStrategy                          { return &phpStrategy{} }
+func (p *phpStrategy) Language() astkit.LanguageKey { return astkit.LangPHP }
+func (p *phpStrategy) Extensions() []string         { return []string{".php"} }
 func (p *phpStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
 	if tree == nil {
 		return nil, nil

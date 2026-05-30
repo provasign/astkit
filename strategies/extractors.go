@@ -9,10 +9,6 @@ import (
 	"github.com/tabladrum/grove-suite/astkit/internalast"
 )
 
-
-
-
-
 // ─── Go ───────────────────────────────────────────────────────────────────────
 
 // extractGoNodes walks the top-level children of a Go source_file node.
@@ -59,8 +55,8 @@ func goFuncSym(n *sitter.Node, filePath, blobSHA string, src []byte, imports []s
 		QualifiedName:  name,
 		Signature:      funcSig(n, src),
 		Span:           internalast.NodeSpan(n),
-		Exported:        internalast.IsCapitalized(name),
-		Body:        raw,
+		Exported:       internalast.IsCapitalized(name),
+		Body:           raw,
 		TypeParameters: goTypeParameters(n, src),
 		CallSites:      goCallSites(body, src),
 	}
@@ -81,9 +77,9 @@ func goMethodSym(n *sitter.Node, filePath, blobSHA string, src []byte, imports [
 		QualifiedName:  name,
 		Signature:      funcSig(n, src),
 		Span:           internalast.NodeSpan(n),
-		Exported:        internalast.IsCapitalized(name),
-		Body:        raw,
-		ParentName:   receiver,
+		Exported:       internalast.IsCapitalized(name),
+		Body:           raw,
+		ParentName:     receiver,
 		TypeParameters: goTypeParameters(n, src),
 		CallSites:      goCallSites(body, src),
 	}
@@ -151,8 +147,8 @@ func goTypeDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			QualifiedName: name,
 			Signature:     internalast.FirstLine(raw),
 			Span:          internalast.NodeSpan(spec),
-			Exported:       internalast.IsCapitalized(name),
-			Body:       raw,
+			Exported:      internalast.IsCapitalized(name),
+			Body:          raw,
 		})
 	}
 	return out
@@ -178,8 +174,8 @@ func goConstDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports [
 			QualifiedName: name,
 			Signature:     strings.TrimSpace(raw),
 			Span:          internalast.NodeSpan(spec),
-			Exported:       internalast.IsCapitalized(name),
-			Body:       raw,
+			Exported:      internalast.IsCapitalized(name),
+			Body:          raw,
 		})
 	}
 	return out
@@ -206,8 +202,8 @@ func goVarDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []s
 				QualifiedName: name,
 				Signature:     internalast.FirstLine(raw),
 				Span:          internalast.NodeSpan(spec),
-				Exported:       internalast.IsCapitalized(name),
-				Body:       raw,
+				Exported:      internalast.IsCapitalized(name),
+				Body:          raw,
 			})
 		}
 	}
@@ -306,9 +302,9 @@ func jsClassDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 		QualifiedName:  className,
 		Signature:      internalast.FirstLine(raw),
 		Span:           internalast.NodeSpan(n),
-		Exported:        exported,
-		Body:        raw,
-		ParentName:   parentClass,
+		Exported:       exported,
+		Body:           raw,
+		ParentName:     parentClass,
 		Modifiers:      jsModifiers(n, src),
 		TypeParameters: jsTypeParameters(n, src),
 		Annotations:    jsDecorators(n, src),
@@ -338,9 +334,9 @@ func jsMethodDef(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 		QualifiedName:  name,
 		Signature:      funcSig(n, src),
 		Span:           internalast.NodeSpan(n),
-		Exported:        false, // methods are accessed via their class, not exported directly
-		Body:        raw,
-		ParentName:   parentClass,
+		Exported:       false, // methods are accessed via their class, not exported directly
+		Body:           raw,
+		ParentName:     parentClass,
 		Modifiers:      jsModifiers(n, src),
 		TypeParameters: jsTypeParameters(n, src),
 		Annotations:    jsDecorators(n, src),
@@ -362,9 +358,9 @@ func jsFieldDef(n *sitter.Node, filePath, blobSHA, language string, src []byte, 
 		QualifiedName: name,
 		Signature:     internalast.FirstLine(raw),
 		Span:          internalast.NodeSpan(n),
-		Exported:       false,
-		Body:       raw,
-		ParentName:  parentClass,
+		Exported:      false,
+		Body:          raw,
+		ParentName:    parentClass,
 		Modifiers:     jsModifiers(n, src),
 		Annotations:   jsDecorators(n, src),
 	})
@@ -392,9 +388,9 @@ func jsNamedSym(n *sitter.Node, field, filePath, blobSHA, language string, src [
 		QualifiedName:  name,
 		Signature:      funcSig(n, src),
 		Span:           internalast.NodeSpan(n),
-		Exported:        exported,
-		Body:        raw,
-		ParentName:   parentClass,
+		Exported:       exported,
+		Body:           raw,
+		ParentName:     parentClass,
 		Modifiers:      jsModifiers(n, src),
 		TypeParameters: jsTypeParameters(n, src),
 		Annotations:    jsDecorators(n, src),
@@ -452,9 +448,9 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 				QualifiedName:  name,
 				Signature:      internalast.FirstLine(raw),
 				Span:           internalast.NodeSpan(decl),
-				Exported:        exported,
-				Body:        raw,
-				ParentName:   parentClass,
+				Exported:       exported,
+				Body:           raw,
+				ParentName:     parentClass,
 				TypeParameters: jsTypeParameters(valueNode, src),
 				CallSites:      jsCallSites(body, src),
 			})
@@ -503,9 +499,9 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 			QualifiedName: name,
 			Signature:     internalast.FirstLine(raw),
 			Span:          internalast.NodeSpan(n),
-			Exported:       !strings.HasPrefix(name, "_"),
-			Body:       raw,
-			ParentName:  parentClass,
+			Exported:      !strings.HasPrefix(name, "_"),
+			Body:          raw,
+			ParentName:    parentClass,
 			Modifiers:     pythonModifiers(name),
 			Annotations:   decorators,
 			CallSites:     pythonCallSites(body, src),
@@ -523,9 +519,9 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 			QualifiedName: className,
 			Signature:     internalast.FirstLine(raw),
 			Span:          internalast.NodeSpan(n),
-			Exported:       !strings.HasPrefix(className, "_"),
-			Body:       raw,
-			ParentName:  parentClass,
+			Exported:      !strings.HasPrefix(className, "_"),
+			Body:          raw,
+			ParentName:    parentClass,
 			Modifiers:     pythonModifiers(className),
 			Annotations:   decorators,
 		})
@@ -609,9 +605,9 @@ func javaTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 		QualifiedName:  className,
 		Signature:      sig,
 		Span:           internalast.NodeSpan(n),
-		Exported:        exports,
-		Body:        raw,
-		ParentName:   parentClass,
+		Exported:       exports,
+		Body:           raw,
+		ParentName:     parentClass,
 		Modifiers:      modifiers,
 		TypeParameters: javaTypeParameters(n, src),
 		Annotations:    javaAnnotations(n, src),
@@ -644,9 +640,9 @@ func javaMethodDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA st
 		QualifiedName:  name,
 		Signature:      sig,
 		Span:           internalast.NodeSpan(n),
-		Exported:        exports,
-		Body:        raw,
-		ParentName:   parentClass,
+		Exported:       exports,
+		Body:           raw,
+		ParentName:     parentClass,
 		Modifiers:      modifiers,
 		TypeParameters: javaTypeParameters(n, src),
 		Annotations:    javaAnnotations(n, src),
@@ -679,9 +675,9 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 		QualifiedName: name,
 		Signature:     sig,
 		Span:          internalast.NodeSpan(n),
-		Exported:       exports,
-		Body:       raw,
-		ParentName:  parentClass,
+		Exported:      exports,
+		Body:          raw,
+		ParentName:    parentClass,
 		Modifiers:     modifiers,
 		Annotations:   javaAnnotations(n, src),
 	})
@@ -723,9 +719,9 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 				QualifiedName:  name,
 				Signature:      funcSig(n, src),
 				Span:           internalast.NodeSpan(n),
-				Exported:        strings.HasPrefix(strings.TrimSpace(raw), "pub"),
-				Body:        raw,
-				ParentName:   implType,
+				Exported:       strings.HasPrefix(strings.TrimSpace(raw), "pub"),
+				Body:           raw,
+				ParentName:     implType,
 				Modifiers:      rustModifiers(n, src),
 				TypeParameters: rustTypeParameters(n, src),
 				Annotations:    rustAttributes(n, src),
@@ -759,8 +755,8 @@ func rustNamedItem(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA str
 		QualifiedName:  name,
 		Signature:      internalast.FirstLine(raw),
 		Span:           internalast.NodeSpan(n),
-		Exported:        strings.HasPrefix(strings.TrimSpace(raw), "pub"),
-		Body:        raw,
+		Exported:       strings.HasPrefix(strings.TrimSpace(raw), "pub"),
+		Body:           raw,
 		Modifiers:      rustModifiers(n, src),
 		TypeParameters: rustTypeParameters(n, src),
 		Annotations:    rustAttributes(n, src),
@@ -794,9 +790,9 @@ func rustStructFields(n *sitter.Node, filePath, blobSHA string, src []byte, impo
 			QualifiedName: name,
 			Signature:     internalast.FirstLine(raw),
 			Span:          internalast.NodeSpan(fd),
-			Exported:       strings.HasPrefix(strings.TrimSpace(raw), "pub"),
-			Body:       raw,
-			ParentName:  structName,
+			Exported:      strings.HasPrefix(strings.TrimSpace(raw), "pub"),
+			Body:          raw,
+			ParentName:    structName,
 			Modifiers:     rustModifiers(fd, src),
 			Annotations:   rustAttributes(fd, src),
 		})
@@ -890,9 +886,9 @@ func cFuncSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, im
 		QualifiedName: name,
 		Signature:     funcSig(n, src),
 		Span:          internalast.NodeSpan(n),
-		Exported:       !strings.HasPrefix(name, "_"),
-		Body:       raw,
-		ParentName:  parentClass,
+		Exported:      !strings.HasPrefix(name, "_"),
+		Body:          raw,
+		ParentName:    parentClass,
 	}
 }
 
@@ -940,8 +936,8 @@ func cDeclarationSyms(n *sitter.Node, filePath, blobSHA, language string, src []
 				QualifiedName: name,
 				Signature:     strings.TrimSpace(raw),
 				Span:          internalast.NodeSpan(n),
-				Exported:       !strings.HasPrefix(name, "_"),
-				Body:       raw,
+				Exported:      !strings.HasPrefix(name, "_"),
+				Body:          raw,
 			})
 		}
 	}
@@ -987,8 +983,8 @@ func cTypedefSyms(n *sitter.Node, filePath, blobSHA, language string, src []byte
 		QualifiedName: name,
 		Signature:     internalast.FirstLine(raw),
 		Span:          internalast.NodeSpan(n),
-		Exported:       true,
-		Body:       raw,
+		Exported:      true,
+		Body:          raw,
 	}}
 }
 
@@ -1005,8 +1001,8 @@ func cTaggedTypeSym(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA, l
 		QualifiedName: name,
 		Signature:     internalast.FirstLine(raw),
 		Span:          internalast.NodeSpan(n),
-		Exported:       true,
-		Body:       raw,
+		Exported:      true,
+		Body:          raw,
 	}
 }
 
@@ -1023,8 +1019,8 @@ func cppClassSym(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 		QualifiedName: className,
 		Signature:     internalast.FirstLine(raw),
 		Span:          internalast.NodeSpan(n),
-		Exported:       true,
-		Body:       raw,
+		Exported:      true,
+		Body:          raw,
 	}}
 	// Extract member functions from the class body.
 	body := n.ChildByFieldName("body")
@@ -1058,8 +1054,8 @@ func cppNamespaceSym(n *sitter.Node, filePath, blobSHA, language string, src []b
 		QualifiedName: name,
 		Signature:     internalast.FirstLine(raw),
 		Span:          internalast.NodeSpan(n),
-		Exported:       true,
-		Body:       raw,
+		Exported:      true,
+		Body:          raw,
 	}
 }
 
@@ -1110,8 +1106,8 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 				QualifiedName: nsName,
 				Signature:     internalast.FirstLine(raw),
 				Span:          internalast.NodeSpan(n),
-				Exported:       true,
-				Body:       raw,
+				Exported:      true,
+				Body:          raw,
 			})
 			if body := n.ChildByFieldName("body"); body != nil {
 				csVisit(body, filePath, blobSHA, src, imports, "", out)
@@ -1148,9 +1144,9 @@ func csTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA string
 		QualifiedName:  name,
 		Signature:      internalast.FirstLine(raw),
 		Span:           internalast.NodeSpan(n),
-		Exported:        csIsExported(modifiers),
-		Body:        raw,
-		ParentName:   parentClass,
+		Exported:       csIsExported(modifiers),
+		Body:           raw,
+		ParentName:     parentClass,
 		Modifiers:      modifiers,
 		TypeParameters: csTypeParams(n, src),
 		Annotations:    csAttributes(n, src),
@@ -1178,9 +1174,9 @@ func csMethodDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports 
 		QualifiedName:  name,
 		Signature:      funcSig(n, src),
 		Span:           internalast.NodeSpan(n),
-		Exported:        csIsExported(modifiers),
-		Body:        raw,
-		ParentName:   parentClass,
+		Exported:       csIsExported(modifiers),
+		Body:           raw,
+		ParentName:     parentClass,
 		Modifiers:      modifiers,
 		TypeParameters: csTypeParams(n, src),
 		Annotations:    csAttributes(n, src),
@@ -1201,9 +1197,9 @@ func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, import
 		QualifiedName: name,
 		Signature:     internalast.FirstLine(raw),
 		Span:          internalast.NodeSpan(n),
-		Exported:       csIsExported(modifiers),
-		Body:       raw,
-		ParentName:  parentClass,
+		Exported:      csIsExported(modifiers),
+		Body:          raw,
+		ParentName:    parentClass,
 		Modifiers:     modifiers,
 		Annotations:   csAttributes(n, src),
 	})
@@ -1228,9 +1224,9 @@ func csFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports [
 			QualifiedName: name,
 			Signature:     internalast.FirstLine(raw),
 			Span:          internalast.NodeSpan(child),
-			Exported:       csIsExported(modifiers),
-			Body:       raw,
-			ParentName:  parentClass,
+			Exported:      csIsExported(modifiers),
+			Body:          raw,
+			ParentName:    parentClass,
 			Modifiers:     modifiers,
 		})
 	}
@@ -1341,9 +1337,9 @@ func phpFuncSym(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 		QualifiedName: name,
 		Signature:     funcSig(n, src),
 		Span:          internalast.NodeSpan(n),
-		Exported:       phpIsExported(n, src),
-		Body:       raw,
-		ParentName:  parentClass,
+		Exported:      phpIsExported(n, src),
+		Body:          raw,
+		ParentName:    parentClass,
 		Modifiers:     phpModifiers(n, src),
 	}
 }
@@ -1361,8 +1357,8 @@ func phpClassDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 		QualifiedName: className,
 		Signature:     internalast.FirstLine(raw),
 		Span:          internalast.NodeSpan(n),
-		Exported:       true,
-		Body:       raw,
+		Exported:      true,
+		Body:          raw,
 		Modifiers:     phpModifiers(n, src),
 	})
 	body := n.ChildByFieldName("body")
@@ -1399,7 +1395,6 @@ func phpIsExported(n *sitter.Node, src []byte) bool {
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
-
 // funcSig returns the function/method signature without the body.
 func funcSig(n *sitter.Node, src []byte) string {
 	body := n.ChildByFieldName("body")
@@ -1415,5 +1410,3 @@ func funcSig(n *sitter.Node, src []byte) string {
 	sig = strings.TrimRight(sig, " \t\n{")
 	return strings.TrimSpace(sig)
 }
-
-
