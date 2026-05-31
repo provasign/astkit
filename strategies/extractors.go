@@ -140,7 +140,7 @@ func goTypeDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 				kind = astkit.KindInterface
 			}
 		}
-		raw := spec.Content(src)
+		raw := goStandaloneDecl("type", spec.Content(src))
 		out = append(out, astkit.Symbol{
 			Kind:          kind,
 			Name:          name,
@@ -167,7 +167,7 @@ func goConstDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports [
 			continue
 		}
 		name := nameNode.Content(src)
-		raw := spec.Content(src)
+		raw := goStandaloneDecl("const", spec.Content(src))
 		out = append(out, astkit.Symbol{
 			Kind:          astkit.KindConst,
 			Name:          name,
@@ -194,7 +194,7 @@ func goVarDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []s
 		if nameNode == nil {
 			continue
 		}
-		raw := spec.Content(src)
+		raw := goStandaloneDecl("var", spec.Content(src))
 		for _, name := range goIdentifierNames(nameNode, src) {
 			out = append(out, astkit.Symbol{
 				Kind:          astkit.KindVariable,
@@ -208,6 +208,14 @@ func goVarDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []s
 		}
 	}
 	return out
+}
+
+func goStandaloneDecl(keyword, raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, keyword+" ") || strings.HasPrefix(trimmed, keyword+"(") {
+		return raw
+	}
+	return keyword + " " + raw
 }
 
 // goIdentifierNames extracts one or more identifier names from a node that may

@@ -148,6 +148,22 @@ var pkg = "x"
 			}
 		}
 	}
+	for _, s := range syms {
+		switch s.QualifiedName {
+		case "Greeter":
+			if !strings.HasPrefix(s.Body, "type Greeter struct") {
+				t.Fatalf("Greeter body = %q", s.Body)
+			}
+		case "Version":
+			if !strings.HasPrefix(s.Body, "const Version") {
+				t.Fatalf("Version body = %q", s.Body)
+			}
+		case "pkg":
+			if !strings.HasPrefix(s.Body, "var pkg") {
+				t.Fatalf("pkg body = %q", s.Body)
+			}
+		}
+	}
 }
 
 func TestExtract_GoImportGroups(t *testing.T) {
