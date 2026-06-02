@@ -12,8 +12,8 @@ import (
 
 	sitter "github.com/smacker/go-tree-sitter"
 
-	"github.com/tabladrum/grove-suite/astkit"
-	"github.com/tabladrum/grove-suite/astkit/internalast"
+	"github.com/provasign/astkit"
+	"github.com/provasign/astkit/internalast"
 )
 
 // Default returns a Registry pre-populated with every strategy astkit ships.

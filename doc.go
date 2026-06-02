@@ -1,5 +1,5 @@
 // Package astkit is the shared code-intelligence layer used by every product
-// in grove-suite.
+// in the Provasign toolchain.
 //
 // It owns:
 //

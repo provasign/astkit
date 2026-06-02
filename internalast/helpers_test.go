@@ -7,7 +7,7 @@ import (
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/golang"
 
-	"github.com/tabladrum/grove-suite/astkit/internalast"
+	"github.com/provasign/astkit/internalast"
 )
 
 func parseGo(t *testing.T, src string) (*sitter.Tree, []byte) {

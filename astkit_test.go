@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/astkit"
+	"github.com/provasign/astkit"
 )
 
 func TestDetectLanguage(t *testing.T) {

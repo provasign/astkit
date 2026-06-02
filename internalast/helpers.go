@@ -6,7 +6,7 @@ package internalast
 import (
 	sitter "github.com/smacker/go-tree-sitter"
 
-	"github.com/tabladrum/grove-suite/astkit"
+	"github.com/provasign/astkit"
 )
 
 // WalkChildren invokes fn on every immediate child of n.
