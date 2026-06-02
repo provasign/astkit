@@ -1,4 +1,4 @@
-module github.com/tabladrum/grove-suite/astkit
+module github.com/provasign/astkit
 
 go 1.26
 

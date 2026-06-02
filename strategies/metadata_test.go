@@ -3,7 +3,7 @@ package strategies_test
 import (
 	"testing"
 
-	"github.com/tabladrum/grove-suite/astkit"
+	"github.com/provasign/astkit"
 )
 
 // These tests exercise the per-language metadata edge paths (decorators,

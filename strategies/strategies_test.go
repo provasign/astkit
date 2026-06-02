@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/astkit"
-	"github.com/tabladrum/grove-suite/astkit/strategies"
+	"github.com/provasign/astkit"
+	"github.com/provasign/astkit/strategies"
 )
 
 // extract is a small helper that parses src under lang and runs the
