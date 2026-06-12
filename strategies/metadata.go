@@ -182,6 +182,28 @@ func argToken(c *sitter.Node, src []byte) string {
 		return "#double"
 	case "true", "false":
 		return "#boolean"
+	case "cast_expression":
+		// "(char[]) obj" — the canonical Java overload disambiguator.
+		if t := c.ChildByFieldName("type"); t != nil {
+			typ := strings.TrimSpace(string(t.Content(src)))
+			if i := strings.IndexByte(typ, '<'); i >= 0 {
+				typ = typ[:i]
+			}
+			return "#" + typ
+		}
+	case "field_access":
+		// array.length is always int.
+		if f := c.ChildByFieldName("field"); f != nil && string(f.Content(src)) == "length" {
+			return "#int"
+		}
+	case "method_invocation", "call_expression", "call":
+		// Consumers can resolve the called function's return type.
+		if n := c.ChildByFieldName("name"); n != nil {
+			return "call:" + string(n.Content(src))
+		}
+		if fn := c.ChildByFieldName("function"); fn != nil && fn.Type() == "identifier" {
+			return "call:" + string(fn.Content(src))
+		}
 	}
 	return ""
 }
