@@ -43,6 +43,10 @@ type CallSite struct {
 	// mean "no arguments" or "unknown" for older indexes; consumers treat
 	// it as advisory). Lets graph consumers disambiguate overloads.
 	Argc int `json:"argc,omitempty"`
+	// Args holds each argument's identifier when the argument is a bare
+	// identifier, "" otherwise. With local type inference downstream, this
+	// disambiguates same-arity overloads (isEmpty(char[]) vs isEmpty(long[])).
+	Args []string `json:"args,omitempty"`
 }
 
 // Symbol is the canonical, persistence-agnostic representation of a single

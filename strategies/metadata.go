@@ -101,6 +101,7 @@ func collectCallSites(body *sitter.Node, src []byte, spec callSpec) []astkit.Cal
 						Callee: callee,
 						Line:   int(n.StartPoint().Row) + 1,
 						Argc:   callArgc(n),
+						Args:   callArgs(n, src),
 					})
 				}
 				break
@@ -121,6 +122,29 @@ func callArgc(call *sitter.Node) int {
 		return 0
 	}
 	return int(args.NamedChildCount())
+}
+
+// callArgs returns each argument's identifier text when the argument is a
+// bare identifier, "" otherwise. Nil when no argument is an identifier.
+func callArgs(call *sitter.Node, src []byte) []string {
+	args := call.ChildByFieldName("arguments")
+	if args == nil {
+		return nil
+	}
+	n := int(args.NamedChildCount())
+	out := make([]string, n)
+	any := false
+	for i := 0; i < n; i++ {
+		c := args.NamedChild(i)
+		if c != nil && c.Type() == "identifier" {
+			out[i] = string(c.Content(src))
+			any = true
+		}
+	}
+	if !any {
+		return nil
+	}
+	return out
 }
 
 func goCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
