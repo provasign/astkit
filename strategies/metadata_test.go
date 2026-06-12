@@ -314,7 +314,7 @@ func TestJS_CallSitesMemberAndNew(t *testing.T) {
 			for _, c := range s.CallSites {
 				callees[c.Callee] = true
 			}
-			for _, want := range []string{"method", "Thing", "helper"} {
+			for _, want := range []string{"obj.method", "Thing", "helper"} {
 				if !callees[want] {
 					t.Errorf("JS callee %q missing in %v", want, callees)
 				}
@@ -389,4 +389,61 @@ func mapKeys(m map[string]astkit.Symbol) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// CallSite.Callee must honor the documented "Receiver.callee" form so graph
+// consumers can do receiver-aware call resolution.
+func TestCallSites_QualifiersPreserved(t *testing.T) {
+	src := `package x
+func (r JSON) Render(w W) {
+	r.WriteContentType(w)
+	json.Marshal(obj)
+	c.Writer.Flush()
+	c.Writer.Header().Set("k", "v")
+	bare()
+}`
+	syms, _ := extract(t, astkit.LangGo, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee] = true
+		}
+	}
+	for _, want := range []string{"r.WriteContentType", "json.Marshal", "Writer.Flush", "Header().Set", "bare"} {
+		if !got[want] {
+			t.Errorf("missing call site %q; got %v", want, got)
+		}
+	}
+}
+
+func TestCallSites_QualifiersPython(t *testing.T) {
+	src := "class A:\n    def f(self):\n        self.save()\n        self.db.conn.commit()\n        g()\n"
+	syms, _ := extract(t, astkit.LangPython, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee] = true
+		}
+	}
+	for _, want := range []string{"self.save", "conn.commit", "g"} {
+		if !got[want] {
+			t.Errorf("missing call site %q; got %v", want, got)
+		}
+	}
+}
+
+func TestCallSites_QualifiersJS(t *testing.T) {
+	src := "class A { f() { this.save(); res.status(200).json(x); g(); } }"
+	syms, _ := extract(t, astkit.LangJavaScript, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee] = true
+		}
+	}
+	for _, want := range []string{"this.save", "status().json", "g"} {
+		if !got[want] {
+			t.Errorf("missing call site %q; got %v", want, got)
+		}
+	}
 }

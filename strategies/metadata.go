@@ -22,6 +22,67 @@ type callSpec struct {
 	calleeFn  func(call *sitter.Node, src []byte) string
 }
 
+// qualifierName reduces a callee's receiver operand to one identifier so
+// CallSite.Callee can honor the documented "Receiver.callee" form:
+//
+//	r.Write(b)            → "r"
+//	c.Writer.Flush()      → "Writer"  (last selector segment)
+//	c.Writer.Header().Set → "Header()" (receiver is a call result)
+//
+// Unknown operand shapes (index expressions, parenthesized expressions)
+// return "" and the callee stays bare — same behavior as before.
+// selectorTypes maps this grammar's selector node type to its name field;
+// callTypes maps its call node type to its function field.
+func qualifierName(op *sitter.Node, src []byte, identTypes []string, selectorTypes, callTypes map[string]string) string {
+	if op == nil {
+		return ""
+	}
+	t := op.Type()
+	for _, it := range identTypes {
+		if t == it {
+			return string(op.Content(src))
+		}
+	}
+	if nameField, ok := selectorTypes[t]; ok {
+		if f := op.ChildByFieldName(nameField); f != nil {
+			return string(f.Content(src))
+		}
+		return ""
+	}
+	if fnField, ok := callTypes[t]; ok {
+		inner := op.ChildByFieldName(fnField)
+		if inner == nil {
+			return ""
+		}
+		if name := qualifierName(inner, src, identTypes, selectorTypes, callTypes); name != "" {
+			return name + "()"
+		}
+		// The inner function is itself a selector: reuse its name segment.
+		for selType, nameField := range selectorTypes {
+			if inner.Type() == selType {
+				if f := inner.ChildByFieldName(nameField); f != nil {
+					return string(f.Content(src)) + "()"
+				}
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+func joinQualified(qualifier, name string) string {
+	if qualifier == "" {
+		return name
+	}
+	// Identifier tokens can't contain whitespace; reject anything that
+	// slipped through except the deliberate "name()" call-result marker.
+	bare := strings.TrimSuffix(qualifier, "()")
+	if strings.ContainsAny(bare, " \t\n().") {
+		return name
+	}
+	return qualifier + "." + name
+}
+
 func collectCallSites(body *sitter.Node, src []byte, spec callSpec) []astkit.CallSite {
 	if body == nil {
 		return nil
@@ -53,6 +114,9 @@ func collectCallSites(body *sitter.Node, src []byte, spec callSpec) []astkit.Cal
 }
 
 func goCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
+	identTypes := []string{"identifier"}
+	selectorTypes := map[string]string{"selector_expression": "field"}
+	callTypes := map[string]string{"call_expression": "function"}
 	return collectCallSites(body, src, callSpec{
 		nodeTypes: []string{"call_expression"},
 		calleeFn: func(call *sitter.Node, src []byte) string {
@@ -66,7 +130,8 @@ func goCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			case "selector_expression":
 				field := fn.ChildByFieldName("field")
 				if field != nil {
-					return field.Content(src)
+					qual := qualifierName(fn.ChildByFieldName("operand"), src, identTypes, selectorTypes, callTypes)
+					return joinQualified(qual, string(field.Content(src)))
 				}
 			}
 			return ""
@@ -92,7 +157,11 @@ func jsCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			case "member_expression":
 				prop := fn.ChildByFieldName("property")
 				if prop != nil {
-					return prop.Content(src)
+					qual := qualifierName(fn.ChildByFieldName("object"), src,
+						[]string{"identifier", "property_identifier", "this"},
+						map[string]string{"member_expression": "property"},
+						map[string]string{"call_expression": "function"})
+					return joinQualified(qual, string(prop.Content(src)))
 				}
 			}
 			return ""
@@ -114,7 +183,11 @@ func pythonCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			case "attribute":
 				attr := fn.ChildByFieldName("attribute")
 				if attr != nil {
-					return attr.Content(src)
+					qual := qualifierName(fn.ChildByFieldName("object"), src,
+						[]string{"identifier"},
+						map[string]string{"attribute": "attribute"},
+						map[string]string{"call": "function"})
+					return joinQualified(qual, string(attr.Content(src)))
 				}
 			}
 			return ""
@@ -135,7 +208,11 @@ func javaCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			}
 			name := call.ChildByFieldName("name")
 			if name != nil {
-				return name.Content(src)
+				qual := qualifierName(call.ChildByFieldName("object"), src,
+					[]string{"identifier", "this"},
+					map[string]string{"field_access": "field"},
+					map[string]string{"method_invocation": "name"})
+				return joinQualified(qual, string(name.Content(src)))
 			}
 			return ""
 		},
@@ -163,7 +240,11 @@ func rustCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			case "field_expression":
 				field := fn.ChildByFieldName("field")
 				if field != nil {
-					return field.Content(src)
+					qual := qualifierName(fn.ChildByFieldName("value"), src,
+						[]string{"identifier", "self"},
+						map[string]string{"field_expression": "field"},
+						map[string]string{"call_expression": "function"})
+					return joinQualified(qual, string(field.Content(src)))
 				}
 			case "scoped_identifier":
 				name := fn.ChildByFieldName("name")
