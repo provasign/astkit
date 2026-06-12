@@ -261,7 +261,7 @@ func jsVisitChild(n *sitter.Node, filePath, blobSHA, language string, src []byte
 		if sym := jsNamedSym(n, "name", filePath, blobSHA, language, src, imports, astkit.KindFunction, parentClass, exported); sym != nil {
 			*out = append(*out, *sym)
 		}
-	case "class_declaration":
+	case "class_declaration", "abstract_class_declaration":
 		jsClassDecl(n, filePath, blobSHA, language, src, imports, parentClass, exported, out)
 	case "interface_declaration": // TypeScript / TSX
 		if sym := jsNamedSym(n, "name", filePath, blobSHA, language, src, imports, astkit.KindInterface, parentClass, exported); sym != nil {
@@ -283,8 +283,11 @@ func jsVisitChild(n *sitter.Node, filePath, blobSHA, language string, src []byte
 				jsVisit(body, filePath, blobSHA, language, src, imports, sym.Name, false, out)
 			}
 		}
-	case "method_definition":
+	case "method_definition", "abstract_method_signature":
 		// Class methods are never themselves exported even if the class is.
+		// Abstract method signatures are real declarations: they're the
+		// dispatch point subclass implementations override, so graph
+		// consumers need them as symbols.
 		jsMethodDef(n, filePath, blobSHA, language, src, imports, parentClass, out)
 	case "public_field_definition", "field_definition":
 		jsFieldDef(n, filePath, blobSHA, language, src, imports, parentClass, out)
@@ -422,6 +425,7 @@ func jsUnwrapExport(n *sitter.Node, filePath, blobSHA, language string, src []by
 		}
 		switch c.Type() {
 		case "function_declaration", "class_declaration",
+			"abstract_class_declaration",
 			"interface_declaration", "type_alias_declaration",
 			"lexical_declaration", "variable_declaration",
 			"enum_declaration", "generator_function_declaration":

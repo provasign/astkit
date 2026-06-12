@@ -473,3 +473,14 @@ func TestPython_AttrSites(t *testing.T) {
 		t.Errorf("self.save must remain a call site; got %v", gotCalls)
 	}
 }
+
+func TestTS_AbstractMethodSignature(t *testing.T) {
+	src := "abstract class Base {\n  protected abstract cleanup(): void;\n  run() { this.cleanup(); }\n}\n"
+	syms, _ := extract(t, astkit.LangTypeScript, src)
+	for _, s := range syms {
+		if s.Name == "cleanup" && s.ParentName == "Base" {
+			return
+		}
+	}
+	t.Fatalf("abstract method signature must be extracted as a symbol; got %v", names(syms))
+}
