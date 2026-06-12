@@ -521,3 +521,23 @@ func TestJS_SuperCallSites(t *testing.T) {
 		}
 	}
 }
+
+func TestCallSites_Argc(t *testing.T) {
+	src := `class A { void f(){ g(1, 2, h(3)); zero(); } }`
+	syms, _ := extract(t, astkit.LangJava, src)
+	got := map[string]int{}
+	for _, s := range syms {
+		for _, c := range s.CallSites {
+			got[c.Callee] = c.Argc
+		}
+	}
+	if got["g"] != 3 {
+		t.Errorf("g argc = %d, want 3 (nested call is one argument); got %v", got["g"], got)
+	}
+	if got["zero"] != 0 {
+		t.Errorf("zero argc = %d, want 0", got["zero"])
+	}
+	if got["h"] != 1 {
+		t.Errorf("h argc = %d, want 1", got["h"])
+	}
+}

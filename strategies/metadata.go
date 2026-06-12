@@ -100,6 +100,7 @@ func collectCallSites(body *sitter.Node, src []byte, spec callSpec) []astkit.Cal
 					out = append(out, astkit.CallSite{
 						Callee: callee,
 						Line:   int(n.StartPoint().Row) + 1,
+						Argc:   callArgc(n),
 					})
 				}
 				break
@@ -111,6 +112,15 @@ func collectCallSites(body *sitter.Node, src []byte, spec callSpec) []astkit.Cal
 	}
 	walk(body)
 	return out
+}
+
+// callArgc counts argument expressions in a call node's argument list.
+func callArgc(call *sitter.Node) int {
+	args := call.ChildByFieldName("arguments")
+	if args == nil {
+		return 0
+	}
+	return int(args.NamedChildCount())
 }
 
 func goCallSites(body *sitter.Node, src []byte) []astkit.CallSite {

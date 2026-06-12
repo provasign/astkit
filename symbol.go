@@ -39,6 +39,10 @@ type LineRange struct {
 type CallSite struct {
 	Callee string `json:"callee"`
 	Line   int    `json:"line"`
+	// Argc is the number of argument expressions at the call site (0 may
+	// mean "no arguments" or "unknown" for older indexes; consumers treat
+	// it as advisory). Lets graph consumers disambiguate overloads.
+	Argc int `json:"argc,omitempty"`
 }
 
 // Symbol is the canonical, persistence-agnostic representation of a single
