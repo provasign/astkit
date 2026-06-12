@@ -152,13 +152,17 @@ func jsCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 				return ""
 			}
 			switch fn.Type() {
+			case "super":
+				// super(...) invokes the base class constructor; graph
+				// consumers resolve it through the extends relation.
+				return "super()"
 			case "identifier", "property_identifier":
 				return fn.Content(src)
 			case "member_expression":
 				prop := fn.ChildByFieldName("property")
 				if prop != nil {
 					qual := qualifierName(fn.ChildByFieldName("object"), src,
-						[]string{"identifier", "property_identifier", "this"},
+						[]string{"identifier", "property_identifier", "this", "super"},
 						map[string]string{"member_expression": "property"},
 						map[string]string{"call_expression": "function"})
 					return joinQualified(qual, string(prop.Content(src)))

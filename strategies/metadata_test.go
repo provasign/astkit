@@ -505,3 +505,19 @@ func TestJS_AssignmentFunctions(t *testing.T) {
 		t.Errorf("prototype method parent = %q, want App; got %v", got["handle"], got)
 	}
 }
+
+func TestJS_SuperCallSites(t *testing.T) {
+	src := "class B extends A {\n  constructor(x) { super(x); }\n  close() { super.close(); this.flush(); }\n}\n"
+	syms, _ := extract(t, astkit.LangTypeScript, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, c := range s.CallSites {
+			got[c.Callee] = true
+		}
+	}
+	for _, want := range []string{"super()", "super.close", "this.flush"} {
+		if !got[want] {
+			t.Errorf("missing call site %q; got %v", want, got)
+		}
+	}
+}
