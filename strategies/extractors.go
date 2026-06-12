@@ -513,6 +513,7 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 			Modifiers:     pythonModifiers(name),
 			Annotations:   decorators,
 			CallSites:     pythonCallSites(body, src),
+			AttrSites:     pythonAttrSites(body, src),
 		})
 	case "class_definition":
 		nameNode := n.ChildByFieldName("name")

@@ -100,6 +100,12 @@ type Symbol struct {
 	// CallSites records every call expression observed inside Body, when the
 	// strategy supports call-site extraction.
 	CallSites []CallSite `json:"callSites,omitempty"`
+
+	// AttrSites records attribute accesses that are NOT call expressions
+	// ("x.blueprints" with no parens). Python-only today: these are how
+	// @property code executes, so graph consumers need them to model
+	// property calls. Same shape as CallSites ("qualifier.name").
+	AttrSites []CallSite `json:"attrSites,omitempty"`
 }
 
 // ImportStatement is one parsed import / use / require clause.

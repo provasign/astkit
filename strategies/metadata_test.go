@@ -447,3 +447,29 @@ func TestCallSites_QualifiersJS(t *testing.T) {
 		}
 	}
 }
+
+func TestPython_AttrSites(t *testing.T) {
+	src := "class A:\n    def f(self):\n        x = self.request.blueprints\n        self.save()\n        return request.blueprint\n"
+	syms, _ := extract(t, astkit.LangPython, src)
+	gotAttrs := map[string]bool{}
+	gotCalls := map[string]bool{}
+	for _, s := range syms {
+		for _, a := range s.AttrSites {
+			gotAttrs[a.Callee] = true
+		}
+		for _, c := range s.CallSites {
+			gotCalls[c.Callee] = true
+		}
+	}
+	for _, want := range []string{"request.blueprints", "request.blueprint", "self.request"} {
+		if !gotAttrs[want] {
+			t.Errorf("missing attr site %q; got %v", want, gotAttrs)
+		}
+	}
+	if gotAttrs["self.save"] {
+		t.Errorf("call expression must not appear as attr site; got %v", gotAttrs)
+	}
+	if !gotCalls["self.save"] {
+		t.Errorf("self.save must remain a call site; got %v", gotCalls)
+	}
+}

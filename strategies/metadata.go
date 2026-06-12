@@ -195,6 +195,54 @@ func pythonCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	})
 }
 
+// pythonAttrSites collects attribute accesses that are not the function of
+// a call ("self.db", "request.blueprints") — the access pattern through
+// which @property code executes. One site per distinct access text.
+func pythonAttrSites(body *sitter.Node, src []byte) []astkit.CallSite {
+	if body == nil {
+		return nil
+	}
+	identTypes := []string{"identifier"}
+	selectorTypes := map[string]string{"attribute": "attribute"}
+	callTypes := map[string]string{"call": "function"}
+	seen := map[string]bool{}
+	var out []astkit.CallSite
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type() == "attribute" {
+			parent := n.Parent()
+			isCallFn := false
+			if parent != nil && parent.Type() == "call" {
+				// Node lookups aren't pointer-stable; compare by span.
+				if fn := parent.ChildByFieldName("function"); fn != nil {
+					isCallFn = fn.StartByte() == n.StartByte() && fn.EndByte() == n.EndByte()
+				}
+			}
+			if !isCallFn {
+				if attr := n.ChildByFieldName("attribute"); attr != nil {
+					qual := qualifierName(n.ChildByFieldName("object"), src, identTypes, selectorTypes, callTypes)
+					name := joinQualified(qual, string(attr.Content(src)))
+					if !seen[name] {
+						seen[name] = true
+						out = append(out, astkit.CallSite{
+							Callee: name,
+							Line:   int(n.StartPoint().Row) + 1,
+						})
+					}
+				}
+			}
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(body)
+	return out
+}
+
 func javaCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	return collectCallSites(body, src, callSpec{
 		nodeTypes: []string{"method_invocation", "object_creation_expression"},
