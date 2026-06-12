@@ -541,3 +541,32 @@ func TestCallSites_Argc(t *testing.T) {
 		t.Errorf("h argc = %d, want 1", got["h"])
 	}
 }
+
+func TestJava_GenericCtorAndLiteralArgs(t *testing.T) {
+	src := "class A { void f(){ Range<Integer> r = new Range<>(lo, hi); g(\"x\", 0, 2L, true, name); } }"
+	syms, _ := extract(t, astkit.LangJava, src)
+	var rangeOK bool
+	var gArgs []string
+	for _, s := range syms {
+		for _, c := range s.CallSites {
+			if c.Callee == "Range" {
+				rangeOK = true
+			}
+			if c.Callee == "g" {
+				gArgs = c.Args
+			}
+		}
+	}
+	if !rangeOK {
+		t.Error("generic instantiation must record bare type name 'Range'")
+	}
+	want := []string{"#String", "#int", "#long", "#boolean", "name"}
+	if len(gArgs) != 5 {
+		t.Fatalf("g args = %v, want 5 entries", gArgs)
+	}
+	for i, w := range want {
+		if gArgs[i] != w {
+			t.Errorf("g arg[%d] = %q, want %q", i, gArgs[i], w)
+		}
+	}
+}

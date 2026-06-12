@@ -124,8 +124,9 @@ func callArgc(call *sitter.Node) int {
 	return int(args.NamedChildCount())
 }
 
-// callArgs returns each argument's identifier text when the argument is a
-// bare identifier, "" otherwise. Nil when no argument is an identifier.
+// callArgs returns, per argument: the identifier text for bare identifiers,
+// a "#type" literal marker for literals (so consumers can type-match
+// overloads), or "" for complex expressions. Nil when nothing is known.
 func callArgs(call *sitter.Node, src []byte) []string {
 	args := call.ChildByFieldName("arguments")
 	if args == nil {
@@ -136,8 +137,11 @@ func callArgs(call *sitter.Node, src []byte) []string {
 	any := false
 	for i := 0; i < n; i++ {
 		c := args.NamedChild(i)
-		if c != nil && c.Type() == "identifier" {
-			out[i] = string(c.Content(src))
+		if c == nil {
+			continue
+		}
+		if v := argToken(c, src); v != "" {
+			out[i] = v
 			any = true
 		}
 	}
@@ -145,6 +149,41 @@ func callArgs(call *sitter.Node, src []byte) []string {
 		return nil
 	}
 	return out
+}
+
+// argToken classifies one argument node: identifier name, or a literal
+// type marker. Covers the literal node types of the Java/TS/JS/Go/Python
+// grammars; unknown shapes return "".
+func argToken(c *sitter.Node, src []byte) string {
+	switch c.Type() {
+	case "identifier":
+		return string(c.Content(src))
+	case "string_literal", "interpreted_string_literal", "raw_string_literal", "string":
+		return "#String"
+	case "character_literal", "rune_literal":
+		return "#char"
+	case "decimal_integer_literal", "hex_integer_literal", "octal_integer_literal",
+		"binary_integer_literal", "int_literal", "integer":
+		text := string(c.Content(src))
+		switch {
+		case strings.HasSuffix(text, "L") || strings.HasSuffix(text, "l"):
+			return "#long"
+		case strings.HasSuffix(text, "F") || strings.HasSuffix(text, "f"):
+			return "#float"
+		case strings.HasSuffix(text, "D") || strings.HasSuffix(text, "d"):
+			return "#double"
+		}
+		return "#int"
+	case "decimal_floating_point_literal", "float_literal", "float":
+		text := string(c.Content(src))
+		if strings.HasSuffix(text, "F") || strings.HasSuffix(text, "f") {
+			return "#float"
+		}
+		return "#double"
+	case "true", "false":
+		return "#boolean"
+	}
+	return ""
 }
 
 func goCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
@@ -288,7 +327,12 @@ func javaCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			if call.Type() == "object_creation_expression" {
 				t := call.ChildByFieldName("type")
 				if t != nil {
-					return strings.TrimSpace(t.Content(src))
+					// "new Range<>(...)" → callee "Range", not "Range<>".
+					name := strings.TrimSpace(t.Content(src))
+					if i := strings.IndexByte(name, '<'); i >= 0 {
+						name = name[:i]
+					}
+					return name
 				}
 				return ""
 			}
