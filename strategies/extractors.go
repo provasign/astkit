@@ -297,6 +297,72 @@ func jsVisitChild(n *sitter.Node, filePath, blobSHA, language string, src []byte
 	case "lexical_declaration", "variable_declaration":
 		// const Foo = () => ... / const Foo = function() { ... }
 		jsArrowDecl(n, filePath, blobSHA, language, src, imports, parentClass, exported, out)
+	case "expression_statement":
+		// app.listen = function listen() {} / exports.render = () => {} —
+		// the assignment-style declarations CommonJS codebases are built on.
+		jsAssignFunc(n, filePath, blobSHA, language, src, imports, parentClass, out)
+	}
+}
+
+// jsAssignFunc extracts `obj.prop = function...` / `obj.prop = (...) => ...`
+// assignments as function symbols named by the property. The receiver chain's
+// last identifier becomes ParentName ("app.listen = ..." → parent "app"),
+// except module-export forms (exports/module.exports/prototype chains keep
+// the prototype's class name).
+func jsAssignFunc(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		assign := n.Child(i)
+		if assign == nil || assign.Type() != "assignment_expression" {
+			continue
+		}
+		left := assign.ChildByFieldName("left")
+		right := assign.ChildByFieldName("right")
+		if left == nil || right == nil || left.Type() != "member_expression" {
+			continue
+		}
+		switch right.Type() {
+		case "arrow_function", "function", "function_expression":
+		default:
+			continue
+		}
+		prop := left.ChildByFieldName("property")
+		if prop == nil {
+			continue
+		}
+		name := prop.Content(src)
+		parent := parentClass
+		if obj := left.ChildByFieldName("object"); obj != nil && parent == "" {
+			switch obj.Type() {
+			case "identifier":
+				if o := obj.Content(src); o != "exports" && o != "module" {
+					parent = o
+				}
+			case "member_expression":
+				// X.prototype.method = ... → parent X
+				if inner := obj.ChildByFieldName("property"); inner != nil && inner.Content(src) == "prototype" {
+					if base := obj.ChildByFieldName("object"); base != nil && base.Type() == "identifier" {
+						parent = base.Content(src)
+					}
+				}
+			}
+		}
+		raw := assign.Content(src)
+		k := astkit.KindFunction
+		if parent != "" {
+			k = astkit.KindMethod
+		}
+		body := right.ChildByFieldName("body")
+		*out = append(*out, astkit.Symbol{
+			Kind:          k,
+			Name:          name,
+			QualifiedName: name,
+			Signature:     internalast.FirstLine(raw),
+			Span:          internalast.NodeSpan(assign),
+			Exported:      true,
+			Body:          raw,
+			ParentName:    parent,
+			CallSites:     jsCallSites(body, src),
+		})
 	}
 }
 

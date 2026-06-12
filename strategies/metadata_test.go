@@ -484,3 +484,24 @@ func TestTS_AbstractMethodSignature(t *testing.T) {
 	}
 	t.Fatalf("abstract method signature must be extracted as a symbol; got %v", names(syms))
 }
+
+func TestJS_AssignmentFunctions(t *testing.T) {
+	src := "var app = {};\napp.listen = function listen(port) { return bind(port); };\nexports.render = function render(v) { return v; };\nApp.prototype.handle = function(req) { return req; };\n"
+	syms, _ := extract(t, astkit.LangJavaScript, src)
+	got := map[string]string{}
+	for _, s := range syms {
+		got[s.Name] = s.ParentName
+	}
+	if _, ok := got["listen"]; !ok {
+		t.Errorf("missing app.listen assignment function; got %v", got)
+	}
+	if got["listen"] != "app" {
+		t.Errorf("listen parent = %q, want app", got["listen"])
+	}
+	if _, ok := got["render"]; !ok {
+		t.Errorf("missing exports.render; got %v", got)
+	}
+	if got["handle"] != "App" {
+		t.Errorf("prototype method parent = %q, want App; got %v", got["handle"], got)
+	}
+}
