@@ -1296,6 +1296,18 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			csPropertyDecl(n, filePath, blobSHA, src, imports, parentClass, out)
 		case "field_declaration":
 			csFieldDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "file_scoped_namespace_declaration":
+			// `namespace Foo;` (C# 10): declarations follow as siblings in
+			// the same node, sharing this namespace.
+			csVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "preproc_if", "preproc_elif", "preproc_else":
+			// Multi-target code lives inside #if/#elif/#else blocks; the
+			// grammar nests the conditional declarations as children. Not
+			// descending hides whole files (Newtonsoft wraps every file in
+			// `#if !(PORTABLE || ...)`) — the C# analog of Rust's mod_item.
+			// All branches are visited so a symbol guarded by any target is
+			// found; the oracle's chosen branch is always a subset.
+			csVisit(n, filePath, blobSHA, src, imports, parentClass, out)
 		}
 	}
 }
@@ -1350,7 +1362,101 @@ func csMethodDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports 
 		Modifiers:      modifiers,
 		TypeParameters: csTypeParams(n, src),
 		Annotations:    csAttributes(n, src),
+		CallSites:      csCallSites(n, src),
 	})
+}
+
+// csCallSites extracts invocation and object-creation call sites from a C#
+// method/constructor declaration. Member-access calls keep their receiver's
+// last segment as a qualifier (repo.Save → "repo.Save"); object creation
+// resolves to the constructed type's name (new Repo() → "Repo", matching the
+// constructor symbol Grove records). The whole declaration is walked so
+// expression-bodied members (=> Expr) and lambda bodies are covered, with
+// lambda calls attributed to the enclosing method as Grove expects.
+func csCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
+	return collectCallSites(decl, src, callSpec{
+		nodeTypes: []string{"invocation_expression", "object_creation_expression"},
+		calleeFn: func(call *sitter.Node, src []byte) string {
+			if call.Type() == "object_creation_expression" {
+				return csTypeLastName(call.ChildByFieldName("type"), src)
+			}
+			fn := call.ChildByFieldName("function")
+			if fn == nil {
+				return ""
+			}
+			switch fn.Type() {
+			case "identifier":
+				return fn.Content(src)
+			case "generic_name":
+				return csGenericBaseName(fn, src)
+			case "member_access_expression":
+				nameNode := fn.ChildByFieldName("name")
+				if nameNode == nil {
+					return ""
+				}
+				method := csNameToken(nameNode, src)
+				if method == "" {
+					return ""
+				}
+				qual := qualifierName(fn.ChildByFieldName("expression"), src,
+					[]string{"identifier", "this_expression", "base_expression"},
+					map[string]string{"member_access_expression": "name"},
+					map[string]string{"invocation_expression": "function"})
+				return joinQualified(qual, method)
+			}
+			return ""
+		},
+	})
+}
+
+// csNameToken reduces a member-access name (identifier or generic_name) to
+// its bare identifier.
+func csNameToken(n *sitter.Node, src []byte) string {
+	if n.Type() == "generic_name" {
+		return csGenericBaseName(n, src)
+	}
+	return n.Content(src)
+}
+
+// csGenericBaseName returns the identifier of a generic_name (Method<T> → Method).
+func csGenericBaseName(n *sitter.Node, src []byte) string {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if c := n.Child(i); c != nil && c.Type() == "identifier" {
+			return c.Content(src)
+		}
+	}
+	return ""
+}
+
+// csTypeLastName reduces a C# type node to its final identifier:
+// Repo → "Repo", Foo.Bar.Repo → "Repo", List<T> → "List", Repo? → "Repo".
+func csTypeLastName(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	switch n.Type() {
+	case "identifier":
+		return n.Content(src)
+	case "generic_name":
+		return csGenericBaseName(n, src)
+	case "qualified_name":
+		if name := n.ChildByFieldName("name"); name != nil {
+			return csTypeLastName(name, src)
+		}
+	case "nullable_type", "array_type":
+		if t := n.ChildByFieldName("type"); t != nil {
+			return csTypeLastName(t, src)
+		}
+	}
+	// Fallback: last dotted segment of the raw text.
+	text := strings.TrimSpace(n.Content(src))
+	if i := strings.IndexAny(text, "<?["); i >= 0 {
+		text = text[:i]
+	}
+	if i := strings.LastIndexByte(text, '.'); i >= 0 {
+		text = text[i+1:]
+	}
+	return strings.TrimSpace(text)
 }
 
 func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
