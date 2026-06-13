@@ -247,6 +247,42 @@ func TestJava_CallSitesWithNew(t *testing.T) {
 	}
 }
 
+func TestCSharp_CallSiteGenericAndArgs(t *testing.T) {
+	// A generic invocation must set Generic and unwrap the C# `argument`
+	// wrapper so the bare identifier/literal arg classifies (it returned ""
+	// before, leaving Args empty for the whole language).
+	src := `class A {
+  void f(string json) {
+    JsonConvert.DeserializeObject<bool>(json);
+    JsonConvert.DeserializeObject(json);
+  }
+}`
+	syms, _ := extract(t, astkit.LangCSharp, src)
+	var gen, plain *astkit.CallSite
+	for _, s := range syms {
+		for i := range s.CallSites {
+			cs := &s.CallSites[i]
+			if cs.Callee != "JsonConvert.DeserializeObject" {
+				continue
+			}
+			if cs.Generic {
+				gen = cs
+			} else {
+				plain = cs
+			}
+		}
+	}
+	if gen == nil {
+		t.Fatal("missing generic DeserializeObject<bool> call site")
+	}
+	if plain == nil || plain.Generic {
+		t.Fatal("missing non-generic DeserializeObject call site (or wrongly marked generic)")
+	}
+	if len(gen.Args) != 1 || gen.Args[0] != "json" {
+		t.Errorf("expected unwrapped identifier arg [json], got %#v", gen.Args)
+	}
+}
+
 func TestRust_CallSitesWithMacroAndPath(t *testing.T) {
 	src := `fn f() { println!("hi"); std::mem::take(&mut 0); g(); }`
 	syms, _ := extract(t, astkit.LangRust, src)

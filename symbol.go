@@ -47,6 +47,11 @@ type CallSite struct {
 	// identifier, "" otherwise. With local type inference downstream, this
 	// disambiguates same-arity overloads (isEmpty(char[]) vs isEmpty(long[])).
 	Args []string `json:"args,omitempty"`
+	// Generic reports whether the call carries explicit type arguments
+	// (C# DeserializeObject<T>(...), the turbofish/`<...>` form). Lets graph
+	// consumers split a generic overload from its same-arity non-generic
+	// sibling, which bare-name + argc + value-arg types cannot distinguish.
+	Generic bool `json:"generic,omitempty"`
 }
 
 // Symbol is the canonical, persistence-agnostic representation of a single

@@ -1491,9 +1491,34 @@ func csMethodDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports 
 // constructor symbol Grove records). The whole declaration is walked so
 // expression-bodied members (=> Expr) and lambda bodies are covered, with
 // lambda calls attributed to the enclosing method as Grove expects.
+// csCallIsGeneric reports whether a C# call supplies explicit type arguments,
+// i.e. the invoked method name (or constructed type) is a generic_name:
+// DeserializeObject<T>(...) or new List<T>(). The grammar drops the <...> when
+// the callee reduces to a bare name, so this is the only surviving signal that
+// splits a generic overload from its same-arity non-generic sibling.
+func csCallIsGeneric(call *sitter.Node, src []byte) bool {
+	if call.Type() == "object_creation_expression" {
+		t := call.ChildByFieldName("type")
+		return t != nil && t.Type() == "generic_name"
+	}
+	fn := call.ChildByFieldName("function")
+	if fn == nil {
+		return false
+	}
+	switch fn.Type() {
+	case "generic_name":
+		return true
+	case "member_access_expression":
+		name := fn.ChildByFieldName("name")
+		return name != nil && name.Type() == "generic_name"
+	}
+	return false
+}
+
 func csCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
 	return collectCallSites(decl, src, callSpec{
 		nodeTypes: []string{"invocation_expression", "object_creation_expression"},
+		genericFn: csCallIsGeneric,
 		calleeFn: func(call *sitter.Node, src []byte) string {
 			if call.Type() == "object_creation_expression" {
 				return csTypeLastName(call.ChildByFieldName("type"), src)

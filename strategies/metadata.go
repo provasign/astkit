@@ -21,6 +21,9 @@ var _ = internalast.NodeSpan // imported by extractors.go callers
 type callSpec struct {
 	nodeTypes []string // call-expression node types in this language
 	calleeFn  func(call *sitter.Node, src []byte) string
+	// genericFn reports whether a call carries explicit type arguments
+	// (DeserializeObject<T>(...)); nil means "never generic" for the language.
+	genericFn func(call *sitter.Node, src []byte) bool
 }
 
 // qualifierName reduces a callee's receiver operand to one identifier so
@@ -99,10 +102,11 @@ func collectCallSites(body *sitter.Node, src []byte, spec callSpec) []astkit.Cal
 				callee := spec.calleeFn(n, src)
 				if callee != "" {
 					out = append(out, astkit.CallSite{
-						Callee: callee,
-						Line:   int(n.StartPoint().Row) + 1,
-						Argc:   callArgc(n),
-						Args:   callArgs(n, src),
+						Callee:  callee,
+						Line:    int(n.StartPoint().Row) + 1,
+						Argc:    callArgc(n),
+						Args:    callArgs(n, src),
+						Generic: spec.genericFn != nil && spec.genericFn(n, src),
 					})
 				}
 				break
@@ -156,6 +160,16 @@ func callArgs(call *sitter.Node, src []byte) []string {
 // type marker. Covers the literal node types of the Java/TS/JS/Go/Python
 // grammars; unknown shapes return "".
 func argToken(c *sitter.Node, src []byte) string {
+	if c.Type() == "argument" {
+		// C# wraps each argument in an `argument` node:
+		// (name_colon)? ('ref'|'out'|'in')? expression. The value expression
+		// is the last named child; unwrap it so literals/identifiers classify
+		// instead of the wrapper returning "" (left C# Args empty entirely).
+		if nc := int(c.NamedChildCount()); nc > 0 {
+			return argToken(c.NamedChild(nc-1), src)
+		}
+		return ""
+	}
 	switch c.Type() {
 	case "identifier":
 		return string(c.Content(src))
