@@ -359,7 +359,7 @@ func pythonAttrSites(body *sitter.Node, src []byte) []astkit.CallSite {
 
 func javaCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	return collectCallSites(body, src, callSpec{
-		nodeTypes: []string{"method_invocation", "object_creation_expression"},
+		nodeTypes: []string{"method_invocation", "object_creation_expression", "explicit_constructor_invocation"},
 		calleeFn: func(call *sitter.Node, src []byte) string {
 			if call.Type() == "object_creation_expression" {
 				t := call.ChildByFieldName("type")
@@ -370,6 +370,17 @@ func javaCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 						name = name[:i]
 					}
 					return name
+				}
+				return ""
+			}
+			if call.Type() == "explicit_constructor_invocation" {
+				// `super(...)` / `this(...)` constructor delegation. The
+				// keyword leads the node text; emit the form Grove's
+				// constructor resolution recognizes.
+				if t := strings.TrimSpace(call.Content(src)); strings.HasPrefix(t, "super") {
+					return "super()"
+				} else if strings.HasPrefix(t, "this") {
+					return "this()"
 				}
 				return ""
 			}

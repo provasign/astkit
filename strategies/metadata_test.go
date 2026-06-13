@@ -606,3 +606,34 @@ func TestJava_GenericCtorAndLiteralArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestJava_ExplicitConstructorInvocation(t *testing.T) {
+	// super(...) / this(...) delegation must produce call sites (they're real
+	// edges in the bytecode oracle); method references must NOT be emitted
+	// (a Foo::bar reference is a lambda, not a call from the enclosing method).
+	src := `class A {
+  A() { this(1); }
+  A(int x) { super(); }
+  void f(java.util.List<String> xs) { xs.forEach(String::trim); }
+}`
+	syms, _ := extract(t, astkit.LangJava, src)
+	var super_, this_, mref int
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			switch cs.Callee {
+			case "super()":
+				super_++
+			case "this()":
+				this_++
+			case "String.trim", "trim":
+				mref++
+			}
+		}
+	}
+	if super_ == 0 || this_ == 0 {
+		t.Fatalf("expected super() and this() call sites, got super=%d this=%d", super_, this_)
+	}
+	if mref != 0 {
+		t.Errorf("method reference String::trim must not be emitted as a call (got %d)", mref)
+	}
+}
