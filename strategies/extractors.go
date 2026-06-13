@@ -1059,7 +1059,125 @@ func cFuncSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, im
 		Exported:      !strings.HasPrefix(name, "_"),
 		Body:          raw,
 		ParentName:    parentClass,
+		CallSites:     cCallSites(n, src),
 	}
+}
+
+// cCallSites extracts call sites from a C/C++ function/method definition:
+// plain calls foo(), member calls obj.m()/obj->m(), scoped calls Foo::m(),
+// and C++ object construction (new Foo()). Member receivers keep their last
+// segment as a qualifier (repo->save → "repo.save", this->run → "this.run")
+// so the graph layer can narrow by the receiver's inferred type.
+func cCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
+	return collectCallSites(decl, src, callSpec{
+		nodeTypes: []string{"call_expression", "new_expression"},
+		calleeFn: func(call *sitter.Node, src []byte) string {
+			if call.Type() == "new_expression" {
+				if t := call.ChildByFieldName("type"); t != nil {
+					return cTypeLastName(t, src)
+				}
+				return ""
+			}
+			fn := call.ChildByFieldName("function")
+			if fn == nil {
+				return ""
+			}
+			return cCalleeFromExpr(fn, src)
+		},
+	})
+}
+
+func cCalleeFromExpr(fn *sitter.Node, src []byte) string {
+	switch fn.Type() {
+	case "identifier":
+		return fn.Content(src)
+	case "field_expression":
+		// obj.method / obj->method / a.b.method
+		field := fn.ChildByFieldName("field")
+		if field == nil {
+			return ""
+		}
+		qual := cReceiverName(fn.ChildByFieldName("argument"), src)
+		return joinQualified(qual, field.Content(src))
+	case "qualified_identifier":
+		// Ns::Class::method → qualifier "Class", name "method"
+		name := fn.ChildByFieldName("name")
+		if name == nil {
+			return ""
+		}
+		if name.Type() == "qualified_identifier" {
+			return cCalleeFromExpr(name, src)
+		}
+		qual := ""
+		if scope := fn.ChildByFieldName("scope"); scope != nil {
+			qual = cTypeLastName(scope, src)
+		}
+		return joinQualified(qual, cTypeLastName(name, src))
+	case "template_function":
+		// foo<T>(...) — the name child holds the identifier.
+		if name := fn.ChildByFieldName("name"); name != nil {
+			return cCalleeFromExpr(name, src)
+		}
+	case "parenthesized_expression":
+		for i := 0; i < int(fn.ChildCount()); i++ {
+			if c := fn.Child(i); c != nil && c.IsNamed() {
+				return cCalleeFromExpr(c, src)
+			}
+		}
+	}
+	return ""
+}
+
+// cReceiverName reduces a member-call receiver to a bare qualifier:
+// identifier → itself, this → "this", a->b / a.b → "b", call() → "call()".
+func cReceiverName(obj *sitter.Node, src []byte) string {
+	if obj == nil {
+		return ""
+	}
+	switch obj.Type() {
+	case "identifier":
+		return obj.Content(src)
+	case "this":
+		return "this"
+	case "field_expression":
+		if f := obj.ChildByFieldName("field"); f != nil {
+			return f.Content(src)
+		}
+	case "call_expression":
+		if f := obj.ChildByFieldName("function"); f != nil {
+			if n := cCalleeFromExpr(f, src); n != "" {
+				return cLastSegment(n) + "()"
+			}
+		}
+	}
+	return ""
+}
+
+// cTypeLastName reduces a type/name node to its final identifier:
+// Foo → "Foo", Ns::Foo → "Foo", Foo<T> → "Foo".
+func cTypeLastName(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	switch n.Type() {
+	case "type_identifier", "identifier", "field_identifier", "primitive_type":
+		return n.Content(src)
+	case "qualified_identifier", "template_type", "template_function", "scoped_type_identifier", "scoped_identifier":
+		if name := n.ChildByFieldName("name"); name != nil {
+			return cTypeLastName(name, src)
+		}
+	}
+	return cLastSegment(strings.TrimSpace(n.Content(src)))
+}
+
+func cLastSegment(s string) string {
+	if i := strings.IndexAny(s, "<("); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.LastIndex(s, "::"); i >= 0 {
+		s = s[i+2:]
+	}
+	return strings.TrimSpace(s)
 }
 
 // cDeclaratorName walks nested declarator nodes (pointer_declarator,
