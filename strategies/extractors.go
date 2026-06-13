@@ -766,11 +766,11 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 
 func extractRustNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
-	rustVisit(root, filePath, blobSHA, src, imports, "", &out)
+	rustVisit(root, filePath, blobSHA, src, imports, "", nil, "", &out)
 	return out
 }
 
-func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, implBounds []string, implTrait string, out *[]astkit.Symbol) {
 	for i := 0; i < int(node.ChildCount()); i++ {
 		n := node.Child(i)
 		if n == nil {
@@ -791,6 +791,10 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 					kind = astkit.KindConstructor
 				}
 			}
+			annotations := rustAttributes(n, src)
+			if implTrait != "" {
+				annotations = append(annotations, "impl_trait:"+implTrait)
+			}
 			body := n.ChildByFieldName("body")
 			*out = append(*out, astkit.Symbol{
 				Kind:           kind,
@@ -802,8 +806,8 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 				Body:           raw,
 				ParentName:     implType,
 				Modifiers:      rustModifiers(n, src),
-				TypeParameters: rustTypeParameters(n, src),
-				Annotations:    rustAttributes(n, src),
+				TypeParameters: append(rustTypeParameters(n, src), implBounds...),
+				Annotations:    annotations,
 				CallSites:      rustCallSites(body, src),
 			})
 		case "struct_item":
@@ -813,10 +817,45 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 			rustNamedItem(n, astkit.KindEnum, filePath, blobSHA, src, imports, out)
 		case "trait_item":
 			rustNamedItem(n, astkit.KindTrait, filePath, blobSHA, src, imports, out)
+			// Trait bodies declare the methods dynamic dispatch goes
+			// through — default-bodied methods and bare signatures both.
+			if nameNode := n.ChildByFieldName("name"); nameNode != nil {
+				if body := n.ChildByFieldName("body"); body != nil {
+					rustVisit(body, filePath, blobSHA, src, imports, nameNode.Content(src), nil, "", out)
+				}
+			}
+		case "function_signature_item":
+			// Body-less trait method signature: a dispatch point, like an
+			// abstract method.
+			nameNode := n.ChildByFieldName("name")
+			if nameNode == nil || implType == "" {
+				continue
+			}
+			raw := n.Content(src)
+			*out = append(*out, astkit.Symbol{
+				Kind:           astkit.KindMethod,
+				Name:           nameNode.Content(src),
+				QualifiedName:  nameNode.Content(src),
+				Signature:      funcSig(n, src),
+				Span:           internalast.NodeSpan(n),
+				Exported:       strings.HasPrefix(strings.TrimSpace(raw), "pub"),
+				Body:           raw,
+				ParentName:     implType,
+				Modifiers:      rustModifiers(n, src),
+				TypeParameters: append(rustTypeParameters(n, src), implBounds...),
+				Annotations:    rustAttributes(n, src),
+			})
 		case "type_item":
 			rustNamedItem(n, astkit.KindType, filePath, blobSHA, src, imports, out)
 		case "impl_item":
 			rustImplItem(n, filePath, blobSHA, src, imports, out)
+		case "mod_item":
+			// Inline modules (`mod tests { ... }`) nest arbitrary items;
+			// unit tests live here by convention, so not descending hides
+			// every #[cfg(test)] function in the file.
+			if body := n.ChildByFieldName("body"); body != nil {
+				rustVisit(body, filePath, blobSHA, src, imports, implType, implBounds, implTrait, out)
+			}
 		}
 	}
 }
@@ -892,7 +931,59 @@ func rustImplItem(n *sitter.Node, filePath, blobSHA string, src []byte, imports 
 	if body == nil {
 		return
 	}
-	rustVisit(body, filePath, blobSHA, src, imports, typeName, out)
+	// Impl-level generics carry the trait bounds the body's methods are
+	// typed against (impl<M: Matcher, S: Sink> Core<M, S> where ...);
+	// methods inherit them so consumers can resolve M::/m.-style calls.
+	bounds := rustTypeParameters(n, src)
+	bounds = append(bounds, rustWherePredicates(n, src)...)
+	// impl Trait for Type: methods remember the trait so consumers can
+	// route default-trait-method calls (self.x() with no own x) to the
+	// trait's declaration.
+	implTrait := ""
+	if tr := n.ChildByFieldName("trait"); tr != nil {
+		implTrait = tr.Content(src)
+		if idx := strings.IndexByte(implTrait, '<'); idx >= 0 {
+			implTrait = implTrait[:idx]
+		}
+		if idx := strings.LastIndex(implTrait, "::"); idx >= 0 {
+			implTrait = implTrait[idx+2:]
+		}
+	}
+	rustVisit(body, filePath, blobSHA, src, imports, typeName, bounds, implTrait, out)
+}
+
+// rustWherePredicates extracts "T: Bound" predicates from an impl's where
+// clause, complementing inline type-parameter bounds.
+func rustWherePredicates(n *sitter.Node, src []byte) []string {
+	wc := internalast.FindChildByType(n, "where_clause")
+	if wc == nil {
+		return nil
+	}
+	text := strings.TrimSpace(wc.Content(src))
+	text = strings.TrimPrefix(text, "where")
+	var out []string
+	depth := 0
+	last := 0
+	flush := func(end int) {
+		if p := strings.TrimSpace(text[last:end]); p != "" {
+			out = append(out, p)
+		}
+	}
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			depth--
+		case ',':
+			if depth == 0 {
+				flush(i)
+				last = i + 1
+			}
+		}
+	}
+	flush(len(text))
+	return out
 }
 
 // ─── C / C++ ─────────────────────────────────────────────────────────────────

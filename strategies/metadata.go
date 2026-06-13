@@ -1,6 +1,7 @@
 package strategies
 
 import (
+	"regexp"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -372,7 +373,7 @@ func javaCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 }
 
 func rustCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
-	return collectCallSites(body, src, callSpec{
+	out := collectCallSites(body, src, callSpec{
 		nodeTypes: []string{"call_expression", "macro_invocation"},
 		calleeFn: func(call *sitter.Node, src []byte) string {
 			if call.Type() == "macro_invocation" {
@@ -386,27 +387,135 @@ func rustCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			if fn == nil {
 				return ""
 			}
+			if fn.Type() == "generic_function" {
+				// foo::<T>(...) — unwrap the turbofish to the underlying
+				// path before extracting the callee.
+				if inner := fn.ChildByFieldName("function"); inner != nil {
+					fn = inner
+				}
+			}
 			switch fn.Type() {
 			case "identifier":
 				return fn.Content(src)
 			case "field_expression":
 				field := fn.ChildByFieldName("field")
 				if field != nil {
+					// scoped_identifier in the selector map lets a chain
+					// rooted at a path call keep its qualifier:
+					// SearcherTester::new(...).line_number(false) gives
+					// line_number the "new()" call-result qualifier
+					// instead of arriving bare.
 					qual := qualifierName(fn.ChildByFieldName("value"), src,
 						[]string{"identifier", "self"},
-						map[string]string{"field_expression": "field"},
+						map[string]string{"field_expression": "field", "scoped_identifier": "name"},
 						map[string]string{"call_expression": "function"})
 					return joinQualified(qual, string(field.Content(src)))
 				}
 			case "scoped_identifier":
+				// Path calls keep their qualifying segment: Searcher::new
+				// must arrive as "Searcher.new", not a bare "new" that
+				// matches every constructor in scope (the v0.4.2 lesson).
 				name := fn.ChildByFieldName("name")
 				if name != nil {
-					return name.Content(src)
+					return joinQualified(rustPathQualifier(fn.ChildByFieldName("path"), src), string(name.Content(src)))
 				}
 			}
 			return ""
 		},
 	})
+	out = append(out, rustMacroCallSites(body, src)...)
+	return out
+}
+
+// rustMacroStringRe strips string literals from macro token trees so format
+// strings can't fabricate call sites.
+var rustMacroStringRe = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
+
+// rustMacroCallRe finds call-shaped token runs inside a macro's token tree:
+// "unescape(", "m.start(", "SearcherTester::new(".
+var rustMacroCallRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*)\s*\(`)
+
+var rustKeywordCallees = map[string]bool{
+	"if": true, "match": true, "while": true, "for": true, "loop": true,
+	"return": true, "as": true, "in": true, "fn": true, "move": true,
+	"unsafe": true, "let": true, "else": true,
+}
+
+// rustMacroCallSites recovers calls written inside macro invocations
+// (assert_eq!(b(b"\x00"), unescape(r"\x00"))). Macro arguments are token
+// trees, not parsed expressions, so the AST walk cannot see them; without
+// this every call under assert!/assert_eq!/write! is invisible — which in
+// idiomatic Rust is most of the test suite's call surface.
+func rustMacroCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
+	if body == nil {
+		return nil
+	}
+	var out []astkit.CallSite
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type() == "macro_invocation" {
+			if tt := internalast.FindChildByType(n, "token_tree"); tt != nil {
+				text := rustMacroStringRe.ReplaceAllString(tt.Content(src), `""`)
+				line := int(n.StartPoint().Row) + 1
+				for _, m := range rustMacroCallRe.FindAllStringSubmatch(text, -1) {
+					path := m[1]
+					name := path
+					qual := ""
+					if i := strings.LastIndex(path, "::"); i >= 0 {
+						name = path[i+2:]
+						qual = rustLastSegment(path[:i])
+					} else if i := strings.LastIndexByte(path, '.'); i >= 0 {
+						name = path[i+1:]
+						qual = rustLastSegment(path[:i])
+					}
+					if rustKeywordCallees[name] || name == "" {
+						continue
+					}
+					out = append(out, astkit.CallSite{
+						Callee: joinQualified(qual, name),
+						Line:   line,
+					})
+				}
+			}
+			return // nested macros' token trees are part of this text
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(body)
+	return out
+}
+
+// rustLastSegment reduces a dotted/scoped prefix to its final segment.
+func rustLastSegment(p string) string {
+	if i := strings.LastIndex(p, "::"); i >= 0 {
+		p = p[i+2:]
+	}
+	if i := strings.LastIndexByte(p, '.'); i >= 0 {
+		p = p[i+1:]
+	}
+	return p
+}
+
+// rustPathQualifier reduces a Rust path node to its last plain segment:
+// "crate::flags::parse" → "parse", "Searcher" → "Searcher",
+// "Vec<u8>" → "Vec". Single-segment by the same rule as qualifierName.
+func rustPathQualifier(path *sitter.Node, src []byte) string {
+	if path == nil {
+		return ""
+	}
+	p := string(path.Content(src))
+	if i := strings.IndexByte(p, '<'); i >= 0 {
+		p = strings.TrimSuffix(p[:i], "::")
+	}
+	if i := strings.LastIndex(p, "::"); i >= 0 {
+		p = p[i+2:]
+	}
+	return p
 }
 
 // ─── Modifiers ───────────────────────────────────────────────────────────────
