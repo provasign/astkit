@@ -1617,7 +1617,109 @@ func phpFuncSym(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 		Body:          raw,
 		ParentName:    parentClass,
 		Modifiers:     phpModifiers(n, src),
+		CallSites:     phpCallSites(n, src),
 	}
+}
+
+// phpCallSites extracts call sites from a PHP function/method declaration:
+// free function calls, member calls ($obj->m()), static calls (Foo::m()),
+// and object creation (new Foo()). Receiver qualifiers are preserved
+// ($repo->save → "repo.save", $this->run → "this.run") so the graph layer
+// can narrow by the receiver's inferred type instead of name alone.
+func phpCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
+	return collectCallSites(decl, src, callSpec{
+		nodeTypes: []string{
+			"function_call_expression", "member_call_expression",
+			"nullsafe_member_call_expression", "scoped_call_expression",
+			"object_creation_expression",
+		},
+		calleeFn: func(call *sitter.Node, src []byte) string {
+			switch call.Type() {
+			case "function_call_expression":
+				fn := call.ChildByFieldName("function")
+				if fn == nil {
+					return ""
+				}
+				return phpLastNamePart(fn.Content(src))
+			case "member_call_expression", "nullsafe_member_call_expression":
+				name := call.ChildByFieldName("name")
+				if name == nil {
+					return ""
+				}
+				qual := phpReceiverName(call.ChildByFieldName("object"), src)
+				return joinQualified(qual, name.Content(src))
+			case "scoped_call_expression":
+				name := call.ChildByFieldName("name")
+				if name == nil {
+					return ""
+				}
+				qual := phpScopeName(call.ChildByFieldName("scope"), src)
+				return joinQualified(qual, name.Content(src))
+			case "object_creation_expression":
+				return phpNewClassName(call, src)
+			}
+			return ""
+		},
+	})
+}
+
+// phpReceiverName reduces a member-call receiver to a bare qualifier:
+// $repo → "repo", $this → "this", $this->field → "field", method() → "method()".
+func phpReceiverName(obj *sitter.Node, src []byte) string {
+	if obj == nil {
+		return ""
+	}
+	switch obj.Type() {
+	case "variable_name":
+		return strings.TrimPrefix(obj.Content(src), "$")
+	case "member_access_expression":
+		if f := obj.ChildByFieldName("name"); f != nil {
+			return f.Content(src)
+		}
+	case "member_call_expression", "nullsafe_member_call_expression", "function_call_expression", "scoped_call_expression":
+		if f := obj.ChildByFieldName("name"); f != nil {
+			return f.Content(src) + "()"
+		}
+		if f := obj.ChildByFieldName("function"); f != nil {
+			return phpLastNamePart(f.Content(src)) + "()"
+		}
+	}
+	return ""
+}
+
+// phpScopeName reduces a scoped-call scope to a bare qualifier: Foo → "Foo",
+// Ns\Foo → "Foo", self/parent/static kept verbatim.
+func phpScopeName(scope *sitter.Node, src []byte) string {
+	if scope == nil {
+		return ""
+	}
+	return phpLastNamePart(scope.Content(src))
+}
+
+// phpNewClassName returns the constructed class's bare name (new Foo() →
+// "Foo", new Ns\Foo() → "Foo"); dynamic `new $cls()` yields "".
+func phpNewClassName(call *sitter.Node, src []byte) string {
+	for i := 0; i < int(call.ChildCount()); i++ {
+		c := call.Child(i)
+		if c == nil {
+			continue
+		}
+		switch c.Type() {
+		case "name", "qualified_name":
+			return phpLastNamePart(c.Content(src))
+		}
+	}
+	return ""
+}
+
+// phpLastNamePart reduces a (possibly namespaced) name to its last segment:
+// "Ns\\Sub\\Foo" → "Foo", "foo" → "foo".
+func phpLastNamePart(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.LastIndexByte(s, '\\'); i >= 0 {
+		s = s[i+1:]
+	}
+	return s
 }
 
 func phpClassDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA string, src []byte, imports []string, out *[]astkit.Symbol) {
