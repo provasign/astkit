@@ -292,6 +292,45 @@ public class Greeter {
 	}
 }
 
+// Wrapped declarations (jackson house style) must keep their extends/
+// implements clauses and full parameter lists in Signature, and a leading
+// annotation must never masquerade as the signature.
+func TestExtract_Java_MultilineSignatures(t *testing.T) {
+	src := `package x;
+
+@SuppressWarnings("deprecation")
+public abstract class StdSerializer<T>
+    extends JsonSerializer<T>
+    implements JsonFormatVisitable, java.io.Serializable
+{
+    @Override
+    public abstract void serialize(T value, JsonGenerator gen,
+        SerializerProvider provider)
+        throws IOException;
+}
+`
+	syms, _ := extract(t, astkit.LangJava, src)
+	bySig := map[string]string{}
+	for _, s := range syms {
+		bySig[s.Name] = s.Signature
+	}
+	clsSig := bySig["StdSerializer"]
+	if !strings.Contains(clsSig, "extends JsonSerializer<T>") ||
+		!strings.Contains(clsSig, "implements JsonFormatVisitable, java.io.Serializable") {
+		t.Errorf("class signature lost wrapped extends/implements: %q", clsSig)
+	}
+	if strings.Contains(clsSig, "@SuppressWarnings") {
+		t.Errorf("annotation leaked into class signature: %q", clsSig)
+	}
+	mSig := bySig["serialize"]
+	if !strings.Contains(mSig, "SerializerProvider provider") {
+		t.Errorf("method signature lost wrapped params: %q", mSig)
+	}
+	if strings.Contains(mSig, "@Override") {
+		t.Errorf("annotation leaked into method signature: %q", mSig)
+	}
+}
+
 func TestExtract_Rust(t *testing.T) {
 	src := `use std::fmt;
 

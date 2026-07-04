@@ -669,7 +669,9 @@ func javaTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 	}
 	className := nameNode.Content(src)
 	raw := n.Content(src)
-	sig := internalast.FirstLine(raw)
+	// Full header (not FirstLine): Java wraps extends/implements clauses onto
+	// continuation lines, and a leading annotation is not a signature.
+	sig := internalast.SignatureBeforeBody(n, src)
 	modifiers := javaModifiers(n, src)
 	exports := strings.Contains(sig, "public")
 	for _, m := range modifiers {
@@ -704,7 +706,9 @@ func javaMethodDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA st
 	}
 	name := nameNode.Content(src)
 	raw := n.Content(src)
-	sig := internalast.FirstLine(raw)
+	// Full header (not FirstLine): multi-line parameter lists must survive so
+	// overloads can be discriminated by parameter types downstream.
+	sig := internalast.SignatureBeforeBody(n, src)
 	modifiers := javaModifiers(n, src)
 	exports := strings.Contains(sig, "public")
 	for _, m := range modifiers {

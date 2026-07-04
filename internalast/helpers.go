@@ -4,6 +4,8 @@
 package internalast
 
 import (
+	"strings"
+
 	sitter "github.com/smacker/go-tree-sitter"
 
 	"github.com/provasign/astkit"
@@ -92,4 +94,61 @@ func FirstLine(s string) string {
 		}
 	}
 	return s
+}
+
+// SignatureBeforeBody returns the declaration header of n — everything from
+// the node start up to (not including) its "body" child — with annotation
+// nodes excised and whitespace collapsed to single spaces. Unlike FirstLine,
+// this survives declarations that wrap `extends`/`implements` clauses or
+// parameter lists onto continuation lines, and never returns a leading
+// `@Override` line as the signature. Falls back to the whole node text when
+// there is no body (e.g. abstract or interface methods).
+func SignatureBeforeBody(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	start := n.StartByte()
+	end := n.EndByte()
+	if body := n.ChildByFieldName("body"); body != nil {
+		end = body.StartByte()
+	}
+	if int(end) > len(src) {
+		end = uint32(len(src))
+	}
+	if start >= end {
+		return ""
+	}
+	// Annotations live inside the "modifiers" child; excise their byte ranges
+	// so they never masquerade as (or pollute) the signature. They remain
+	// available on the symbol's Annotations field.
+	var cuts [][2]uint32
+	if mods := FindChildByType(n, "modifiers"); mods != nil {
+		count := int(mods.ChildCount())
+		for i := 0; i < count; i++ {
+			c := mods.Child(i)
+			if c == nil {
+				continue
+			}
+			if t := c.Type(); t == "marker_annotation" || t == "annotation" {
+				cuts = append(cuts, [2]uint32{c.StartByte(), c.EndByte()})
+			}
+		}
+	}
+	var b strings.Builder
+	pos := start
+	for _, cut := range cuts {
+		if cut[0] >= end {
+			break
+		}
+		if cut[0] > pos {
+			b.Write(src[pos:cut[0]])
+		}
+		if cut[1] > pos {
+			pos = cut[1]
+		}
+	}
+	if pos < end {
+		b.Write(src[pos:end])
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
 }
