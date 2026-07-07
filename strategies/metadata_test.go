@@ -637,3 +637,33 @@ func TestJava_ExplicitConstructorInvocation(t *testing.T) {
 		t.Errorf("method reference String::trim must not be emitted as a call (got %d)", mref)
 	}
 }
+
+// A trailing line comment on a wrapped declaration header must not be glued
+// into the signature by whitespace collapsing — jackson's
+// ManagedReferenceProperty buried its extends clause behind "// Changed to
+// extends delegating base class in 2.9", corrupting every downstream
+// consumer that parses the signature.
+func TestJava_HeaderCommentDoesNotCorruptSignature(t *testing.T) {
+	src := `package x;
+
+public final class ManagedReferenceProperty  // Changed to extends delegating base class in 2.9
+    extends SettableBeanProperty.Delegating
+{
+  public void set() { }
+}
+`
+	syms, _ := extract(t, astkit.LangJava, src)
+	found := false
+	for _, s := range syms {
+		if s.Name == "ManagedReferenceProperty" {
+			found = true
+			want := "public final class ManagedReferenceProperty extends SettableBeanProperty.Delegating"
+			if s.Signature != want {
+				t.Errorf("Signature = %q, want %q", s.Signature, want)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("class not extracted")
+	}
+}

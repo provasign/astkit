@@ -150,5 +150,74 @@ func SignatureBeforeBody(n *sitter.Node, src []byte) string {
 	if pos < end {
 		b.Write(src[pos:end])
 	}
-	return strings.Join(strings.Fields(b.String()), " ")
+	return strings.Join(strings.Fields(stripHeaderComments(b.String())), " ")
+}
+
+// stripHeaderComments removes line comments (`// …` to end of physical line)
+// and block comments from a declaration header BEFORE whitespace collapsing.
+// The collapse joins continuation lines, so a trailing line comment would
+// otherwise be glued into the signature: jackson's
+//
+//	public final class ManagedReferenceProperty  // Changed in 2.9
+//	    extends SettableBeanProperty.Delegating
+//
+// became "… ManagedReferenceProperty // Changed in 2.9 extends …", burying
+// the real extends clause behind comment text and corrupting every consumer
+// that parses the signature. Quote-aware so `//` inside a string literal
+// (annotation arguments) survives.
+func stripHeaderComments(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+	inStr, inChar, inBlock := false, false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inBlock {
+			if c == '*' && i+1 < len(s) && s[i+1] == '/' {
+				inBlock = false
+				i++
+			}
+			continue
+		}
+		if inStr {
+			out.WriteByte(c)
+			if c == '\\' && i+1 < len(s) {
+				out.WriteByte(s[i+1])
+				i++
+			} else if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		if inChar {
+			out.WriteByte(c)
+			if c == '\\' && i+1 < len(s) {
+				out.WriteByte(s[i+1])
+				i++
+			} else if c == '\'' {
+				inChar = false
+			}
+			continue
+		}
+		switch {
+		case c == '"':
+			inStr = true
+			out.WriteByte(c)
+		case c == '\'':
+			inChar = true
+			out.WriteByte(c)
+		case c == '/' && i+1 < len(s) && s[i+1] == '/':
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+			if i < len(s) {
+				out.WriteByte('\n')
+			}
+		case c == '/' && i+1 < len(s) && s[i+1] == '*':
+			inBlock = true
+			i++
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return out.String()
 }
