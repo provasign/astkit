@@ -1,6 +1,7 @@
 package strategies_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/provasign/astkit"
@@ -665,5 +666,48 @@ public final class ManagedReferenceProperty  // Changed to extends delegating ba
 	}
 	if !found {
 		t.Fatal("class not extracted")
+	}
+}
+
+// A wrapped extends/implements clause (standard Prettier style for TS) must
+// survive into the signature — FirstLine truncated it, dropping the whole
+// inheritance clause and every downstream extends/implements edge (29 real
+// typeorm classes were affected).
+func TestTS_WrappedInheritanceClauseInSignature(t *testing.T) {
+	src := `export class AuroraMysqlQueryRunner
+    extends BaseQueryRunner
+    implements QueryRunner
+{
+  foo(): void {}
+}
+`
+	syms, _ := extract(t, astkit.LangTypeScript, src)
+	found := false
+	for _, s := range syms {
+		if s.Name == "AuroraMysqlQueryRunner" {
+			found = true
+			for _, want := range []string{"extends BaseQueryRunner", "implements QueryRunner"} {
+				if !strings.Contains(s.Signature, want) {
+					t.Errorf("signature %q missing %q", s.Signature, want)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("class not extracted")
+	}
+}
+
+// A block comment abutting tokens in a declaration header must not glue them
+// together after whitespace collapsing.
+func TestJava_BlockCommentDoesNotGlueTokens(t *testing.T) {
+	src := "package x;\n\npublic class Foo/*note*/extends Bar {\n  void m() {}\n}\n"
+	syms, _ := extract(t, astkit.LangJava, src)
+	for _, s := range syms {
+		if s.Name == "Foo" {
+			if !strings.Contains(s.Signature, "extends Bar") || strings.Contains(s.Signature, "Fooextends") {
+				t.Errorf("signature glued tokens: %q", s.Signature)
+			}
+		}
 	}
 }

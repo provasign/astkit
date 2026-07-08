@@ -175,6 +175,12 @@ func stripHeaderComments(s string) string {
 			if c == '*' && i+1 < len(s) && s[i+1] == '/' {
 				inBlock = false
 				i++
+				// Replace the whole comment with a space so tokens that
+				// abutted it stay separated: `Foo/*x*/extends Bar` must not
+				// collapse to `Fooextends Bar` (which hides the extends
+				// clause from downstream regexes). Later Fields() collapses
+				// runs of whitespace, so one space is enough.
+				out.WriteByte(' ')
 			}
 			continue
 		}

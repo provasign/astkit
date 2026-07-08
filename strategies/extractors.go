@@ -377,7 +377,7 @@ func jsClassDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 		Kind:           astkit.KindClass,
 		Name:           className,
 		QualifiedName:  className,
-		Signature:      internalast.FirstLine(raw),
+		Signature:      internalast.SignatureBeforeBody(n, src),
 		Span:           internalast.NodeSpan(n),
 		Exported:       exported,
 		Body:           raw,
@@ -596,7 +596,7 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 			Kind:          astkit.KindClass,
 			Name:          className,
 			QualifiedName: className,
-			Signature:     internalast.FirstLine(raw),
+			Signature:     internalast.SignatureBeforeBody(n, src),
 			Span:          internalast.NodeSpan(n),
 			Exported:      !strings.HasPrefix(className, "_"),
 			Body:          raw,
@@ -744,7 +744,9 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 	}
 	name := nameNode.Content(src)
 	raw := n.Content(src)
-	sig := internalast.FirstLine(raw)
+	// Full header, not FirstLine: an annotation on its own line before the
+	// field made FirstLine return just "@Deprecated" as the signature.
+	sig := internalast.SignatureBeforeBody(n, src)
 	modifiers := javaModifiers(n, src)
 	exports := strings.Contains(sig, "public")
 	for _, m := range modifiers {
@@ -1309,7 +1311,7 @@ func cppClassSym(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 		Kind:          astkit.KindClass,
 		Name:          className,
 		QualifiedName: className,
-		Signature:     internalast.FirstLine(raw),
+		Signature:     internalast.SignatureBeforeBody(n, src),
 		Span:          internalast.NodeSpan(n),
 		Exported:      true,
 		Body:          raw,
@@ -1446,7 +1448,7 @@ func csTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA string
 		Kind:           kind,
 		Name:           name,
 		QualifiedName:  name,
-		Signature:      internalast.FirstLine(raw),
+		Signature:      internalast.SignatureBeforeBody(n, src),
 		Span:           internalast.NodeSpan(n),
 		Exported:       csIsExported(modifiers),
 		Body:           raw,
@@ -1880,7 +1882,7 @@ func phpClassDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 		Kind:          kind,
 		Name:          className,
 		QualifiedName: className,
-		Signature:     internalast.FirstLine(raw),
+		Signature:     internalast.SignatureBeforeBody(n, src),
 		Span:          internalast.NodeSpan(n),
 		Exported:      true,
 		Body:          raw,
