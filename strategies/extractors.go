@@ -280,7 +280,7 @@ func jsVisitChild(n *sitter.Node, filePath, blobSHA, language string, src []byte
 			*out = append(*out, *sym)
 			body := n.ChildByFieldName("body")
 			if body != nil {
-				jsVisit(body, filePath, blobSHA, language, src, imports, sym.Name, false, out)
+				jsVisit(body, filePath, blobSHA, language, src, imports, sym.QualifiedName, false, out)
 			}
 		}
 	case "method_definition", "abstract_method_signature":
@@ -376,12 +376,12 @@ func jsClassDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 	*out = append(*out, astkit.Symbol{
 		Kind:           astkit.KindClass,
 		Name:           className,
-		QualifiedName:  className,
+		QualifiedName:  qualJoin(parentClass, className),
 		Signature:      internalast.SignatureBeforeBody(n, src),
 		Span:           internalast.NodeSpan(n),
 		Exported:       exported,
 		Body:           raw,
-		ParentName:     parentClass,
+		ParentName:     qualLast(parentClass),
 		Modifiers:      jsModifiers(n, src),
 		TypeParameters: jsTypeParameters(n, src),
 		Annotations:    jsDecorators(n, src),
@@ -389,7 +389,7 @@ func jsClassDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 	// Visit class body for methods. Methods are never directly exported.
 	body := n.ChildByFieldName("body")
 	if body != nil {
-		jsVisit(body, filePath, blobSHA, language, src, imports, className, false, out)
+		jsVisit(body, filePath, blobSHA, language, src, imports, qualJoin(parentClass, className), false, out)
 	}
 }
 
@@ -408,12 +408,12 @@ func jsMethodDef(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
 		Name:           name,
-		QualifiedName:  name,
+		QualifiedName:  qualJoin(parentClass, name),
 		Signature:      funcSig(n, src),
 		Span:           internalast.NodeSpan(n),
 		Exported:       false, // methods are accessed via their class, not exported directly
 		Body:           raw,
-		ParentName:     parentClass,
+		ParentName:     qualLast(parentClass),
 		Modifiers:      jsModifiers(n, src),
 		TypeParameters: jsTypeParameters(n, src),
 		Annotations:    jsDecorators(n, src),
@@ -432,12 +432,12 @@ func jsFieldDef(n *sitter.Node, filePath, blobSHA, language string, src []byte, 
 	*out = append(*out, astkit.Symbol{
 		Kind:          astkit.KindField,
 		Name:          name,
-		QualifiedName: name,
+		QualifiedName: qualJoin(parentClass, name),
 		Signature:     internalast.FirstLine(raw),
 		Span:          internalast.NodeSpan(n),
 		Exported:      false,
 		Body:          raw,
-		ParentName:    parentClass,
+		ParentName:    qualLast(parentClass),
 		Modifiers:     jsModifiers(n, src),
 		Annotations:   jsDecorators(n, src),
 	})
@@ -462,12 +462,12 @@ func jsNamedSym(n *sitter.Node, field, filePath, blobSHA, language string, src [
 	return &astkit.Symbol{
 		Kind:           k,
 		Name:           name,
-		QualifiedName:  name,
+		QualifiedName:  qualJoin(parentClass, name),
 		Signature:      funcSig(n, src),
 		Span:           internalast.NodeSpan(n),
 		Exported:       exported,
 		Body:           raw,
-		ParentName:     parentClass,
+		ParentName:     qualLast(parentClass),
 		Modifiers:      jsModifiers(n, src),
 		TypeParameters: jsTypeParameters(n, src),
 		Annotations:    jsDecorators(n, src),
@@ -523,12 +523,12 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 			*out = append(*out, astkit.Symbol{
 				Kind:           k,
 				Name:           name,
-				QualifiedName:  name,
+				QualifiedName:  qualJoin(parentClass, name),
 				Signature:      internalast.FirstLine(raw),
 				Span:           internalast.NodeSpan(decl),
 				Exported:       exported,
 				Body:           raw,
-				ParentName:     parentClass,
+				ParentName:     qualLast(parentClass),
 				TypeParameters: jsTypeParameters(valueNode, src),
 				CallSites:      jsCallSites(body, src),
 			})
@@ -574,12 +574,12 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 		*out = append(*out, astkit.Symbol{
 			Kind:          kind,
 			Name:          name,
-			QualifiedName: name,
+			QualifiedName: qualJoin(parentClass, name),
 			Signature:     internalast.FirstLine(raw),
 			Span:          internalast.NodeSpan(n),
 			Exported:      !strings.HasPrefix(name, "_"),
 			Body:          raw,
-			ParentName:    parentClass,
+			ParentName:    qualLast(parentClass),
 			Modifiers:     pythonModifiers(name),
 			Annotations:   decorators,
 			CallSites:     pythonCallSites(body, src),
@@ -595,18 +595,18 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 		*out = append(*out, astkit.Symbol{
 			Kind:          astkit.KindClass,
 			Name:          className,
-			QualifiedName: className,
+			QualifiedName: qualJoin(parentClass, className),
 			Signature:     internalast.SignatureBeforeBody(n, src),
 			Span:          internalast.NodeSpan(n),
 			Exported:      !strings.HasPrefix(className, "_"),
 			Body:          raw,
-			ParentName:    parentClass,
+			ParentName:    qualLast(parentClass),
 			Modifiers:     pythonModifiers(className),
 			Annotations:   decorators,
 		})
 		body := n.ChildByFieldName("body")
 		if body != nil {
-			pythonVisit(body, filePath, blobSHA, src, imports, className, out)
+			pythonVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, className), out)
 		}
 	case "decorated_definition":
 		decos := pythonDecorators(n, src)
@@ -621,6 +621,26 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 }
 
 // ─── Java ─────────────────────────────────────────────────────────────────────
+
+// qualJoin builds a dotted qualified path ("Outer.Inner" from "Outer" + "Inner");
+// an empty prefix yields the bare name. qualLast returns the innermost segment
+// of a dotted path ("Outer.Inner" → "Inner"), used as ParentName so grove's
+// ParentSymbol matching (which keys on the immediate parent's simple name)
+// keeps working while QualifiedName carries the full path — the two together
+// disambiguate 2+level nested types that share (immediate-parent, own-name).
+func qualJoin(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "." + name
+}
+
+func qualLast(path string) string {
+	if i := strings.LastIndexByte(path, '.'); i >= 0 {
+		return path[i+1:]
+	}
+	return path
+}
 
 func extractJavaNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
@@ -683,19 +703,19 @@ func javaTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
 		Name:           className,
-		QualifiedName:  className,
+		QualifiedName:  qualJoin(parentClass, className),
 		Signature:      sig,
 		Span:           internalast.NodeSpan(n),
 		Exported:       exports,
 		Body:           raw,
-		ParentName:     parentClass,
+		ParentName:     qualLast(parentClass),
 		Modifiers:      modifiers,
 		TypeParameters: javaTypeParameters(n, src),
 		Annotations:    javaAnnotations(n, src),
 	})
 	body := n.ChildByFieldName("body")
 	if body != nil {
-		javaVisit(body, filePath, blobSHA, src, imports, className, out)
+		javaVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, className), out)
 	}
 }
 
@@ -720,12 +740,12 @@ func javaMethodDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA st
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
 		Name:           name,
-		QualifiedName:  name,
+		QualifiedName:  qualJoin(parentClass, name),
 		Signature:      sig,
 		Span:           internalast.NodeSpan(n),
 		Exported:       exports,
 		Body:           raw,
-		ParentName:     parentClass,
+		ParentName:     qualLast(parentClass),
 		Modifiers:      modifiers,
 		TypeParameters: javaTypeParameters(n, src),
 		Annotations:    javaAnnotations(n, src),
@@ -757,12 +777,12 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 	*out = append(*out, astkit.Symbol{
 		Kind:          astkit.KindField,
 		Name:          name,
-		QualifiedName: name,
+		QualifiedName: qualJoin(parentClass, name),
 		Signature:     sig,
 		Span:          internalast.NodeSpan(n),
 		Exported:      exports,
 		Body:          raw,
-		ParentName:    parentClass,
+		ParentName:    qualLast(parentClass),
 		Modifiers:     modifiers,
 		Annotations:   javaAnnotations(n, src),
 	})
@@ -1447,18 +1467,18 @@ func csTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA string
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
 		Name:           name,
-		QualifiedName:  name,
+		QualifiedName:  qualJoin(parentClass, name),
 		Signature:      internalast.SignatureBeforeBody(n, src),
 		Span:           internalast.NodeSpan(n),
 		Exported:       csIsExported(modifiers),
 		Body:           raw,
-		ParentName:     parentClass,
+		ParentName:     qualLast(parentClass),
 		Modifiers:      modifiers,
 		TypeParameters: csTypeParams(n, src),
 		Annotations:    csAttributes(n, src),
 	})
 	if body := n.ChildByFieldName("body"); body != nil {
-		csVisit(body, filePath, blobSHA, src, imports, name, out)
+		csVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, name), out)
 	}
 }
 
@@ -1477,12 +1497,12 @@ func csMethodDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports 
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
 		Name:           name,
-		QualifiedName:  name,
+		QualifiedName:  qualJoin(parentClass, name),
 		Signature:      funcSig(n, src),
 		Span:           internalast.NodeSpan(n),
 		Exported:       csIsExported(modifiers),
 		Body:           raw,
-		ParentName:     parentClass,
+		ParentName:     qualLast(parentClass),
 		Modifiers:      modifiers,
 		TypeParameters: csTypeParams(n, src),
 		Annotations:    csAttributes(n, src),
@@ -1619,12 +1639,12 @@ func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, import
 	*out = append(*out, astkit.Symbol{
 		Kind:          astkit.KindField,
 		Name:          name,
-		QualifiedName: name,
+		QualifiedName: qualJoin(parentClass, name),
 		Signature:     internalast.FirstLine(raw),
 		Span:          internalast.NodeSpan(n),
 		Exported:      csIsExported(modifiers),
 		Body:          raw,
-		ParentName:    parentClass,
+		ParentName:    qualLast(parentClass),
 		Modifiers:     modifiers,
 		Annotations:   csAttributes(n, src),
 	})
@@ -1646,12 +1666,12 @@ func csFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports [
 		*out = append(*out, astkit.Symbol{
 			Kind:          astkit.KindField,
 			Name:          name,
-			QualifiedName: name,
+			QualifiedName: qualJoin(parentClass, name),
 			Signature:     internalast.FirstLine(raw),
 			Span:          internalast.NodeSpan(child),
 			Exported:      csIsExported(modifiers),
 			Body:          raw,
-			ParentName:    parentClass,
+			ParentName:    qualLast(parentClass),
 			Modifiers:     modifiers,
 		})
 	}

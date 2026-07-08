@@ -711,3 +711,42 @@ func TestJava_BlockCommentDoesNotGlueTokens(t *testing.T) {
 		}
 	}
 }
+
+// Two 2-level-nested types sharing (immediate-parent, own-name) must get
+// DISTINCT QualifiedNames (full ancestor path) while keeping the immediate
+// ParentName — else they collapse to one and a change-impact query returns
+// both unrelated scopes. Verified for Java; the same threading covers
+// JS/TS, C#, and Python.
+func TestJava_NestedTypeQualifiedNamePath(t *testing.T) {
+	src := `public class Outer1 {
+    static class Detail {
+        interface Builder { void build(); }
+    }
+}
+public class Outer2 {
+    static class Detail {
+        interface Builder { void build(); }
+    }
+}
+`
+	syms, _ := extract(t, astkit.LangJava, src)
+	builders := map[string]string{} // qualifiedName -> parentName
+	for _, s := range syms {
+		if s.Name == "Builder" {
+			builders[s.QualifiedName] = s.ParentName
+		}
+	}
+	if _, ok := builders["Outer1.Detail.Builder"]; !ok {
+		t.Errorf("missing full-path QualifiedName Outer1.Detail.Builder; got %v", builders)
+	}
+	if _, ok := builders["Outer2.Detail.Builder"]; !ok {
+		t.Errorf("missing full-path QualifiedName Outer2.Detail.Builder; got %v", builders)
+	}
+	// ParentName stays the immediate parent (grove's ParentSymbol matching
+	// keys on the simple name), NOT the full path.
+	for qn, pn := range builders {
+		if pn != "Detail" {
+			t.Errorf("%s: ParentName = %q, want immediate parent Detail", qn, pn)
+		}
+	}
+}
