@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/provasign/astkit"
+	"github.com/provasign/astkit/strategies"
 )
 
 func TestDetectLanguage(t *testing.T) {
@@ -192,5 +193,32 @@ func TestImportStatementZeroValue(t *testing.T) {
 func TestLanguageKeyString(t *testing.T) {
 	if !strings.HasPrefix(string(astkit.LangGo), "go") {
 		t.Fatal("LangGo string broken")
+	}
+}
+
+
+func TestGuardDepth_RejectsPathologicalNesting(t *testing.T) {
+	eng := astkit.NewEngine()
+	reg := strategies.Default()
+	// Deeper than astkit.MaxASTDepth: parses fine, would stack-overflow the
+	// recursive Python extractor without the guard. Extract must return an
+	// error, never crash.
+	deep := []byte("x = " + strings.Repeat("(", astkit.MaxASTDepth+5000) + "1" +
+		strings.Repeat(")", astkit.MaxASTDepth+5000) + "\n")
+	tree, err := eng.Parse(context.Background(), astkit.LangPython, deep)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	defer tree.Close()
+	if _, err := reg.Extract(astkit.LangPython, tree, deep); err == nil {
+		t.Fatal("expected depth-guard error on pathologically nested input, got nil")
+	}
+	// A normal file must still extract cleanly.
+	norm := []byte("def hello():\n    return 1\n")
+	t2, _ := eng.Parse(context.Background(), astkit.LangPython, norm)
+	defer t2.Close()
+	syms, err := reg.Extract(astkit.LangPython, t2, norm)
+	if err != nil || len(syms) == 0 {
+		t.Fatalf("normal extract regressed: err=%v syms=%d", err, len(syms))
 	}
 }

@@ -148,6 +148,9 @@ func (r *Registry) Extract(lang LanguageKey, tree *sitter.Tree, src []byte) ([]S
 	if s == nil {
 		return nil, nil
 	}
+	if err := guardDepth(tree); err != nil {
+		return nil, err
+	}
 	return s.Extract(tree, src)
 }
 
@@ -157,5 +160,50 @@ func (r *Registry) ExtractImports(lang LanguageKey, tree *sitter.Tree, src []byt
 	if s == nil {
 		return nil, nil
 	}
+	if err := guardDepth(tree); err != nil {
+		return nil, err
+	}
 	return s.ExtractImports(tree, src)
+}
+
+// MaxASTDepth bounds tree nesting before extraction. Every per-language
+// extractor walks the tree by direct Go recursion (one call frame per level);
+// a crafted file nested a few hundred thousand levels deep ("((((((…))))))")
+// parses fine but overflows the goroutine stack during extraction — a FATAL,
+// non-recoverable runtime error that takes down the whole host process and
+// every concurrent request Grove/Fuse is serving. A recover() cannot catch a
+// stack overflow, so the depth must be rejected BEFORE the recursive walk.
+// 4000 is far past any real source file (deeply-generated code rarely exceeds
+// a few hundred) while leaving ample headroom below the stack limit.
+const MaxASTDepth = 4000
+
+// guardDepth rejects a tree whose nesting exceeds MaxASTDepth. It walks with a
+// TreeCursor (iterative, O(1) stack — it cannot itself overflow) rather than
+// recursion, so it is safe to run on the very input it is protecting against.
+func guardDepth(tree *sitter.Tree) error {
+	if tree == nil {
+		return nil
+	}
+	root := tree.RootNode()
+	if root == nil {
+		return nil
+	}
+	c := sitter.NewTreeCursor(root)
+	defer c.Close()
+	depth := 0
+	for {
+		if c.GoToFirstChild() {
+			depth++
+			if depth > MaxASTDepth {
+				return fmt.Errorf("astkit: AST nesting exceeds %d levels — refusing extraction (possible denial-of-service input)", MaxASTDepth)
+			}
+			continue
+		}
+		for !c.GoToNextSibling() {
+			if !c.GoToParent() {
+				return nil // walked the whole tree; within bounds
+			}
+			depth--
+		}
+	}
 }
