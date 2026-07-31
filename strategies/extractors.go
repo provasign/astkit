@@ -617,6 +617,73 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 				return
 			}
 		}
+	case "if_statement", "try_statement", "with_statement",
+		"while_statement", "for_statement", "match_statement":
+		// Conditionally-defined symbols still exist: a class under
+		// `if TYPE_CHECKING:` (Flask's LocalProxy stub classes), a
+		// def in a try/except import fallback, or a platform-specific
+		// class in an `if sys.platform ...` branch. Recurse into every
+		// nested block so these are indexed rather than silently dropped.
+		pythonVisitBlocks(n, filePath, blobSHA, src, imports, parentClass, out)
+	case "expression_statement":
+		// Module-level annotated assignment ("g: _AppCtxGlobalsProxy = ...").
+		// Only at module scope (parentClass == ""): class-body attribute
+		// types are already recovered by grove's class-attr inference, and
+		// function-local annotations by its body-scoped local-type pass, so
+		// indexing those would only add noise. Module globals are otherwise
+		// entirely invisible — no symbol carries their declared type — which
+		// blocks resolving calls through proxy globals (Flask's `g`, etc.).
+		if parentClass != "" {
+			return
+		}
+		for j := 0; j < int(n.ChildCount()); j++ {
+			a := n.Child(j)
+			if a == nil || a.Type() != "assignment" {
+				continue
+			}
+			left := a.ChildByFieldName("left")
+			typeNode := a.ChildByFieldName("type")
+			if left == nil || typeNode == nil || left.Type() != "identifier" {
+				continue
+			}
+			name := left.Content(src)
+			raw := n.Content(src)
+			*out = append(*out, astkit.Symbol{
+				Kind:          astkit.KindVariable,
+				Name:          name,
+				QualifiedName: name,
+				Signature:     name + ": " + typeNode.Content(src),
+				Span:          internalast.NodeSpan(n),
+				Exported:      !strings.HasPrefix(name, "_"),
+				Body:          raw,
+				Modifiers:     pythonModifiers(name),
+			})
+		}
+	}
+}
+
+// pythonVisitBlocks recurses through the block/clause children of a compound
+// statement (if/for/while/try/with/match), running pythonVisitDefinition on
+// each contained statement so conditionally-defined classes, functions, and
+// module-level annotated variables are still indexed. Condition and iterable
+// expressions are skipped — only block-bearing children are descended.
+func pythonVisitBlocks(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil {
+			continue
+		}
+		switch {
+		case c.Type() == "block":
+			for j := 0; j < int(c.ChildCount()); j++ {
+				if inner := c.Child(j); inner != nil {
+					pythonVisitDefinition(inner, filePath, blobSHA, src, imports, parentClass, nil, out)
+				}
+			}
+		case strings.HasSuffix(c.Type(), "_clause"):
+			// elif/else/except/finally/case clauses each wrap a block.
+			pythonVisitBlocks(c, filePath, blobSHA, src, imports, parentClass, out)
+		}
 	}
 }
 

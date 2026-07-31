@@ -218,6 +218,50 @@ def hello(name):
 	}
 }
 
+func TestExtract_PythonModuleVarsAndConditionalClasses(t *testing.T) {
+	// A module-level annotated global and a class defined only under
+	// `if TYPE_CHECKING:` — both invisible before recursion into block
+	// statements and expression-statement annotated assignments were added.
+	src := `import typing as t
+from werkzeug.local import LocalProxy
+
+if t.TYPE_CHECKING:
+    from .ctx import _AppCtxGlobals
+
+    class _AppCtxGlobalsProxy(_AppCtxGlobals): ...
+
+g: _AppCtxGlobalsProxy = LocalProxy(_cv_app, "g")
+
+def helper():
+    local_only: int = 1
+    return local_only
+`
+	syms, _ := extract(t, astkit.LangPython, src)
+	var gVar, proxy *astkit.Symbol
+	for i := range syms {
+		switch syms[i].Name {
+		case "g":
+			gVar = &syms[i]
+		case "_AppCtxGlobalsProxy":
+			proxy = &syms[i]
+		case "local_only":
+			t.Errorf("function-local annotated var must NOT be indexed as a symbol")
+		}
+	}
+	if gVar == nil {
+		t.Fatalf("module-level global `g` not indexed; got %v", names(syms))
+	}
+	if gVar.Kind != astkit.KindVariable {
+		t.Errorf("g kind = %q, want variable", gVar.Kind)
+	}
+	if !strings.Contains(gVar.Signature, "_AppCtxGlobalsProxy") {
+		t.Errorf("g signature %q lost its type annotation", gVar.Signature)
+	}
+	if proxy == nil || proxy.Kind != astkit.KindClass {
+		t.Fatalf("TYPE_CHECKING class `_AppCtxGlobalsProxy` not indexed; got %v", names(syms))
+	}
+}
+
 func TestExtract_JavaScript(t *testing.T) {
 	src := `import {x} from "./mod";
 
