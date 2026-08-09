@@ -60,10 +60,20 @@ func NodeSpan(n *sitter.Node) astkit.LineRange {
 	if n == nil {
 		return astkit.LineRange{}
 	}
-	return astkit.LineRange{
-		Start: int(n.StartPoint().Row) + 1,
-		End:   int(n.EndPoint().Row) + 1,
+	start := int(n.StartPoint().Row) + 1
+	end := int(n.EndPoint().Row) + 1
+	// Tree-sitter's EndPoint is the position AFTER the node's last byte. When
+	// a grammar makes a node consume its trailing newline, EndPoint sits at
+	// column 0 of the NEXT line, and +1 marks the node as ending one line too
+	// far. Downstream this is not cosmetic: prism's lossless-delta rendering
+	// substitutes span line ranges for unchanged bodies, so an over-long span
+	// can swallow a changed line into a "[prism:cached]" pointer. Its
+	// overlap guard only fails closed when the next symbol starts on that
+	// exact line — a blank line between symbols defeats it.
+	if end > start && n.EndPoint().Column == 0 {
+		end--
 	}
+	return astkit.LineRange{Start: start, End: end}
 }
 
 // IsCapitalized reports whether name begins with an uppercase ASCII letter.
