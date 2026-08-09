@@ -25,6 +25,21 @@ func WalkChildren(n *sitter.Node, fn func(*sitter.Node)) {
 	}
 }
 
+// WalkTree invokes fn on n and every descendant, in document order. Use it
+// for constructs that are legal at any nesting depth (Python imports under
+// `if TYPE_CHECKING:` or inside functions, PHP require inside a body) where
+// an immediate-children walk silently drops real statements.
+func WalkTree(n *sitter.Node, fn func(*sitter.Node)) {
+	if n == nil {
+		return
+	}
+	fn(n)
+	count := int(n.ChildCount())
+	for i := 0; i < count; i++ {
+		WalkTree(n.Child(i), fn)
+	}
+}
+
 // FindChildByType returns the first immediate child of n whose Type() equals kind.
 func FindChildByType(n *sitter.Node, kind string) *sitter.Node {
 	if n == nil {

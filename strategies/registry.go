@@ -135,7 +135,9 @@ func (p *pythonStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit
 		return nil, nil
 	}
 	var imps []astkit.ImportStatement
-	internalast.WalkChildren(tree.RootNode(), func(n *sitter.Node) {
+	// Whole-tree walk: imports are legal at any depth (`if TYPE_CHECKING:`,
+	// inside functions) and an immediate-children walk dropped them.
+	internalast.WalkTree(tree.RootNode(), func(n *sitter.Node) {
 		switch n.Type() {
 		case "import_statement":
 			for i := 0; i < int(n.ChildCount()); i++ {
@@ -143,11 +145,21 @@ func (p *pythonStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit
 				if c == nil {
 					continue
 				}
-				if c.Type() == "dotted_name" || c.Type() == "aliased_import" {
+				switch c.Type() {
+				case "dotted_name":
 					imps = append(imps, astkit.ImportStatement{
 						Raw:  internalast.NodeText(n, src),
 						Path: internalast.NodeText(c, src),
 						Line: int(n.StartPoint().Row) + 1,
+					})
+				case "aliased_import":
+					// `import typing as t`: Path is the module, Alias the
+					// local binding — never the whole "typing as t" text.
+					imps = append(imps, astkit.ImportStatement{
+						Raw:   internalast.NodeText(n, src),
+						Path:  internalast.NodeText(c.ChildByFieldName("name"), src),
+						Alias: internalast.NodeText(c.ChildByFieldName("alias"), src),
+						Line:  int(n.StartPoint().Row) + 1,
 					})
 				}
 			}
@@ -383,15 +395,73 @@ func (p *phpStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.Im
 		return nil, nil
 	}
 	var imps []astkit.ImportStatement
-	internalast.WalkChildren(tree.RootNode(), func(n *sitter.Node) {
+	// Whole-tree walk: require/include are expressions and appear at any
+	// depth; use declarations sit under the program node but not as its
+	// immediate children in all grammar versions.
+	internalast.WalkTree(tree.RootNode(), func(n *sitter.Node) {
 		switch n.Type() {
-		case "namespace_use_declaration", "require_expression", "require_once_expression", "include_expression", "include_once_expression":
+		case "namespace_use_declaration":
 			raw := strings.TrimSpace(internalast.NodeText(n, src))
-			imps = append(imps, astkit.ImportStatement{
-				Raw:  raw,
-				Path: raw,
-				Line: int(n.StartPoint().Row) + 1,
+			line := int(n.StartPoint().Row) + 1
+			// One ImportStatement per use clause, with the qualified name as
+			// Path and any `as` binding as Alias — consumers resolve Path
+			// verbatim, so it must never be the whole statement text.
+			found := false
+			internalast.WalkTree(n, func(c *sitter.Node) {
+				if c.Type() != "namespace_use_clause" {
+					return
+				}
+				found = true
+				imp := astkit.ImportStatement{Raw: raw, Line: line}
+				for i := 0; i < int(c.ChildCount()); i++ {
+					cc := c.Child(i)
+					if cc == nil {
+						continue
+					}
+					switch cc.Type() {
+					case "qualified_name", "name":
+						if imp.Path == "" {
+							imp.Path = internalast.NodeText(cc, src)
+						}
+					case "namespace_aliasing_clause":
+						imp.Alias = strings.TrimSpace(strings.TrimPrefix(
+							strings.TrimSpace(internalast.NodeText(cc, src)), "as"))
+					}
+				}
+				if imp.Path != "" {
+					imps = append(imps, imp)
+				}
 			})
+			if !found {
+				// Grammar shape we did not model: keep the statement rather
+				// than dropping it, with the `use `/`;` shell trimmed.
+				path := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(raw, "use")), ";")
+				imps = append(imps, astkit.ImportStatement{
+					Raw: raw, Path: strings.TrimSpace(path), Line: line,
+				})
+			}
+		case "require_expression", "require_once_expression", "include_expression", "include_once_expression":
+			raw := strings.TrimSpace(internalast.NodeText(n, src))
+			imp := astkit.ImportStatement{Raw: raw, Line: int(n.StartPoint().Row) + 1}
+			// Path is the argument (usually a string literal, quotes
+			// stripped), not the whole `require ...` expression.
+			internalast.WalkTree(n, func(c *sitter.Node) {
+				if imp.Path == "" && c.Type() == "string_content" {
+					imp.Path = internalast.NodeText(c, src)
+				}
+			})
+			if imp.Path == "" {
+				for _, kw := range []string{"require_once", "include_once", "require", "include"} {
+					if strings.HasPrefix(raw, kw) {
+						imp.Path = strings.TrimSuffix(strings.TrimSpace(raw[len(kw):]), ";")
+						break
+					}
+				}
+				if imp.Path == "" {
+					imp.Path = raw
+				}
+			}
+			imps = append(imps, imp)
 		}
 	})
 	return imps, nil

@@ -52,6 +52,10 @@ func (e *Engine) Parse(ctx context.Context, lang LanguageKey, src []byte) (*sitt
 		return nil, nil
 	}
 	p := sitter.NewParser()
+	// Release the native parser eagerly: the returned tree does not depend on
+	// it, and waiting for the finalizer lets large indexes accumulate
+	// significant native memory before GC notices.
+	defer p.Close()
 	p.SetLanguage(tsLang)
 	cctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
