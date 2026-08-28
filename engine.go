@@ -115,6 +115,17 @@ type Strategy interface {
 	ExtractImports(tree *sitter.Tree, src []byte) ([]ImportStatement, error)
 }
 
+// TextStrategy is an optional capability a Strategy may implement when it
+// extracts from source text alone — no tree-sitter grammar exists for its
+// language, and its Extract/ExtractImports accept a nil tree. Intended for
+// line-structured artifact types (job control, data-division extracts,
+// sort control cards); no current language implements it.
+type TextStrategy interface {
+	Strategy
+	// ExtractsFromText reports that Extract tolerates a nil tree.
+	ExtractsFromText() bool
+}
+
 // Registry is a thread-safe map of LanguageKey → Strategy.
 type Registry struct {
 	mu sync.RWMutex
@@ -147,6 +158,15 @@ func (r *Registry) Get(lang LanguageKey) Strategy {
 
 // Extract is a convenience that looks up the strategy and runs Extract.
 // Returns (nil, nil) when no strategy is registered.
+// TextCapable reports whether the strategy registered under lang extracts
+// from source text alone (Extract accepts a nil tree). Callers use it to
+// decide whether a language with no tree-sitter grammar still yields
+// symbols; it is false for every current language.
+func (r *Registry) TextCapable(lang LanguageKey) bool {
+	ts, ok := r.Get(lang).(TextStrategy)
+	return ok && ts.ExtractsFromText()
+}
+
 func (r *Registry) Extract(lang LanguageKey, tree *sitter.Tree, src []byte) ([]Symbol, error) {
 	s := r.Get(lang)
 	if s == nil {
