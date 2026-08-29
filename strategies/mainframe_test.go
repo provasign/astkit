@@ -265,3 +265,21 @@ func TestCOBOL_ParagraphBody(t *testing.T) {
 		t.Error("MAIN-PARA body contains INIT-PARA's statements")
 	}
 }
+
+func TestJCL_DatasetSymbols(t *testing.T) {
+	syms, err := NewJCL().Extract(nil, []byte(jclSample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds := find(t, syms, "dataset", "PROD.CUST.MASTER")
+	if ds.ParentName != "UPDATE" {
+		t.Errorf("dataset parent step = %q", ds.ParentName)
+	}
+	if len(ds.Modifiers) != 1 || ds.Modifiers[0] != "dd:CUSTIN" {
+		t.Errorf("dataset modifiers = %v", ds.Modifiers)
+	}
+	out := find(t, syms, "dataset", "PROD.CUST.MASTER.NEW")
+	if out.Modifiers[0] != "dd:CUSTOUT" {
+		t.Errorf("continued DD dataset modifiers = %v", out.Modifiers)
+	}
+}

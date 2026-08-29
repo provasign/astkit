@@ -14,6 +14,7 @@ const (
 	kindJob     astkit.SymbolKind = "job"
 	kindStep    astkit.SymbolKind = "step"
 	kindJCLProc astkit.SymbolKind = "jcl-procedure"
+	kindDataset astkit.SymbolKind = "dataset"
 )
 
 // jclStrategy extracts job control: jobs, steps (with the program or
@@ -70,6 +71,7 @@ func (j *jclStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, e
 	var syms []astkit.Symbol
 	var jobName, procName string
 	var stepCount int
+	var lastStep, lastDD string
 
 	for _, ln := range joinJCL(src) {
 		m := reJCLStmt.FindStringSubmatch(ln.text)
@@ -96,6 +98,21 @@ func (j *jclStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, e
 			})
 		case "PEND":
 			procName = ""
+		case "DD":
+			if name != "" {
+				lastDD = name // concatenated DDs ("//  DD") reuse the name
+			}
+			if dm := reDSN.FindStringSubmatch(operands); dm != nil {
+				dsn := strings.ToUpper(dm[1])
+				parent := lastStep
+				syms = append(syms, astkit.Symbol{
+					Kind: kindDataset, Name: dsn, QualifiedName: dsn,
+					ParentName: parent,
+					Signature:  strings.TrimSpace(ln.text),
+					Span:       astkit.LineRange{Start: ln.orig, End: ln.orig},
+					Modifiers:  []string{"dd:" + strings.ToUpper(lastDD)},
+				})
+			}
 		case "EXEC":
 			stepCount++
 			parent := jobName
@@ -123,6 +140,7 @@ func (j *jclStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, e
 				s.CallSites = append(s.CallSites, astkit.CallSite{Callee: strings.ToUpper(pm[1]), Line: ln.orig})
 			}
 			syms = append(syms, s)
+			lastStep = name
 		}
 	}
 	return syms, nil
