@@ -283,3 +283,37 @@ func TestJCL_DatasetSymbols(t *testing.T) {
 		t.Errorf("continued DD dataset modifiers = %v", out.Modifiers)
 	}
 }
+
+// Field-reported classes: REPLACING pseudo-text must never yield a member,
+// and a statement wrapping between COPY and its member still resolves.
+func TestCOBOL_CopyReplacingAndWrap(t *testing.T) {
+	src := strings.Join([]string{
+		pad("000100", " ", " DATA DIVISION."),
+		pad("000200", " ", " COPY LSCDT990 REPLACING =='LS&&####'== BY =='LSSDSIC'==."),
+		pad("000300", " ", " COPY"),
+		pad("000400", " ", "     AUCCS020."),
+		pad("000500", " ", " COPY CUSTREC REPLACING ==COPY FAKEMEM== BY ==X==."),
+	}, "\n")
+	imports, err := NewCOBOL().ExtractImports(nil, []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, im := range imports {
+		paths = append(paths, im.Path)
+	}
+	want := []string{"LSCDT990", "AUCCS020", "CUSTREC"}
+	if len(paths) != 3 {
+		t.Fatalf("want %v, got %v", want, paths)
+	}
+	for i, w := range want {
+		if paths[i] != w {
+			t.Errorf("import %d = %q, want %q", i, paths[i], w)
+		}
+	}
+	for _, p := range paths {
+		if strings.Contains(p, "#") || strings.Contains(p, "&") || p == "FAKEMEM" {
+			t.Errorf("pseudo-text leaked into member name: %q", p)
+		}
+	}
+}

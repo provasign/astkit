@@ -342,20 +342,46 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 	return syms, nil
 }
 
+var (
+	// Pseudo-text (==...==) and quoted literals must be erased before member
+	// extraction: REPLACING arguments legally contain '&', '#' and even the
+	// word COPY, and a member name harvested from them is confidently wrong
+	// (observed on a real estate: 54 members extracted from REPLACING args).
+	rePseudoText = regexp.MustCompile(`==[^=]*(?:=[^=]+)*==`)
+	reQuotedLit  = regexp.MustCompile(`'[^']*'|"[^"]*"`)
+	reCopyTail   = regexp.MustCompile(`(?i)\bCOPY\s*$`)
+	reMemberHead = regexp.MustCompile(`^\s*([A-Za-z0-9][A-Za-z0-9-]*)`)
+)
+
 func (c *cobolStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.ImportStatement, error) {
 	_ = tree
 	var imports []astkit.ImportStatement
+	emit := func(member, raw string, line int) {
+		if member == "" || reReserved.MatchString(member) {
+			return
+		}
+		imports = append(imports, astkit.ImportStatement{
+			Raw:   strings.TrimSpace(raw),
+			Path:  strings.ToUpper(member),
+			Group: "copybook",
+			Line:  line,
+		})
+	}
+	pendingCopy := false // previous line ended at COPY; member starts this line
 	for _, ln := range normalizeCOBOL(src) {
-		for _, m := range reCopy.FindAllStringSubmatch(ln.text, -1) {
-			if reReserved.MatchString(m[1]) {
-				continue
+		clean := rePseudoText.ReplaceAllString(ln.text, " ")
+		clean = reQuotedLit.ReplaceAllString(clean, " ")
+		if pendingCopy {
+			if m := reMemberHead.FindStringSubmatch(clean); m != nil {
+				emit(m[1], ln.text, ln.orig)
 			}
-			imports = append(imports, astkit.ImportStatement{
-				Raw:   strings.TrimSpace(ln.text),
-				Path:  strings.ToUpper(m[1]),
-				Group: "copybook",
-				Line:  ln.orig,
-			})
+			pendingCopy = false
+		}
+		for _, m := range reCopy.FindAllStringSubmatch(clean, -1) {
+			emit(m[1], ln.text, ln.orig)
+		}
+		if reCopyTail.MatchString(clean) {
+			pendingCopy = true
 		}
 	}
 	return imports, nil
