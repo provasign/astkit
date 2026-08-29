@@ -33,6 +33,9 @@ func Default() *astkit.Registry {
 	r.Register(NewCPP())
 	r.Register(NewCSharp())
 	r.Register(NewPHP())
+	// Mainframe text strategies (no grammar; Extract accepts a nil tree).
+	r.Register(NewCOBOL())
+	r.Register(NewJCL())
 	return r
 }
 

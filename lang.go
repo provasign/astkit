@@ -31,6 +31,14 @@ const (
 	LangTOML LanguageKey = "toml"
 )
 
+// Mainframe artifact languages: extracted by TextStrategy implementations
+// (no tree-sitter grammar). LangCOBOL covers programs and copybooks — the
+// strategy distinguishes them by content.
+const (
+	LangCOBOL LanguageKey = "cobol"
+	LangJCL   LanguageKey = "jcl"
+)
+
 // DetectLanguage returns the language for a given file path. The content
 // argument is currently unused but reserved for future shebang/heredoc
 // disambiguation.
@@ -64,6 +72,10 @@ func DetectLanguage(path, _ string) LanguageKey {
 		return LangYAML
 	case ".toml":
 		return LangTOML
+	case ".cbl", ".cob", ".cobol", ".cpy", ".ccp", ".cpb":
+		return LangCOBOL
+	case ".jcl", ".prc":
+		return LangJCL
 	default:
 		return LangUnknown
 	}
