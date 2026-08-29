@@ -782,8 +782,76 @@ func javaTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 	})
 	body := n.ChildByFieldName("body")
 	if body != nil {
+		before := len(*out)
 		javaVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, className), out)
+		synthesizeLombokAccessors(className, javaAnnotations(n, src), before, out)
 	}
+}
+
+// synthesizeLombokAccessors emits getter/setter method symbols for fields of
+// a class annotated @Getter/@Setter/@Data/@Value (or fields carrying those
+// annotations themselves). Without this, a Lombok entity's accessors exist
+// only in bytecode: call sites reference getLoanId() but no such symbol is
+// indexed, so the field is UNANCHORABLE for change-impact and every accessor
+// caller dangles (measured on apache/fineract: entity fields with derived
+// queries could not be queried at all). Synthesized symbols carry the
+// "lombok-generated" modifier and the FIELD's span, so results point at the
+// declaration a human would edit.
+func synthesizeLombokAccessors(className string, classAnn []string, fieldsFrom int, out *[]astkit.Symbol) {
+	has := func(ann []string, names ...string) bool {
+		// javaAnnotations strips the leading @; match the bare name exactly
+		// or with an argument list ("Getter", "Getter(...)").
+		for _, a := range ann {
+			for _, n := range names {
+				if a == n || strings.HasPrefix(a, n+"(") {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	clsGetter := has(classAnn, "Getter", "Data", "Value")
+	clsSetter := has(classAnn, "Setter", "Data")
+	if !clsGetter && !clsSetter {
+		// Field-level annotations may still apply; scan below regardless.
+	}
+	var synth []astkit.Symbol
+	fields := (*out)[fieldsFrom:]
+	for i := range fields {
+		f := &fields[i]
+		if f.Kind != astkit.KindField || f.ParentName != className {
+			continue
+		}
+		g := clsGetter || has(f.Annotations, "Getter", "Data", "Value")
+		s := clsSetter || has(f.Annotations, "Setter", "Data")
+		if !g && !s {
+			continue
+		}
+		name := f.Name
+		cap := strings.ToUpper(name[:1]) + name[1:]
+		getter := "get" + cap
+		if strings.Contains(f.Signature, "boolean ") {
+			getter = "is" + cap
+		}
+		mk := func(mname, sig string) astkit.Symbol {
+			return astkit.Symbol{
+				Kind: astkit.KindMethod, Name: mname,
+				QualifiedName: f.QualifiedName[:len(f.QualifiedName)-len(name)] + mname,
+				ParentName:    className,
+				Signature:     sig,
+				Span:          f.Span,
+				Exported:      true,
+				Modifiers:     []string{"lombok-generated"},
+			}
+		}
+		if g {
+			synth = append(synth, mk(getter, "public "+getter+"() [lombok, from field "+name+"]"))
+		}
+		if s {
+			synth = append(synth, mk("set"+cap, "public set"+cap+"(...) [lombok, from field "+name+"]"))
+		}
+	}
+	*out = append(*out, synth...)
 }
 
 func javaMethodDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {

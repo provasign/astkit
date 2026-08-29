@@ -499,3 +499,56 @@ func TestExtract_Signature(t *testing.T) {
 	}
 	t.Fatal("Foo not found")
 }
+
+func TestJava_LombokAccessorSynthesis(t *testing.T) {
+	src := []byte(`
+import lombok.Getter;
+import lombok.Setter;
+import lombok.Data;
+
+@Getter
+@Setter
+public class LoanMapping {
+    private Long loanId;
+    private boolean active;
+}
+
+@Data
+class Wallet {
+    private String owner;
+}
+
+class Plain {
+    private int x;
+}
+`)
+	eng := astkit.NewEngine()
+	tree, err := eng.Parse(context.Background(), astkit.LangJava, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tree.Close()
+	syms, err := strategies.NewJava().Extract(tree, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]astkit.Symbol{}
+	for _, s := range syms {
+		byName[s.QualifiedName] = s
+	}
+	for _, want := range []string{"LoanMapping.getLoanId", "LoanMapping.setLoanId",
+		"LoanMapping.isActive", "LoanMapping.setActive",
+		"Wallet.getOwner", "Wallet.setOwner"} {
+		s, ok := byName[want]
+		if !ok {
+			t.Errorf("missing synthesized accessor %s", want)
+			continue
+		}
+		if s.Kind != astkit.KindMethod || len(s.Modifiers) == 0 || s.Modifiers[0] != "lombok-generated" {
+			t.Errorf("%s: kind=%s modifiers=%v", want, s.Kind, s.Modifiers)
+		}
+	}
+	if _, ok := byName["Plain.getX"]; ok {
+		t.Error("Plain has no Lombok annotations but got a synthesized getter")
+	}
+}
