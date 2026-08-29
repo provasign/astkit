@@ -108,7 +108,13 @@ func detectFixedFormat(lines []string) bool {
 		if sampled > 50 {
 			break
 		}
-		if len(line) >= 7 && seqAreaOK(line[:6]) && strings.ContainsRune(" *-/Dd", rune(line[6])) {
+		// The sequence area (cols 1-6) may contain ANYTHING — the compiler
+		// ignores it, and estates commonly stamp the member name there
+		// (measured: such copybooks extracted ZERO symbols when the digits
+		// requirement misdetected them as free format, silently breaking
+		// member resolution for the whole estate). Only the indicator
+		// column decides.
+		if len(line) >= 7 && strings.ContainsRune(" *-/Dd", rune(line[6])) {
 			fixedShaped++
 		}
 	}
@@ -116,15 +122,6 @@ func detectFixedFormat(lines []string) bool {
 		sampled = 50
 	}
 	return sampled > 0 && fixedShaped*5 >= sampled*4 // >= 80%
-}
-
-func seqAreaOK(s string) bool {
-	for _, r := range s {
-		if r != ' ' && (r < '0' || r > '9') {
-			return false
-		}
-	}
-	return true
 }
 
 var (

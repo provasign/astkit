@@ -317,3 +317,23 @@ func TestCOBOL_CopyReplacingAndWrap(t *testing.T) {
 		}
 	}
 }
+
+// Field-reported: estates stamp the member name in the sequence area
+// (cols 1-6) — legal, the compiler ignores it. The format detector must
+// not require digits there, or such copybooks extract ZERO symbols and
+// member resolution silently dies for most of the estate.
+func TestCOBOL_MemberNameStampedSequenceArea(t *testing.T) {
+	src := strings.Join([]string{
+		"AUCCS0 01  AU-REC." + strings.Repeat(" ", 44) + "AUCCS020",
+		"AUCCS0     05  AU-ID   PIC 9(8)." + strings.Repeat(" ", 30) + "AUCCS020",
+		"AUCCS0     05  AU-SSN  PIC 9(9)." + strings.Repeat(" ", 30) + "AUCCS020",
+	}, "\n")
+	syms := extractCOBOL(t, src)
+	if len(syms) != 3 {
+		t.Fatalf("stamped copybook: want 3 symbols, got %v", names(syms))
+	}
+	ssn := find(t, syms, "data-item", "AU-SSN")
+	if ssn.QualifiedName != "AU-REC.AU-SSN" {
+		t.Errorf("AU-SSN qualified = %q", ssn.QualifiedName)
+	}
+}
