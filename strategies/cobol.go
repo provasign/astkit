@@ -138,7 +138,10 @@ var (
 	rePerform    = regexp.MustCompile(`(?i)\bPERFORM\s+([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+(?:THRU|THROUGH)\s+([A-Za-z0-9-]+))?`)
 	reCallLit    = regexp.MustCompile(`(?i)\bCALL\s+['"]([^'"]+)['"]`)
 	reCallVar    = regexp.MustCompile(`(?i)\bCALL\s+([A-Za-z][A-Za-z0-9-]*)`)
-	reCopy       = regexp.MustCompile(`(?i)\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+(?:OF|IN)\s+([A-Za-z0-9-]+))?`)
+	// Member names cannot start with a digit (PDS naming): a leading-digit
+	// match is a sequence number or numeric operand, not a member
+	// (field-reported: 68 numeric "members" like 053300).
+	reCopy       = regexp.MustCompile(`(?i)\bCOPY\s+([A-Za-z@#$][A-Za-z0-9@#$-]*)(?:\s+(?:OF|IN)\s+([A-Za-z0-9-]+))?`)
 	reReserved   = regexp.MustCompile(`(?i)^(EXIT|STOP|GOBACK|END|ELSE|WHEN|UNTIL|VARYING|TIMES)$`)
 )
 
@@ -347,7 +350,7 @@ var (
 	rePseudoText = regexp.MustCompile(`==[^=]*(?:=[^=]+)*==`)
 	reQuotedLit  = regexp.MustCompile(`'[^']*'|"[^"]*"`)
 	reCopyTail   = regexp.MustCompile(`(?i)\bCOPY\s*$`)
-	reMemberHead = regexp.MustCompile(`^\s*([A-Za-z0-9][A-Za-z0-9-]*)`)
+	reMemberHead = regexp.MustCompile(`^\s*([A-Za-z@#$][A-Za-z0-9@#$-]*)`)
 )
 
 func (c *cobolStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.ImportStatement, error) {

@@ -337,3 +337,22 @@ func TestCOBOL_MemberNameStampedSequenceArea(t *testing.T) {
 		t.Errorf("AU-SSN qualified = %q", ssn.QualifiedName)
 	}
 }
+
+// Field-reported: 68 numeric "members" (053300, 08, 11) — sequence numbers
+// or numeric operands captured as COPY targets. PDS member names cannot
+// start with a digit.
+func TestCOBOL_NoNumericMembers(t *testing.T) {
+	src := strings.Join([]string{
+		pad("000100", " ", " COPY"),
+		pad("000200", " ", " 053300 MOVE A TO B."),
+		pad("000300", " ", " COPY 08."),
+		pad("000400", " ", " COPY REALMEM."),
+	}, "\n")
+	imports, err := NewCOBOL().ExtractImports(nil, []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imports) != 1 || imports[0].Path != "REALMEM" {
+		t.Fatalf("want only REALMEM, got %+v", imports)
+	}
+}
