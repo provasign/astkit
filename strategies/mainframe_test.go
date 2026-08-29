@@ -252,3 +252,16 @@ func contains(xs []string, want string) bool {
 	}
 	return false
 }
+
+func TestCOBOL_ParagraphBody(t *testing.T) {
+	syms := extractCOBOL(t, cobolSample)
+	main := find(t, syms, "paragraph", "MAIN-PARA")
+	for _, want := range []string{"PERFORM INIT-PARA", "CALL 'AUDITLOG'", "STOP RUN"} {
+		if !strings.Contains(main.Body, want) {
+			t.Errorf("MAIN-PARA body missing %q:\n%s", want, main.Body)
+		}
+	}
+	if strings.Contains(main.Body, "MOVE 'N' TO WS-EOF") {
+		t.Error("MAIN-PARA body contains INIT-PARA's statements")
+	}
+}

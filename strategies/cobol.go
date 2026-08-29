@@ -322,9 +322,17 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 				}
 			}
 		}
-		// span growth for the enclosing procedure
-		if currentProc != nil && ln.orig > currentProc.Span.End {
-			currentProc.Span.End = ln.orig
+		// span growth + body accumulation for the enclosing procedure —
+		// Body carries the normalized statement text so graph consumers can
+		// resolve field references without re-normalizing the file.
+		if currentProc != nil && division == "PROCEDURE" {
+			if ln.orig > currentProc.Span.End {
+				currentProc.Span.End = ln.orig
+			}
+			if currentProc.Body != "" {
+				currentProc.Body += "\n"
+			}
+			currentProc.Body += strings.TrimSpace(ln.text)
 		}
 	}
 	flushProc()
