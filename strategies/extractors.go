@@ -626,16 +626,23 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 		// nested block so these are indexed rather than silently dropped.
 		pythonVisitBlocks(n, filePath, blobSHA, src, imports, parentClass, out)
 	case "expression_statement":
-		// Module-level annotated assignment ("g: _AppCtxGlobalsProxy = ...").
-		// Only at module scope (parentClass == ""): class-body attribute
-		// types are already recovered by grove's class-attr inference, and
-		// function-local annotations by its body-scoped local-type pass, so
-		// indexing those would only add noise. Module globals are otherwise
-		// entirely invisible — no symbol carries their declared type — which
-		// blocks resolving calls through proxy globals (Flask's `g`, etc.).
-		if parentClass != "" {
-			return
-		}
+		// Module scope: annotated assignment ("g: _AppCtxGlobalsProxy = ...")
+		// becomes a KindVariable — module globals are otherwise invisible,
+		// blocking call resolution through proxy globals (Flask's `g`).
+		//
+		// Class body: EVERY attribute becomes a KindField (measured
+		// 2026-08-30: Python classes previously indexed ZERO attributes of
+		// any shape — plain `x = 5`, annotated `x: int = 5`, bare
+		// `x: int` dataclass/pydantic fields, SQLAlchemy
+		// `x: Mapped[str] = mapped_column(...)` — making field-level
+		// change-impact impossible for Python and leaving the Jinja
+		// template-binding edges with no field targets). The earlier
+		// rationale ("grove's class-attr inference recovers the types")
+		// conflated type inference with symbol existence: inference feeds
+		// call RESOLUTION, but a symbol that is never indexed cannot be
+		// queried, searched, or bound to. Function-local annotations remain
+		// unindexed — pythonVisit only descends class bodies, not function
+		// bodies, so locals never reach here.
 		for j := 0; j < int(n.ChildCount()); j++ {
 			a := n.Child(j)
 			if a == nil || a.Type() != "assignment" {
@@ -643,19 +650,38 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 			}
 			left := a.ChildByFieldName("left")
 			typeNode := a.ChildByFieldName("type")
-			if left == nil || typeNode == nil || left.Type() != "identifier" {
+			if left == nil || left.Type() != "identifier" {
+				continue
+			}
+			if parentClass == "" && typeNode == nil {
+				// Module scope keeps its original contract: only ANNOTATED
+				// globals are indexed (a plain `x = 5` at module scope is
+				// config/constant noise at scale).
 				continue
 			}
 			name := left.Content(src)
 			raw := n.Content(src)
+			sig := name
+			if typeNode != nil {
+				sig = name + ": " + typeNode.Content(src)
+			} else if right := a.ChildByFieldName("right"); right != nil {
+				sig = internalast.FirstLine(raw)
+			}
+			kind := astkit.KindVariable
+			qn := name
+			if parentClass != "" {
+				kind = astkit.KindField
+				qn = qualJoin(parentClass, name)
+			}
 			*out = append(*out, astkit.Symbol{
-				Kind:          astkit.KindVariable,
+				Kind:          kind,
 				Name:          name,
-				QualifiedName: name,
-				Signature:     name + ": " + typeNode.Content(src),
+				QualifiedName: qn,
+				Signature:     sig,
 				Span:          internalast.NodeSpan(n),
 				Exported:      !strings.HasPrefix(name, "_"),
 				Body:          raw,
+				ParentName:    qualLast(parentClass),
 				Modifiers:     pythonModifiers(name),
 			})
 		}

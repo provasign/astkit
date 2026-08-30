@@ -552,3 +552,61 @@ class Plain {
 		t.Error("Plain has no Lombok annotations but got a synthesized getter")
 	}
 }
+
+func TestPython_ClassAttributesAsFields(t *testing.T) {
+	src := []byte(`
+import sqlalchemy.orm as so
+
+class User:
+    plain = 5
+    annotated: int = 7
+    bare: str
+    username: so.Mapped[str] = so.mapped_column()
+    _private: int = 0
+
+g: SomeProxy = make_proxy()
+plain_global = 3
+`)
+	eng := astkit.NewEngine()
+	tree, err := eng.Parse(context.Background(), astkit.LangPython, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tree.Close()
+	syms, err := strategies.NewPython().Extract(tree, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byQN := map[string]astkit.Symbol{}
+	for _, s := range syms {
+		byQN[s.QualifiedName] = s
+	}
+	for _, want := range []string{"User.plain", "User.annotated", "User.bare", "User.username", "User._private"} {
+		s, ok := byQN[want]
+		if !ok {
+			t.Errorf("missing class attribute %s (have %v)", want, keysOf(byQN))
+			continue
+		}
+		if s.Kind != astkit.KindField || s.ParentName != "User" {
+			t.Errorf("%s: kind=%s parent=%s", want, s.Kind, s.ParentName)
+		}
+	}
+	if byQN["User._private"].Exported {
+		t.Error("_private should not be exported")
+	}
+	// Module contract preserved: annotated global indexed, plain global not.
+	if _, ok := byQN["g"]; !ok {
+		t.Error("annotated module global lost")
+	}
+	if _, ok := byQN["plain_global"]; ok {
+		t.Error("plain module global should stay unindexed")
+	}
+}
+
+func keysOf(m map[string]astkit.Symbol) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
