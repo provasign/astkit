@@ -344,6 +344,42 @@ static int do_dump(const json_t *json, int depth) {
 	}
 }
 
+// base./this. receivers reach the call site as qualifiers.
+func TestCSharp_CallSiteBaseAndThis(t *testing.T) {
+	src := `class B : A {
+  public override void WriteValue(int value) { base.WriteValue(value); this.Other(1); }
+}`
+	syms, _ := extract(t, astkit.LangCSharp, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee] = true
+		}
+	}
+	for _, want := range []string{"base.WriteValue", "this.Other"} {
+		if !got[want] {
+			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+}
+
+// Java super./this. receivers reach the call site as qualifiers.
+func TestJava_CallSiteSuperAndThis(t *testing.T) {
+	src := `class B extends A { void f() { this.g(); super.g(); } }`
+	syms, _ := extract(t, astkit.LangJava, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee] = true
+		}
+	}
+	for _, want := range []string{"this.g", "super.g"} {
+		if !got[want] {
+			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+}
+
 func TestCSharp_CallSiteGenericAndArgs(t *testing.T) {
 	// A generic invocation must set Generic and unwrap the C# `argument`
 	// wrapper so the bare identifier/literal arg classifies (it returned ""

@@ -449,8 +449,11 @@ func javaCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 				obj := call.ChildByFieldName("object")
 				qual := javaReceiverQualifier(obj, src)
 				if qual == "" {
+					// "super" is its own node type: without it here,
+					// super.g() arrived as a bare g and bound the caller's
+					// own class.
 					qual = qualifierName(obj, src,
-						[]string{"identifier", "this"},
+						[]string{"identifier", "this", "super"},
 						map[string]string{"field_access": "field"},
 						map[string]string{"method_invocation": "name"})
 				}

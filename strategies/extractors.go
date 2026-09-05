@@ -1757,7 +1757,11 @@ func csCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
 					return ""
 				}
 				qual := qualifierName(fn.ChildByFieldName("expression"), src,
-					[]string{"identifier", "this_expression", "base_expression"},
+					// tree-sitter-c-sharp names the receiver keywords plainly
+					// ("this", "base"); the *_expression spellings matched
+					// nothing, so base.WriteValue(v) arrived as a bare
+					// WriteValue and bound the caller's own overload family.
+					[]string{"identifier", "this", "base", "this_expression", "base_expression"},
 					map[string]string{"member_access_expression": "name"},
 					map[string]string{"invocation_expression": "function"})
 				return joinQualified(qual, method)
