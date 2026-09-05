@@ -240,7 +240,24 @@ func (r *rustStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, 
 	if tree == nil {
 		return nil, nil
 	}
-	return extractRustNodes(tree.RootNode(), "", "", src, nil), nil
+	out := extractRustNodes(tree.RootNode(), "", "", src, nil)
+	if len(out) == 0 && tree.RootNode().NamedChildCount() > 0 {
+		// A re-export-only file (a facade crate's lib.rs holding nothing
+		// but `pub use`/`pub extern crate`) declares no items, and a file
+		// with no symbols does not exist to the graph: its crate root went
+		// undetected and its re-exports never joined any scope. One module
+		// symbol spanning the file keeps it — and its imports — visible.
+		root := tree.RootNode()
+		out = append(out, astkit.Symbol{
+			Kind:          astkit.KindModule,
+			Name:          "crate",
+			QualifiedName: "crate",
+			Signature:     "re-export module",
+			Span:          internalast.NodeSpan(root),
+			Exported:      true,
+		})
+	}
+	return out, nil
 }
 func (r *rustStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.ImportStatement, error) {
 	if tree == nil {
@@ -248,16 +265,28 @@ func (r *rustStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.I
 	}
 	var imps []astkit.ImportStatement
 	internalast.WalkChildren(tree.RootNode(), func(n *sitter.Node) {
-		if n.Type() != "use_declaration" {
-			return
+		switch n.Type() {
+		case "use_declaration":
+			raw := strings.TrimSpace(internalast.NodeText(n, src))
+			path := strings.TrimSuffix(strings.TrimPrefix(raw, "use "), ";")
+			imps = append(imps, astkit.ImportStatement{
+				Raw:  raw,
+				Path: strings.TrimSpace(path),
+				Line: int(n.StartPoint().Row) + 1,
+			})
+		case "extern_crate_declaration":
+			// `pub extern crate grep_cli as cli;` is a crate re-export
+			// exactly like `pub use grep_cli as cli;` — ripgrep's facade
+			// crate is built from these — so it is recorded in that form,
+			// which consumers already read as a re-export chain.
+			raw := strings.TrimSpace(internalast.NodeText(n, src))
+			path := strings.TrimSuffix(strings.Replace(raw, "extern crate ", "use ", 1), ";")
+			imps = append(imps, astkit.ImportStatement{
+				Raw:  raw,
+				Path: strings.TrimSpace(path),
+				Line: int(n.StartPoint().Row) + 1,
+			})
 		}
-		raw := strings.TrimSpace(internalast.NodeText(n, src))
-		path := strings.TrimSuffix(strings.TrimPrefix(raw, "use "), ";")
-		imps = append(imps, astkit.ImportStatement{
-			Raw:  raw,
-			Path: strings.TrimSpace(path),
-			Line: int(n.StartPoint().Row) + 1,
-		})
 	})
 	return imps, nil
 }

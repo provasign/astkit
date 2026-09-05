@@ -72,6 +72,36 @@ from os.path import join
 	}
 }
 
+// Rust facade crates re-export through `pub extern crate x as y;` and hold
+// no items: the re-export must be an import and the file must still
+// yield a symbol.
+func TestRustImports_ExternCrateAndFacade(t *testing.T) {
+	src := `pub extern crate grep_cli as cli;
+pub use grep_regex as regex;
+pub mod hiargs;
+`
+	syms, imps := extract(t, astkit.LangRust, src)
+	if findImport(imps, "pub use grep_cli as cli") == nil {
+		t.Errorf("extern crate re-export not recorded as pub use: %+v", imps)
+	}
+	if findImport(imps, "pub use grep_regex as regex") == nil {
+		t.Errorf("pub use missing: %+v", imps)
+	}
+	var mods []string
+	for _, s := range syms {
+		if s.Kind == astkit.KindModule {
+			mods = append(mods, s.Name)
+		}
+	}
+	if len(mods) != 1 || mods[0] != "hiargs" {
+		t.Errorf("mod declaration symbol = %v, want [hiargs]", mods)
+	}
+	syms2, _ := extract(t, astkit.LangRust, "pub extern crate grep_cli as cli;\n")
+	if len(syms2) != 1 || syms2[0].Kind != astkit.KindModule {
+		t.Errorf("re-export-only file must yield one module symbol, got %+v", syms2)
+	}
+}
+
 // PHP use/require must store a resolvable Path (qualified name or file), not
 // the entire statement text.
 func TestPHPImports_PathsAndAliases(t *testing.T) {

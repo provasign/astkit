@@ -1039,9 +1039,13 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 		case "mod_item":
 			// Inline modules (`mod tests { ... }`) nest arbitrary items;
 			// unit tests live here by convention, so not descending hides
-			// every #[cfg(test)] function in the file.
+			// every #[cfg(test)] function in the file. A declaration
+			// (`pub mod hiargs;`) becomes a module symbol so a lib.rs made
+			// of mod lines still exists to the graph.
 			if body := n.ChildByFieldName("body"); body != nil {
 				rustVisit(body, filePath, blobSHA, src, imports, implType, implBounds, implTrait, out)
+			} else {
+				rustNamedItem(n, astkit.KindModule, filePath, blobSHA, src, imports, out)
 			}
 		}
 	}
