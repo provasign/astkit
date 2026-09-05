@@ -264,7 +264,10 @@ func (r *rustStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.I
 		return nil, nil
 	}
 	var imps []astkit.ImportStatement
-	internalast.WalkChildren(tree.RootNode(), func(n *sitter.Node) {
+	// Whole-tree walk: `use` lines inside `mod tests { ... }` and inside
+	// function bodies are imports too — a top-level-only walk left every
+	// test module's dependencies (and its scope) unrecorded.
+	internalast.WalkTree(tree.RootNode(), func(n *sitter.Node) {
 		switch n.Type() {
 		case "use_declaration":
 			raw := strings.TrimSpace(internalast.NodeText(n, src))

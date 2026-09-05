@@ -96,6 +96,10 @@ pub mod hiargs;
 	if len(mods) != 1 || mods[0] != "hiargs" {
 		t.Errorf("mod declaration symbol = %v, want [hiargs]", mods)
 	}
+	_, nested := extract(t, astkit.LangRust, "fn f() {}\n#[cfg(test)]\nmod tests {\n    use grep_regex::{RegexMatcher, RegexMatcherBuilder};\n    fn g() { use std::io; }\n}\n")
+	if findImport(nested, "grep_regex::{RegexMatcher, RegexMatcherBuilder}") == nil || findImport(nested, "std::io") == nil {
+		t.Errorf("nested use declarations missing: %+v", nested)
+	}
 	syms2, _ := extract(t, astkit.LangRust, "pub extern crate grep_cli as cli;\n")
 	if len(syms2) != 1 || syms2[0].Kind != astkit.KindModule {
 		t.Errorf("re-export-only file must yield one module symbol, got %+v", syms2)
