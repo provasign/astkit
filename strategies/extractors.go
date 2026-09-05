@@ -1185,6 +1185,8 @@ func rustWherePredicates(n *sitter.Node, src []byte) []string {
 
 func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
+	defined := map[string]bool{} // function names with a body in this file
+	prototype := map[int]bool{}  // out indices that came from declarations
 	for i := 0; i < int(root.ChildCount()); i++ {
 		n := root.Child(i)
 		if n == nil {
@@ -1194,10 +1196,16 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 		case "function_definition":
 			if sym := cFuncSym(n, filePath, blobSHA, language, src, imports, ""); sym != nil {
 				out = append(out, *sym)
+				defined[sym.Name] = true
 			}
 		case "declaration":
 			// Catches typedef struct, extern function declarations, etc.
-			out = append(out, cDeclarationSyms(n, filePath, blobSHA, language, src, imports)...)
+			for _, sym := range cDeclarationSyms(n, filePath, blobSHA, language, src, imports) {
+				if sym.Kind == astkit.KindFunction {
+					prototype[len(out)] = true
+				}
+				out = append(out, sym)
+			}
 		case "struct_specifier", "union_specifier":
 			if sym := cTaggedTypeSym(n, astkit.KindStruct, filePath, blobSHA, language, src, imports); sym != nil {
 				out = append(out, *sym)
@@ -1223,6 +1231,22 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 			out = append(out, cppTemplateDecl(n, filePath, blobSHA, language, src, imports)...)
 		}
 	}
+	// A prototype (`static int do_dump(...);`) for a function defined in
+	// the same file is the same function, not a second one: as its own
+	// 1-line symbol it split the function's identity (two do_dump
+	// declarations in change-impact) and, in span-based matching, claimed
+	// the definition's line so every call from the real body went missing.
+	if len(prototype) > 0 {
+		kept := out[:0]
+		for i, sym := range out {
+			if prototype[i] && defined[sym.Name] {
+				continue
+			}
+			kept = append(kept, sym)
+		}
+		out = kept
+	}
+
 	return out
 }
 

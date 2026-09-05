@@ -323,6 +323,27 @@ func TestCSharp_CallSiteArgMarkers(t *testing.T) {
 	}
 }
 
+// A C prototype for a function defined in the same file is not a second
+// function; a prototype without a definition (a header) stays.
+func TestC_PrototypeCollapsesIntoDefinition(t *testing.T) {
+	src := `static int do_dump(const json_t *json, int depth);
+int external_thing(int x);
+static int do_dump(const json_t *json, int depth) {
+    return depth;
+}
+`
+	syms, _ := extract(t, astkit.LangC, src)
+	var names []string
+	for _, s := range syms {
+		if s.Kind == astkit.KindFunction {
+			names = append(names, s.Name)
+		}
+	}
+	if strings.Join(names, ",") != "external_thing,do_dump" {
+		t.Errorf("functions = %v, want [external_thing do_dump]", names)
+	}
+}
+
 func TestCSharp_CallSiteGenericAndArgs(t *testing.T) {
 	// A generic invocation must set Generic and unwrap the C# `argument`
 	// wrapper so the bare identifier/literal arg classifies (it returned ""
