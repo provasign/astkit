@@ -168,10 +168,27 @@ func (p *pythonStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit
 			}
 		case "import_from_statement":
 			mod := internalast.NodeText(n.ChildByFieldName("module_name"), src)
+			// The bound members ride along: `from . import cli` binds a
+			// SUBMODULE, and a later `cli.show_server_banner(...)` is only
+			// resolvable if the consumer knows `cli` came from this import.
+			var names []string
+			for i := 0; i < int(n.ChildCount()); i++ {
+				c := n.Child(i)
+				if c == nil || n.FieldNameForChild(i) != "name" {
+					continue
+				}
+				switch c.Type() {
+				case "dotted_name":
+					names = append(names, internalast.NodeText(c, src))
+				case "aliased_import":
+					names = append(names, internalast.NodeText(c.ChildByFieldName("name"), src))
+				}
+			}
 			imps = append(imps, astkit.ImportStatement{
-				Raw:  internalast.NodeText(n, src),
-				Path: mod,
-				Line: int(n.StartPoint().Row) + 1,
+				Raw:   internalast.NodeText(n, src),
+				Path:  mod,
+				Names: names,
+				Line:  int(n.StartPoint().Row) + 1,
 			})
 		}
 	})

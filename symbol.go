@@ -132,6 +132,11 @@ type ImportStatement struct {
 	// Alias is the local binding name, if the import was aliased.
 	Alias string `json:"alias,omitempty"`
 
+	// Names lists the members a from-import binds ("from . import cli, app"
+	// → ["cli", "app"]). A member may itself be a submodule; consumers that
+	// resolve module paths decide which. Empty for whole-module imports.
+	Names []string `json:"names,omitempty"`
+
 	// Group classifies the import as stdlib | external | relative when known.
 	Group string `json:"group,omitempty"`
 

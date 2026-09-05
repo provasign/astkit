@@ -1,6 +1,7 @@
 package strategies_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/provasign/astkit"
@@ -48,6 +49,26 @@ def f():
 	}
 	if findImport(imps, "re") == nil {
 		t.Errorf("function-scoped import re missing: %+v", imps)
+	}
+}
+
+// From-imports carry the bound member names: `from . import cli` binds a
+// submodule the consumer can only resolve if it knows `cli` came from here.
+func TestPythonImports_FromImportNames(t *testing.T) {
+	src := `from . import cli, app as application
+from .helpers import _CollectErrors
+from os.path import join
+`
+	_, imps := extract(t, astkit.LangPython, src)
+	want := map[string][]string{".": {"cli", "app"}, ".helpers": {"_CollectErrors"}, "os.path": {"join"}}
+	for path, names := range want {
+		imp := findImport(imps, path)
+		if imp == nil {
+			t.Fatalf("import %q missing: %+v", path, imps)
+		}
+		if strings.Join(imp.Names, ",") != strings.Join(names, ",") {
+			t.Errorf("%s names = %v, want %v", path, imp.Names, names)
+		}
 	}
 }
 

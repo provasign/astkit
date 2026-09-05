@@ -248,6 +248,81 @@ func TestJava_CallSitesWithNew(t *testing.T) {
 	}
 }
 
+// Receivers qualifierName cannot name: a cast is typed by the cast, an array
+// element by the array variable, `X.class` by Class. Each must arrive
+// qualified, never bare (bare binds the caller's own same-named method).
+func TestJava_CallSiteReceiverShapes(t *testing.T) {
+	src := `class A {
+  int f(CharSequence cs, Integer[] array, Class<?> type) {
+    ((String) cs).indexOf("x");
+    array[0].intValue();
+    String.class.equals(type);
+    return 0;
+  }
+}`
+	syms, _ := extract(t, astkit.LangJava, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee] = true
+		}
+	}
+	for _, want := range []string{"String.indexOf", "array.intValue", "Class.equals"} {
+		if !got[want] {
+			t.Errorf("missing call site %q in %v", want, got)
+		}
+	}
+}
+
+// Wrapper constants and lambdas are typed argument evidence.
+func TestJava_CallSiteArgMarkers(t *testing.T) {
+	src := `class A {
+  void f(int[] a, int v) {
+    lastIndexOf(a, v, Integer.MAX_VALUE);
+    run(() -> 1);
+    run(A::g);
+  }
+}`
+	syms, _ := extract(t, astkit.LangJava, src)
+	var got [][]string
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got = append(got, cs.Args)
+		}
+	}
+	want := map[string]bool{"a,v,#int": true, "#lambda": true}
+	for _, args := range got {
+		delete(want, strings.Join(args, ","))
+	}
+	if len(want) != 0 {
+		t.Errorf("missing arg markers %v in %v", want, got)
+	}
+}
+
+// C# typed constants, lambdas and nested object creations are argument
+// evidence for overload resolution.
+func TestCSharp_CallSiteArgMarkers(t *testing.T) {
+	src := `class A {
+  void F() {
+    new JValue(int.MaxValue);
+    new JArray(new JValue(1), new JValue(2));
+    Run(x => x);
+  }
+}`
+	syms, _ := extract(t, astkit.LangCSharp, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee+":"+strings.Join(cs.Args, ",")] = true
+		}
+	}
+	for _, want := range []string{"JValue:#int", "JArray:#JValue,#JValue", "Run:#lambda"} {
+		if !got[want] {
+			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+}
+
 func TestCSharp_CallSiteGenericAndArgs(t *testing.T) {
 	// A generic invocation must set Generic and unwrap the C# `argument`
 	// wrapper so the bare identifier/literal arg classifies (it returned ""

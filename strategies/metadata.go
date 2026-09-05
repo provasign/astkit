@@ -178,7 +178,7 @@ func argToken(c *sitter.Node, src []byte) string {
 	case "character_literal", "rune_literal":
 		return "#char"
 	case "decimal_integer_literal", "hex_integer_literal", "octal_integer_literal",
-		"binary_integer_literal", "int_literal", "integer":
+		"binary_integer_literal", "int_literal", "integer", "integer_literal":
 		text := string(c.Content(src))
 		switch {
 		case strings.HasSuffix(text, "L") || strings.HasSuffix(text, "l"):
@@ -189,7 +189,9 @@ func argToken(c *sitter.Node, src []byte) string {
 			return "#double"
 		}
 		return "#int"
-	case "decimal_floating_point_literal", "float_literal", "float":
+	case "boolean_literal":
+		return "#boolean"
+	case "decimal_floating_point_literal", "float_literal", "float", "real_literal":
 		text := string(c.Content(src))
 		if strings.HasSuffix(text, "F") || strings.HasSuffix(text, "f") {
 			return "#float"
@@ -208,9 +210,67 @@ func argToken(c *sitter.Node, src []byte) string {
 		}
 	case "field_access":
 		// array.length is always int.
-		if f := c.ChildByFieldName("field"); f != nil && string(f.Content(src)) == "length" {
+		f := c.ChildByFieldName("field")
+		if f != nil && string(f.Content(src)) == "length" {
 			return "#int"
 		}
+		// Integer.MAX_VALUE and friends are typed constants: without them
+		// lastIndexOf(array, v, Integer.MAX_VALUE) cannot tell the int
+		// startIndex overload from the double tolerance one.
+		if f != nil {
+			if fld := string(f.Content(src)); fld == "MAX_VALUE" || fld == "MIN_VALUE" {
+				if obj := c.ChildByFieldName("object"); obj != nil {
+					switch string(obj.Content(src)) {
+					case "Integer":
+						return "#int"
+					case "Long":
+						return "#long"
+					case "Short":
+						return "#short"
+					case "Byte":
+						return "#byte"
+					case "Character":
+						return "#char"
+					case "Double":
+						return "#double"
+					case "Float":
+						return "#float"
+					}
+				}
+			}
+		}
+	case "member_access_expression":
+		// C#: int.MaxValue / long.MinValue are typed constants.
+		name := c.ChildByFieldName("name")
+		obj := c.ChildByFieldName("expression")
+		if name != nil && obj != nil {
+			n := string(name.Content(src))
+			t := string(obj.Content(src))
+			if n == "MaxValue" || n == "MinValue" {
+				switch t {
+				case "int", "long", "short", "byte", "char", "double", "float", "decimal", "uint", "ulong", "ushort", "sbyte":
+					return "#" + t
+				}
+			}
+			// Formatting.Indented: a PascalCase member of a PascalCase
+			// identifier is an enum value (or a static member) — "%Type"
+			// lets a consumer that knows Type is an enum treat the
+			// argument as typed Type.
+			if obj.Type() == "identifier" && len(t) > 0 && t[0] >= 'A' && t[0] <= 'Z' && len(n) > 0 && n[0] >= 'A' && n[0] <= 'Z' {
+				return "%" + t
+			}
+		}
+	case "object_creation_expression":
+		// `new JValue(1)` as an argument is typed by the created class.
+		if t := c.ChildByFieldName("type"); t != nil {
+			if name := csTypeLastName(t, src); name != "" {
+				return "#" + name
+			}
+		}
+	case "lambda_expression", "method_reference", "arrow_function", "lambda":
+		// A lambda binds only a functional-interface parameter; consumers
+		// rule out primitive, array and String overload slots.
+		return "#lambda"
 	case "method_invocation", "call_expression", "call":
 		// Consumers can resolve the called function's return type.
 		if n := c.ChildByFieldName("name"); n != nil {
@@ -386,15 +446,57 @@ func javaCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			}
 			name := call.ChildByFieldName("name")
 			if name != nil {
-				qual := qualifierName(call.ChildByFieldName("object"), src,
-					[]string{"identifier", "this"},
-					map[string]string{"field_access": "field"},
-					map[string]string{"method_invocation": "name"})
+				obj := call.ChildByFieldName("object")
+				qual := javaReceiverQualifier(obj, src)
+				if qual == "" {
+					qual = qualifierName(obj, src,
+						[]string{"identifier", "this"},
+						map[string]string{"field_access": "field"},
+						map[string]string{"method_invocation": "name"})
+				}
 				return joinQualified(qual, string(name.Content(src)))
 			}
 			return ""
 		},
 	})
+}
+
+// javaReceiverQualifier names the receiver for the expression shapes
+// qualifierName cannot: a cast `((String) cs).indexOf(...)` is typed by the
+// cast, an array element `array[i].intValue()` by the array variable, and
+// `String.class.equals(...)` by Class. Without these the call arrived BARE
+// and bound to the caller's own same-named method, or fanned out to every
+// same-named method in the repo. Returns "" for shapes it does not handle.
+func javaReceiverQualifier(obj *sitter.Node, src []byte) string {
+	if obj == nil {
+		return ""
+	}
+	switch obj.Type() {
+	case "parenthesized_expression":
+		for i := 0; i < int(obj.NamedChildCount()); i++ {
+			inner := obj.NamedChild(i)
+			if inner != nil && inner.Type() == "cast_expression" {
+				if t := inner.ChildByFieldName("type"); t != nil {
+					typ := strings.TrimSpace(string(t.Content(src)))
+					if j := strings.IndexByte(typ, '<'); j >= 0 {
+						typ = typ[:j]
+					}
+					typ = strings.TrimSuffix(typ, "[]")
+					if j := strings.LastIndexByte(typ, '.'); j >= 0 {
+						typ = typ[j+1:]
+					}
+					return typ
+				}
+			}
+		}
+	case "array_access":
+		if arr := obj.ChildByFieldName("array"); arr != nil && arr.Type() == "identifier" {
+			return string(arr.Content(src))
+		}
+	case "class_literal":
+		return "Class" // String.class.equals(...) runs on a java.lang.Class
+	}
+	return ""
 }
 
 func rustCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
