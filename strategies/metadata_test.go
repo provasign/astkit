@@ -62,6 +62,49 @@ func (T) N() {}
 	}
 }
 
+func TestGo_GenericReceiverAndTypeParameters(t *testing.T) {
+	src := `package x
+type Task[T any] struct{}
+func (t Task[T]) Run() {}
+func (t *Task[T]) Reset() {}
+`
+	syms, _ := extract(t, astkit.LangGo, src)
+	parents := map[string]string{}
+	var typeParams []string
+	for _, s := range syms {
+		parents[s.Name] = s.ParentName
+		if s.Name == "Task" && s.Kind == astkit.KindStruct {
+			typeParams = s.TypeParameters
+		}
+	}
+	if parents["Run"] != "Task" || parents["Reset"] != "Task" {
+		t.Errorf("generic receiver parents=%v", parents)
+	}
+	if len(typeParams) != 1 || typeParams[0] != "T" {
+		t.Errorf("Task TypeParams=%v want [T]", typeParams)
+	}
+}
+
+func TestGo_SingleTypeArgumentCall(t *testing.T) {
+	src := `package x
+func Identity[T any](v T) T { return v }
+func use() { _ = Identity[int](3) }
+`
+	syms, _ := extract(t, astkit.LangGo, src)
+	for _, sym := range syms {
+		if sym.Name != "use" {
+			continue
+		}
+		for _, site := range sym.CallSites {
+			if site.Callee == "Identity" && site.Argc == 1 {
+				return
+			}
+		}
+		t.Fatalf("use call sites = %+v", sym.CallSites)
+	}
+	t.Fatal("missing use symbol")
+}
+
 func TestJS_ClassFieldsAndDecorators(t *testing.T) {
 	src := `class A {
   static count = 0;
@@ -95,6 +138,133 @@ export { Exported as Renamed };
 	if len(syms) == 0 {
 		t.Fatal("expected symbols for export patterns")
 	}
+	byName := map[string]astkit.Symbol{}
+	for _, sym := range syms {
+		byName[sym.Name] = sym
+	}
+	if !byName["defFn"].Exported || !byName["Exported"].Exported {
+		t.Fatalf("direct export flags = defFn:%v Exported:%v", byName["defFn"].Exported, byName["Exported"].Exported)
+	}
+}
+
+func TestJS_NamedExportMarksLocalDeclaration(t *testing.T) {
+	src := `function hidden() {}
+function privateFn() {}
+export { hidden as publicName };
+`
+	syms, _ := extract(t, astkit.LangJavaScript, src)
+	byName := map[string]astkit.Symbol{}
+	for _, sym := range syms {
+		byName[sym.Name] = sym
+	}
+	if !byName["hidden"].Exported {
+		t.Fatal("named export did not mark its local declaration exported")
+	}
+	if byName["privateFn"].Exported {
+		t.Fatal("unexported sibling was marked exported")
+	}
+}
+
+func TestJS_AssignedFunctionsOnlyExportCommonJSBindings(t *testing.T) {
+	src := `const obj = {};
+obj.privateFn = function() {};
+Widget.prototype.method = function() {};
+exports.publicFn = function() {};
+module.exports.otherPublic = () => {};
+`
+	syms, _ := extract(t, astkit.LangJavaScript, src)
+	byName := map[string]astkit.Symbol{}
+	for _, sym := range syms {
+		byName[sym.Name] = sym
+	}
+	if byName["privateFn"].Exported || byName["method"].Exported {
+		t.Fatalf("private assignment marked exported: private=%v method=%v", byName["privateFn"].Exported, byName["method"].Exported)
+	}
+	if !byName["publicFn"].Exported || !byName["otherPublic"].Exported {
+		t.Fatalf("CommonJS export missed: public=%v other=%v", byName["publicFn"].Exported, byName["otherPublic"].Exported)
+	}
+}
+
+func TestTS_ClassDecoratorCallAndSpan(t *testing.T) {
+	src := `function Log() {}
+@Log()
+class Service { run() {} }
+`
+	syms, _ := extract(t, astkit.LangTypeScript, src)
+	for _, sym := range syms {
+		if sym.Name != "Service" {
+			continue
+		}
+		if sym.Span.Start != 2 {
+			t.Fatalf("class span starts at %d, want decorator line 2", sym.Span.Start)
+		}
+		if len(sym.CallSites) != 1 || sym.CallSites[0].Callee != "Log" {
+			t.Fatalf("class decorator call sites = %+v", sym.CallSites)
+		}
+		return
+	}
+	t.Fatal("missing Service class")
+}
+
+func TestJS_ChainedNewCallKeepsReceiver(t *testing.T) {
+	src := `function use() { new mod.Driver().run(); }`
+	syms, _ := extract(t, astkit.LangJavaScript, src)
+	for _, sym := range syms {
+		if sym.Name != "use" {
+			continue
+		}
+		for _, site := range sym.CallSites {
+			if site.Callee == "Driver().run" {
+				return
+			}
+		}
+		t.Fatalf("use call sites = %+v", sym.CallSites)
+	}
+	t.Fatal("missing use function")
+}
+
+func TestJS_ArrowFieldAndObjectLiteralCalls(t *testing.T) {
+	src := `function helper() {}
+class Widget {
+  render() {}
+  handleClick = (event) => this.render(event)
+}
+export const service = {
+  method() { helper() },
+  arrow: () => helper(),
+}
+`
+	syms, _ := extract(t, astkit.LangJavaScript, src)
+	byName := map[string]astkit.Symbol{}
+	for _, sym := range syms {
+		byName[sym.QualifiedName] = sym
+	}
+	if calls := byName["Widget.handleClick"].CallSites; len(calls) != 1 || calls[0].Callee != "this.render" {
+		t.Fatalf("arrow field call sites = %+v", calls)
+	}
+	for _, qualified := range []string{"service.method", "service.arrow"} {
+		if calls := byName[qualified].CallSites; len(calls) != 1 || calls[0].Callee != "helper" {
+			t.Errorf("%s call sites = %+v", qualified, calls)
+		}
+	}
+}
+
+func TestTSX_ComponentUsageIsCallSite(t *testing.T) {
+	src := `function Button() { return <span /> }
+function App() { return <Button label="go" /> }
+`
+	syms, _ := extract(t, astkit.LangTSX, src)
+	for _, sym := range syms {
+		if sym.Name == "App" {
+			for _, site := range sym.CallSites {
+				if site.Callee == "Button" {
+					return
+				}
+			}
+			t.Fatalf("App call sites = %+v", sym.CallSites)
+		}
+	}
+	t.Fatal("missing App")
 }
 
 func TestTS_Decorators(t *testing.T) {
@@ -132,6 +302,27 @@ def f(): return 1
 	}
 }
 
+func TestPython_ProtocolIsInterface(t *testing.T) {
+	src := `from typing import Protocol, TypeVar
+T = TypeVar("T")
+class Reader(Protocol[T]):
+    def read(self) -> T: ...
+class Concrete:
+    pass
+`
+	syms, _ := extract(t, astkit.LangPython, src)
+	byName := map[string]astkit.SymbolKind{}
+	for _, sym := range syms {
+		byName[sym.Name] = sym.Kind
+	}
+	if byName["Reader"] != astkit.KindInterface {
+		t.Fatalf("Reader kind = %q, want interface", byName["Reader"])
+	}
+	if byName["Concrete"] != astkit.KindClass {
+		t.Fatalf("Concrete kind = %q, want class", byName["Concrete"])
+	}
+}
+
 func TestJava_AnnotationsAndTypeParams(t *testing.T) {
 	src := `package x;
 
@@ -147,6 +338,52 @@ public class Box<T extends Number> {
 			if len(s.TypeParameters) != 1 || s.TypeParameters[0] != "T" {
 				t.Errorf("Box TypeParams=%v", s.TypeParameters)
 			}
+		}
+	}
+}
+
+func TestJava_EnumConstantsAndConstantBodyMethods(t *testing.T) {
+	src := `enum Mode {
+  FAST { @Override int speed() { return 2; } },
+  SLOW;
+  abstract int speed();
+}`
+	syms, _ := extract(t, astkit.LangJava, src)
+	fields := map[string]bool{}
+	var speedMethods int
+	for _, s := range syms {
+		if s.Kind == astkit.KindField && s.ParentName == "Mode" {
+			fields[s.Name] = true
+		}
+		if s.Kind == astkit.KindMethod && s.Name == "speed" && s.ParentName == "Mode" {
+			speedMethods++
+		}
+	}
+	if !fields["FAST"] || !fields["SLOW"] {
+		t.Errorf("enum constants missing; fields=%v", fields)
+	}
+	if speedMethods != 2 {
+		t.Errorf("speed methods=%d want 2", speedMethods)
+	}
+}
+
+func TestJava_RecordComponentsEmitFieldsAndAccessors(t *testing.T) {
+	src := `public record Point(int x, String label) {}`
+	syms, _ := extract(t, astkit.LangJava, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		if s.ParentName == "Point" && (s.Kind == astkit.KindField || s.Kind == astkit.KindMethod) {
+			got[string(s.Kind)+":"+s.Name] = true
+		}
+	}
+	for _, want := range []string{
+		string(astkit.KindField) + ":x",
+		string(astkit.KindMethod) + ":x",
+		string(astkit.KindField) + ":label",
+		string(astkit.KindMethod) + ":label",
+	} {
+		if !got[want] {
+			t.Errorf("missing record component symbol %q in %v", want, got)
 		}
 	}
 }
@@ -177,6 +414,30 @@ pub enum Shape { Circle, Square }
 	}
 }
 
+func TestRust_ImplTraitsAnnotateTypesIncludingEmptyImpl(t *testing.T) {
+	src := `trait Greet { fn name(&self) -> &str; }
+struct Dog;
+struct Fish;
+impl Greet for Dog { fn name(&self) -> &str { "dog" } }
+impl Greet for Fish {}
+`
+	syms, _ := extract(t, astkit.LangRust, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		if s.Kind != astkit.KindStruct {
+			continue
+		}
+		for _, ann := range s.Annotations {
+			if ann == "implements:Greet" {
+				got[s.Name] = true
+			}
+		}
+	}
+	if !got["Dog"] || !got["Fish"] {
+		t.Errorf("impl annotations=%v", got)
+	}
+}
+
 func TestC_StructTypedefAndDecl(t *testing.T) {
 	src := `#include <stddef.h>
 struct Point { int x; int y; };
@@ -193,6 +454,25 @@ static int helper(int a) { return a; }
 	for _, w := range []string{"Point", "Color", "Counter", "helper"} {
 		if !names[w] {
 			t.Errorf("missing C symbol %q in %v", w, names)
+		}
+	}
+}
+
+func TestC_PreprocessorGuardedDeclarations(t *testing.T) {
+	src := `#ifdef FEATURE
+int enabled(void) { return 1; }
+#else
+int fallback(void) { return 0; }
+#endif
+`
+	syms, _ := extract(t, astkit.LangC, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		got[s.Name] = true
+	}
+	for _, want := range []string{"enabled", "fallback"} {
+		if !got[want] {
+			t.Errorf("missing guarded declaration %q in %v", want, got)
 		}
 	}
 }
@@ -214,6 +494,25 @@ T add(T a, T b) { return a + b; }
 	if len(syms) == 0 {
 		t.Fatal("expected templates to extract")
 	}
+}
+
+func TestCPP_OutOfLineTemplateMemberKeepsOwner(t *testing.T) {
+	src := `template<typename T>
+class Holder { public: void put(T value); };
+
+template<typename T>
+void Holder<T>::put(T value) {}
+`
+	syms, _ := extract(t, astkit.LangCPP, src)
+	for _, sym := range syms {
+		if sym.Name == "put" && sym.Span.Start == 5 {
+			if sym.Kind != astkit.KindMethod || sym.ParentName != "Holder" || sym.QualifiedName != "Holder.put" {
+				t.Fatalf("out-of-line template member = %+v", sym)
+			}
+			return
+		}
+	}
+	t.Fatalf("out-of-line Holder<T>::put missing: %+v", syms)
 }
 
 func TestCSharp_FieldsPropertiesGenerics(t *testing.T) {
@@ -245,6 +544,22 @@ func TestJava_CallSitesWithNew(t *testing.T) {
 	}
 	if total == 0 {
 		t.Error("expected Java call sites")
+	}
+}
+
+func TestJava_MultipleFieldDeclarators(t *testing.T) {
+	src := `class Counters { private int first, second = 2, third; }`
+	syms, _ := extract(t, astkit.LangJava, src)
+	got := map[string]bool{}
+	for _, sym := range syms {
+		if sym.Kind == astkit.KindField && sym.ParentName == "Counters" {
+			got[sym.Name] = true
+		}
+	}
+	for _, name := range []string{"first", "second", "third"} {
+		if !got[name] {
+			t.Errorf("missing field %q; got %v", name, got)
+		}
 	}
 }
 
@@ -363,6 +678,115 @@ func TestCSharp_CallSiteBaseAndThis(t *testing.T) {
 	}
 }
 
+func TestCSharp_PropertiesFieldsRecordsAndConstructorInitializers(t *testing.T) {
+	src := `interface IShape { double Area { get; } }
+record struct Point(int X, int Y);
+class Child : Base {
+  private Service first, second;
+  Child(int x) : this() {}
+  Child() : base(1) {}
+  string Label { get { return Format(); } }
+}
+`
+	syms, _ := extract(t, astkit.LangCSharp, src)
+	byName := map[string]astkit.Symbol{}
+	for _, sym := range syms {
+		byName[sym.Name] = sym
+	}
+	if area := byName["Area"]; area.Kind != astkit.KindMethod || area.ParentName != "IShape" {
+		t.Fatalf("interface property contract = %+v", area)
+	}
+	if point := byName["Point"]; point.Kind != astkit.KindStruct {
+		t.Fatalf("record struct = %+v", point)
+	}
+	for _, field := range []string{"first", "second"} {
+		if got := byName[field]; got.Kind != astkit.KindField || got.ParentName != "Child" {
+			t.Errorf("field %s = %+v", field, got)
+		}
+	}
+	if label := byName["Label"]; len(label.CallSites) != 1 || label.CallSites[0].Callee != "Format" {
+		t.Fatalf("property call sites = %+v", label.CallSites)
+	}
+	var sawThis, sawBase bool
+	for _, sym := range syms {
+		if sym.Kind != astkit.KindConstructor {
+			continue
+		}
+		for _, site := range sym.CallSites {
+			if site.Callee == "Child" && site.Argc == 0 {
+				sawThis = true
+			}
+			if site.Callee == "super()" && site.Argc == 1 {
+				sawBase = true
+			}
+		}
+	}
+	if !sawThis || !sawBase {
+		t.Fatalf("constructor initializer sites: this=%v base=%v symbols=%+v", sawThis, sawBase, syms)
+	}
+}
+
+func TestPHP_SelfStaticConstructionAndFirstClassCallable(t *testing.T) {
+	src := `<?php
+class Factory {
+  function makeSelf() { return new self(); }
+  function makeStatic() { return new static(); }
+  function ref() { return $this->g(...); }
+  function g() {}
+}`
+	syms, _ := extract(t, astkit.LangPHP, src)
+	for _, sym := range syms {
+		switch sym.Name {
+		case "makeSelf", "makeStatic":
+			if len(sym.CallSites) != 1 || sym.CallSites[0].Callee != "Factory" {
+				t.Errorf("%s construction sites = %+v", sym.Name, sym.CallSites)
+			}
+		case "ref":
+			if len(sym.CallSites) != 1 || sym.CallSites[0].Argc != 0 {
+				t.Errorf("first-class callable sites = %+v", sym.CallSites)
+			}
+		}
+	}
+}
+
+func TestPHP_TopLevelAnonymousClassOwnsMethods(t *testing.T) {
+	src := `<?php
+$worker = new class extends Base {
+  public function run() { return helper(); }
+};`
+	syms, _ := extract(t, astkit.LangPHP, src)
+	var anonymous, run *astkit.Symbol
+	for i := range syms {
+		sym := &syms[i]
+		if sym.Kind == astkit.KindClass && sym.Name == "<anonymous@2>" {
+			anonymous = sym
+		}
+		if sym.Name == "run" {
+			run = sym
+		}
+	}
+	if anonymous == nil {
+		t.Fatalf("missing anonymous class in %+v", syms)
+	}
+	if run == nil || run.Kind != astkit.KindMethod || run.ParentName != anonymous.Name {
+		t.Fatalf("anonymous method ownership = %+v", run)
+	}
+}
+
+func TestCSharp_NewExpressionReceiverQualifier(t *testing.T) {
+	src := `class A { void Run() { new Dog().Bark(); } }`
+	syms, _ := extract(t, astkit.LangCSharp, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee] = true
+		}
+	}
+	if !got["Dog().Bark"] {
+		t.Errorf("missing constructed receiver call; got %v", got)
+	}
+}
+
 // Java super./this. receivers reach the call site as qualifiers.
 func TestJava_CallSiteSuperAndThis(t *testing.T) {
 	src := `class B extends A { void f() { this.g(); super.g(); } }`
@@ -377,6 +801,49 @@ func TestJava_CallSiteSuperAndThis(t *testing.T) {
 		if !got[want] {
 			t.Errorf("missing %q in %v", want, got)
 		}
+	}
+}
+
+func TestJava_AnonymousClassAndLambdaOwnTheirCalls(t *testing.T) {
+	src := `class Outer {
+  void run() {
+    Runnable r = new Runnable() { public void run() { insideAnon(); } };
+    java.util.function.Supplier<Integer> s = () -> insideLambda();
+    outer();
+  }
+}`
+	syms, _ := extract(t, astkit.LangJava, src)
+	var outerRun, anonymousRun, lambda *astkit.Symbol
+	for i := range syms {
+		sym := &syms[i]
+		switch {
+		case sym.QualifiedName == "Outer.run":
+			outerRun = sym
+		case sym.Name == "run" && strings.Contains(sym.ParentName, "<anonymous@"):
+			anonymousRun = sym
+		case strings.HasPrefix(sym.Name, "<lambda@"):
+			lambda = sym
+		}
+	}
+	if outerRun == nil || anonymousRun == nil || lambda == nil {
+		t.Fatalf("missing nested Java symbols: %+v", syms)
+	}
+	hasCall := func(sym *astkit.Symbol, name string) bool {
+		for _, call := range sym.CallSites {
+			if call.Callee == name {
+				return true
+			}
+		}
+		return false
+	}
+	if hasCall(outerRun, "insideAnon") || hasCall(outerRun, "insideLambda") || !hasCall(outerRun, "outer") {
+		t.Fatalf("outer method call ownership = %+v", outerRun.CallSites)
+	}
+	if !hasCall(anonymousRun, "insideAnon") {
+		t.Fatalf("anonymous method calls = %+v", anonymousRun.CallSites)
+	}
+	if !hasCall(lambda, "insideLambda") {
+		t.Fatalf("lambda calls = %+v", lambda.CallSites)
 	}
 }
 
@@ -475,6 +942,7 @@ func TestJS_CallSitesMemberAndNew(t *testing.T) {
   new Thing(2);
   helper(3);
 }
+
 `
 	syms, _ := extract(t, astkit.LangJavaScript, src)
 	for _, s := range syms {
@@ -489,6 +957,20 @@ func TestJS_CallSitesMemberAndNew(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestJS_NewExpressionReceiverQualifier(t *testing.T) {
+	src := `function run() { new PgDriver().query("select 1"); }`
+	syms, _ := extract(t, astkit.LangJavaScript, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee] = true
+		}
+	}
+	if !got["PgDriver().query"] {
+		t.Errorf("missing constructed receiver call; got %v", got)
 	}
 }
 
@@ -562,6 +1044,32 @@ func mapKeys(m map[string]astkit.Symbol) []string {
 
 // CallSite.Callee must honor the documented "Receiver.callee" form so graph
 // consumers can do receiver-aware call resolution.
+func TestGoMethodValuesAreReferenceOnly(t *testing.T) {
+	src := `package x
+type H struct{}
+func (h H) Only() int { return 1 }
+func use(h H) int {
+    fn := h.Only
+    expr := H.Only
+    return fn() + expr(h)
+}`
+	syms, _ := extract(t, astkit.LangGo, src)
+	refs := map[string]bool{}
+	for _, s := range syms {
+		if s.Name != "use" {
+			continue
+		}
+		for _, cs := range s.CallSites {
+			if cs.ReferenceOnly {
+				refs[cs.Callee] = true
+			}
+		}
+	}
+	if !refs["h.Only"] || !refs["H.Only"] {
+		t.Fatalf("method-value references=%v", refs)
+	}
+}
+
 func TestCallSites_QualifiersPreserved(t *testing.T) {
 	src := `package x
 func (r JSON) Render(w W) {
@@ -594,7 +1102,7 @@ func TestCallSites_QualifiersPython(t *testing.T) {
 			got[cs.Callee] = true
 		}
 	}
-	for _, want := range []string{"self.save", "conn.commit", "g"} {
+	for _, want := range []string{"self.save", "self.db.conn.commit", "g"} {
 		if !got[want] {
 			t.Errorf("missing call site %q; got %v", want, got)
 		}
@@ -742,8 +1250,8 @@ func TestJava_GenericCtorAndLiteralArgs(t *testing.T) {
 
 func TestJava_ExplicitConstructorInvocation(t *testing.T) {
 	// super(...) / this(...) delegation must produce call sites (they're real
-	// edges in the bytecode oracle); method references must NOT be emitted
-	// (a Foo::bar reference is a lambda, not a call from the enclosing method).
+	// edges in the bytecode oracle); method references are retained as
+	// reference-only sites, never runtime calls from the enclosing method.
 	src := `class A {
   A() { this(1); }
   A(int x) { super(); }
@@ -759,15 +1267,17 @@ func TestJava_ExplicitConstructorInvocation(t *testing.T) {
 			case "this()":
 				this_++
 			case "String.trim", "trim":
-				mref++
+				if cs.ReferenceOnly {
+					mref++
+				}
 			}
 		}
 	}
 	if super_ == 0 || this_ == 0 {
 		t.Fatalf("expected super() and this() call sites, got super=%d this=%d", super_, this_)
 	}
-	if mref != 0 {
-		t.Errorf("method reference String::trim must not be emitted as a call (got %d)", mref)
+	if mref != 1 {
+		t.Errorf("method reference String::trim reference sites=%d want 1", mref)
 	}
 }
 

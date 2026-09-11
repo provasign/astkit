@@ -39,6 +39,13 @@ type LineRange struct {
 type CallSite struct {
 	Callee string `json:"callee"`
 	Line   int    `json:"line"`
+	// Write marks an attribute site used as an assignment target. It is false
+	// for calls and ordinary reads, preserving older serialized indexes.
+	Write bool `json:"write,omitempty"`
+	// ReferenceOnly marks a callable reference that does not execute at this
+	// location (Java Foo::bar, Go T.Method). Consumers may use it for rename
+	// and reference analysis but must not turn it into a calls edge.
+	ReferenceOnly bool `json:"reference_only,omitempty"`
 	// Argc is the number of argument expressions at the call site (0 may
 	// mean "no arguments" or "unknown" for older indexes; consumers treat
 	// it as advisory). Lets graph consumers disambiguate overloads.

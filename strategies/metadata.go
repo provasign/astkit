@@ -122,11 +122,24 @@ func collectCallSites(body *sitter.Node, src []byte, spec callSpec) []astkit.Cal
 
 // callArgc counts argument expressions in a call node's argument list.
 func callArgc(call *sitter.Node) int {
+	if call.Type() == "type_conversion_expression" {
+		if call.ChildByFieldName("operand") != nil {
+			return 1
+		}
+		return 0
+	}
 	args := call.ChildByFieldName("arguments")
 	if args == nil {
 		return 0
 	}
-	return int(args.NamedChildCount())
+	argc := 0
+	for i := uint32(0); i < args.NamedChildCount(); i++ {
+		child := args.NamedChild(int(i))
+		if child != nil && child.Type() != "variadic_placeholder" {
+			argc++
+		}
+	}
+	return argc
 }
 
 // callArgs returns, per argument: the identifier text for bare identifiers,
@@ -287,15 +300,24 @@ func goCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	identTypes := []string{"identifier"}
 	selectorTypes := map[string]string{"selector_expression": "field"}
 	callTypes := map[string]string{"call_expression": "function"}
-	return collectCallSites(body, src, callSpec{
-		nodeTypes: []string{"call_expression"},
+	out := collectCallSites(body, src, callSpec{
+		nodeTypes: []string{"call_expression", "type_conversion_expression"},
 		calleeFn: func(call *sitter.Node, src []byte) string {
 			fn := call.ChildByFieldName("function")
+			if call.Type() == "type_conversion_expression" {
+				fn = call.ChildByFieldName("type")
+			}
 			if fn == nil {
 				return ""
 			}
+			if fn.Type() == "generic_type" {
+				fn = fn.ChildByFieldName("type")
+				if fn == nil {
+					return ""
+				}
+			}
 			switch fn.Type() {
-			case "identifier":
+			case "identifier", "type_identifier":
 				return fn.Content(src)
 			case "selector_expression":
 				field := fn.ChildByFieldName("field")
@@ -307,12 +329,50 @@ func goCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			return ""
 		},
 	})
+	if body == nil {
+		return out
+	}
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type() == "selector_expression" {
+			parent := n.Parent()
+			isCalled := false
+			if parent != nil && parent.Type() == "call_expression" {
+				if fn := parent.ChildByFieldName("function"); fn != nil {
+					isCalled = fn.StartByte() == n.StartByte() && fn.EndByte() == n.EndByte()
+				}
+			}
+			if !isCalled {
+				if field := n.ChildByFieldName("field"); field != nil {
+					qual := qualifierName(n.ChildByFieldName("operand"), src, identTypes, selectorTypes, callTypes)
+					out = append(out, astkit.CallSite{
+						Callee: joinQualified(qual, field.Content(src)),
+						Line:   int(n.StartPoint().Row) + 1, ReferenceOnly: true,
+					})
+				}
+			}
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(body)
+	return out
 }
 
 func jsCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	return collectCallSites(body, src, callSpec{
-		nodeTypes: []string{"call_expression", "new_expression"},
+		nodeTypes: []string{"call_expression", "new_expression", "jsx_opening_element", "jsx_self_closing_element"},
 		calleeFn: func(call *sitter.Node, src []byte) string {
+			if call.Type() == "jsx_opening_element" || call.Type() == "jsx_self_closing_element" {
+				if name := call.ChildByFieldName("name"); name != nil {
+					return name.Content(src)
+				}
+				return ""
+			}
 			fn := call.ChildByFieldName("function")
 			if fn == nil {
 				// new_expression uses "constructor" field
@@ -334,7 +394,10 @@ func jsCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 					qual := qualifierName(fn.ChildByFieldName("object"), src,
 						[]string{"identifier", "property_identifier", "this", "super"},
 						map[string]string{"member_expression": "property"},
-						map[string]string{"call_expression": "function"})
+						map[string]string{
+							"call_expression": "function",
+							"new_expression":  "constructor",
+						})
 					return joinQualified(qual, string(prop.Content(src)))
 				}
 			}
@@ -344,29 +407,79 @@ func jsCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 }
 
 func pythonCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
-	return collectCallSites(body, src, callSpec{
-		nodeTypes: []string{"call"},
-		calleeFn: func(call *sitter.Node, src []byte) string {
-			fn := call.ChildByFieldName("function")
-			if fn == nil {
-				return ""
+	if body == nil {
+		return nil
+	}
+	var out []astkit.CallSite
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil || (n != body && pythonNestedScope(n.Type())) {
+			return
+		}
+		if n.Type() == "call" {
+			if callee := pythonCallCallee(n, src); callee != "" {
+				out = append(out, astkit.CallSite{
+					Callee: callee, Line: int(n.StartPoint().Row) + 1,
+					Argc: callArgc(n), Args: callArgs(n, src),
+				})
 			}
-			switch fn.Type() {
-			case "identifier":
-				return fn.Content(src)
-			case "attribute":
-				attr := fn.ChildByFieldName("attribute")
-				if attr != nil {
-					qual := qualifierName(fn.ChildByFieldName("object"), src,
-						[]string{"identifier"},
-						map[string]string{"attribute": "attribute"},
-						map[string]string{"call": "function"})
-					return joinQualified(qual, string(attr.Content(src)))
-				}
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(body)
+	return out
+}
+
+func pythonNestedScope(nodeType string) bool {
+	return nodeType == "function_definition" || nodeType == "class_definition" || nodeType == "decorated_definition"
+}
+
+func pythonCallCallee(call *sitter.Node, src []byte) string {
+	fn := call.ChildByFieldName("function")
+	if fn == nil {
+		return ""
+	}
+	switch fn.Type() {
+	case "identifier":
+		return fn.Content(src)
+	case "attribute":
+		attr := fn.ChildByFieldName("attribute")
+		if attr != nil {
+			qual := pythonQualifierName(fn.ChildByFieldName("object"), src)
+			if qual != "" {
+				return qual + "." + attr.Content(src)
 			}
-			return ""
-		},
-	})
+			return attr.Content(src)
+		}
+	}
+	return ""
+}
+
+func pythonQualifierName(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	switch n.Type() {
+	case "identifier":
+		return n.Content(src)
+	case "attribute":
+		object := pythonQualifierName(n.ChildByFieldName("object"), src)
+		attr := n.ChildByFieldName("attribute")
+		if attr == nil {
+			return object
+		}
+		if object == "" {
+			return attr.Content(src)
+		}
+		return object + "." + attr.Content(src)
+	case "call":
+		if fn := pythonQualifierName(n.ChildByFieldName("function"), src); fn != "" {
+			return fn + "()"
+		}
+	}
+	return ""
 }
 
 // pythonAttrSites collects attribute accesses that are not the function of
@@ -383,27 +496,38 @@ func pythonAttrSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	var out []astkit.CallSite
 	var walk func(*sitter.Node)
 	walk = func(n *sitter.Node) {
-		if n == nil {
+		if n == nil || (n != body && pythonNestedScope(n.Type())) {
 			return
 		}
 		if n.Type() == "attribute" {
 			parent := n.Parent()
 			isCallFn := false
+			isWrite := false
 			if parent != nil && parent.Type() == "call" {
 				// Node lookups aren't pointer-stable; compare by span.
 				if fn := parent.ChildByFieldName("function"); fn != nil {
 					isCallFn = fn.StartByte() == n.StartByte() && fn.EndByte() == n.EndByte()
 				}
 			}
+			if parent != nil && (parent.Type() == "assignment" || parent.Type() == "augmented_assignment") {
+				if left := parent.ChildByFieldName("left"); left != nil {
+					isWrite = left.StartByte() == n.StartByte() && left.EndByte() == n.EndByte()
+				}
+			}
 			if !isCallFn {
 				if attr := n.ChildByFieldName("attribute"); attr != nil {
 					qual := qualifierName(n.ChildByFieldName("object"), src, identTypes, selectorTypes, callTypes)
 					name := joinQualified(qual, string(attr.Content(src)))
-					if !seen[name] {
-						seen[name] = true
+					key := name
+					if isWrite {
+						key += "#write"
+					}
+					if !seen[key] {
+						seen[key] = true
 						out = append(out, astkit.CallSite{
 							Callee: name,
 							Line:   int(n.StartPoint().Row) + 1,
+							Write:  isWrite,
 						})
 					}
 				}
@@ -418,50 +542,91 @@ func pythonAttrSites(body *sitter.Node, src []byte) []astkit.CallSite {
 }
 
 func javaCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
-	return collectCallSites(body, src, callSpec{
-		nodeTypes: []string{"method_invocation", "object_creation_expression", "explicit_constructor_invocation"},
-		calleeFn: func(call *sitter.Node, src []byte) string {
-			if call.Type() == "object_creation_expression" {
-				t := call.ChildByFieldName("type")
-				if t != nil {
-					// "new Range<>(...)" → callee "Range", not "Range<>".
-					name := strings.TrimSpace(t.Content(src))
-					if i := strings.IndexByte(name, '<'); i >= 0 {
-						name = name[:i]
+	if body == nil {
+		return nil
+	}
+	var out []astkit.CallSite
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		switch n.Type() {
+		case "lambda_expression", "class_declaration", "record_declaration", "interface_declaration", "enum_declaration":
+			return // nested executable/type owns its descendants
+		case "method_invocation", "object_creation_expression", "explicit_constructor_invocation":
+			if callee := javaCallCallee(n, src); callee != "" {
+				out = append(out, astkit.CallSite{
+					Callee: callee, Line: int(n.StartPoint().Row) + 1,
+					Argc: callArgc(n), Args: callArgs(n, src),
+				})
+			}
+		case "method_reference":
+			if qual, name, ok := strings.Cut(n.Content(src), "::"); ok {
+				qual = strings.TrimSpace(qual)
+				name = strings.TrimSpace(name)
+				if strings.HasPrefix(name, "<") {
+					if close := strings.IndexByte(name, '>'); close >= 0 {
+						name = strings.TrimSpace(name[close+1:])
 					}
-					return name
 				}
-				return ""
-			}
-			if call.Type() == "explicit_constructor_invocation" {
-				// `super(...)` / `this(...)` constructor delegation. The
-				// keyword leads the node text; emit the form Grove's
-				// constructor resolution recognizes.
-				if t := strings.TrimSpace(call.Content(src)); strings.HasPrefix(t, "super") {
-					return "super()"
-				} else if strings.HasPrefix(t, "this") {
-					return "this()"
+				if name == "new" {
+					name = qual
+				} else {
+					name = joinQualified(qual, name)
 				}
-				return ""
+				out = append(out, astkit.CallSite{
+					Callee: name, Line: int(n.StartPoint().Row) + 1, ReferenceOnly: true,
+				})
 			}
-			name := call.ChildByFieldName("name")
-			if name != nil {
-				obj := call.ChildByFieldName("object")
-				qual := javaReceiverQualifier(obj, src)
-				if qual == "" {
-					// "super" is its own node type: without it here,
-					// super.g() arrived as a bare g and bound the caller's
-					// own class.
-					qual = qualifierName(obj, src,
-						[]string{"identifier", "this", "super"},
-						map[string]string{"field_access": "field"},
-						map[string]string{"method_invocation": "name"})
-				}
-				return joinQualified(qual, string(name.Content(src)))
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			child := n.Child(i)
+			if n.Type() == "object_creation_expression" && child != nil && child.Type() == "class_body" {
+				continue
 			}
+			walk(child)
+		}
+	}
+	walk(body)
+	return out
+}
+
+func javaCallCallee(call *sitter.Node, src []byte) string {
+	if call.Type() == "object_creation_expression" {
+		t := call.ChildByFieldName("type")
+		if t == nil {
 			return ""
-		},
-	})
+		}
+		// "new Range<>(...)" → callee "Range", not "Range<>".
+		name := strings.TrimSpace(t.Content(src))
+		if i := strings.IndexByte(name, '<'); i >= 0 {
+			name = name[:i]
+		}
+		return name
+	}
+	if call.Type() == "explicit_constructor_invocation" {
+		// `super(...)` / `this(...)` constructor delegation.
+		if t := strings.TrimSpace(call.Content(src)); strings.HasPrefix(t, "super") {
+			return "super()"
+		} else if strings.HasPrefix(t, "this") {
+			return "this()"
+		}
+		return ""
+	}
+	name := call.ChildByFieldName("name")
+	if name == nil {
+		return ""
+	}
+	obj := call.ChildByFieldName("object")
+	qual := javaReceiverQualifier(obj, src)
+	if qual == "" {
+		qual = qualifierName(obj, src,
+			[]string{"identifier", "this", "super"},
+			map[string]string{"field_access": "field"},
+			map[string]string{"method_invocation": "name"})
+	}
+	return joinQualified(qual, string(name.Content(src)))
 }
 
 // javaReceiverQualifier names the receiver for the expression shapes
@@ -554,6 +719,28 @@ func rustCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 		},
 	})
 	out = append(out, rustMacroCallSites(body, src)...)
+	var nested []astkit.LineRange
+	internalast.WalkTree(body, func(n *sitter.Node) {
+		if n != nil && n.Type() == "function_item" {
+			nested = append(nested, internalast.NodeSpan(n))
+		}
+	})
+	if len(nested) > 0 {
+		kept := out[:0]
+		for _, site := range out {
+			insideNested := false
+			for _, span := range nested {
+				if site.Line >= span.Start && site.Line <= span.End {
+					insideNested = true
+					break
+				}
+			}
+			if !insideNested {
+				kept = append(kept, site)
+			}
+		}
+		out = kept
+	}
 	return out
 }
 
@@ -639,6 +826,11 @@ func rustPathQualifier(path *sitter.Node, src []byte) string {
 		return ""
 	}
 	p := string(path.Content(src))
+	if strings.HasPrefix(p, "<") && strings.HasSuffix(p, ">") {
+		if typ, _, ok := strings.Cut(strings.TrimSpace(p[1:len(p)-1]), " as "); ok {
+			p = strings.TrimSpace(typ)
+		}
+	}
 	if i := strings.IndexByte(p, '<'); i >= 0 {
 		p = strings.TrimSuffix(p[:i], "::")
 	}
@@ -838,7 +1030,7 @@ func goTypeParameters(n *sitter.Node, src []byte) []string {
 			continue
 		}
 		for j := 0; j < int(c.ChildCount()); j++ {
-			if cc := c.Child(j); cc != nil && cc.Type() == "identifier" {
+			if cc := c.Child(j); cc != nil && (cc.Type() == "identifier" || cc.Type() == "type_identifier") {
 				out = append(out, cc.Content(src))
 			}
 		}

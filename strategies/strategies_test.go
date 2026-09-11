@@ -431,6 +431,89 @@ namespace ns {
 	}
 }
 
+func TestExtract_CPPStructMethods(t *testing.T) {
+	src := `struct Widget {
+  void inlineMethod() {}
+  int multilineMethod()
+  {
+    return 1;
+  }
+};`
+	syms, _ := extract(t, astkit.LangCPP, src)
+	want := map[string]astkit.SymbolKind{
+		"Widget":          astkit.KindStruct,
+		"inlineMethod":    astkit.KindMethod,
+		"multilineMethod": astkit.KindMethod,
+	}
+	for _, sym := range syms {
+		kind, ok := want[sym.Name]
+		if !ok {
+			continue
+		}
+		if sym.Kind != kind {
+			t.Errorf("%s kind = %s, want %s", sym.Name, sym.Kind, kind)
+		}
+		if sym.Name != "Widget" && sym.ParentName != "Widget" {
+			t.Errorf("%s parent = %q, want Widget", sym.Name, sym.ParentName)
+		}
+		delete(want, sym.Name)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing C++ struct symbols: %v (all=%v)", want, names(syms))
+	}
+}
+
+func TestExtract_CPPVisibilityAndFileLocalLinkage(t *testing.T) {
+	src := `static void fileLocal() {}
+void externallyVisible() {}
+class Widget {
+public:
+  void pubM() {}
+protected:
+  void protM() {}
+private:
+  void privM() {}
+  void declaredPrivate();
+};
+void Widget::declaredPrivate() {}
+struct Item {
+  void publicByDefault() {}
+private:
+  void privateItem() {}
+};`
+	syms, _ := extract(t, astkit.LangCPP, src)
+	byName := map[string]astkit.Symbol{}
+	for _, sym := range syms {
+		byName[sym.QualifiedName] = sym
+	}
+	want := map[string]struct {
+		exported bool
+		modifier string
+	}{
+		"fileLocal":              {false, "static"},
+		"externallyVisible":      {true, ""},
+		"Widget.pubM":            {true, "public"},
+		"Widget.protM":           {false, "protected"},
+		"Widget.privM":           {false, "private"},
+		"Widget.declaredPrivate": {false, "private"},
+		"Item.publicByDefault":   {true, "public"},
+		"Item.privateItem":       {false, "private"},
+	}
+	for name, expected := range want {
+		sym, ok := byName[name]
+		if !ok {
+			t.Errorf("missing %s; symbols=%v", name, names(syms))
+			continue
+		}
+		if sym.Exported != expected.exported {
+			t.Errorf("%s exported = %v, want %v", name, sym.Exported, expected.exported)
+		}
+		if expected.modifier != "" && !contains(sym.Modifiers, expected.modifier) {
+			t.Errorf("%s modifiers = %v, want %s", name, sym.Modifiers, expected.modifier)
+		}
+	}
+}
+
 func TestExtract_CSharp(t *testing.T) {
 	src := `using System;
 
@@ -440,6 +523,20 @@ namespace App {
     public Greeter(string p) { Prefix = p; }
     public string Say(string n) => Prefix + n;
   }
+}
+
+func TestExtract_CSharpUsingForms(t *testing.T) {
+	src := "global using System.IO;\nusing static System.Math;\nusing Alias = Fix.Models.User;\n"
+	_, imps := extract(t, astkit.LangCSharp, src)
+	got := map[string]bool{}
+	for _, imp := range imps {
+		got[imp.Path] = true
+	}
+	for _, want := range []string{"System.IO", "System.Math", "Alias = Fix.Models.User"} {
+		if !got[want] {
+			t.Errorf("missing normalized C# using %q in %+v", want, imps)
+		}
+	}
 }
 `
 	syms, imps := extract(t, astkit.LangCSharp, src)
@@ -487,6 +584,64 @@ func TestExtract_NilTreeReturnsNil(t *testing.T) {
 	}
 }
 
+func TestExtract_JSModuleForms(t *testing.T) {
+	src := `import direct from "./direct";
+const common = require("./common");
+async function load() { return import("./dynamic"); }
+export * from "./star";
+export { Named as Alias } from "./named";
+`
+	_, imps := extract(t, astkit.LangTypeScript, src)
+	got := map[string]bool{}
+	for _, imp := range imps {
+		got[imp.Path] = true
+	}
+	for _, want := range []string{"./direct", "./common", "./dynamic", "./star", "./named"} {
+		if !got[want] {
+			t.Errorf("missing %s import in %#v", want, imps)
+		}
+	}
+}
+
+func TestExtract_TSXComponentUsageIsCallSite(t *testing.T) {
+	src := `export function Button() { return <button />; }
+export function App() { return <Button />; }
+`
+	syms, _ := extract(t, astkit.LangTSX, src)
+	for _, sym := range syms {
+		if sym.Name != "App" {
+			continue
+		}
+		for _, site := range sym.CallSites {
+			if site.Callee == "Button" {
+				return
+			}
+		}
+		t.Fatalf("App call sites = %+v, want Button", sym.CallSites)
+	}
+	t.Fatal("App symbol not extracted")
+}
+
+func TestExtract_CSharpPropertyBodyIsCallSite(t *testing.T) {
+	src := `class Svc {
+  int Compute() => 1;
+  public int Age => Compute();
+}`
+	syms, _ := extract(t, astkit.LangCSharp, src)
+	for _, sym := range syms {
+		if sym.Name != "Age" {
+			continue
+		}
+		for _, site := range sym.CallSites {
+			if site.Callee == "Compute" {
+				return
+			}
+		}
+		t.Fatalf("Age call sites = %+v, want Compute", sym.CallSites)
+	}
+	t.Fatal("Age property symbol not extracted")
+}
+
 func TestExtract_Signature(t *testing.T) {
 	syms, _ := extract(t, astkit.LangGo, "package x\nfunc Foo(a int, b string) (string, error) { return \"\", nil }\n")
 	for _, s := range syms {
@@ -521,6 +676,12 @@ class Wallet {
 class Plain {
     private int x;
 }
+
+@Getter
+class Explicit {
+    private String name;
+    public String getName() { return name; }
+}
 `)
 	eng := astkit.NewEngine()
 	tree, err := eng.Parse(context.Background(), astkit.LangJava, src)
@@ -550,6 +711,18 @@ class Plain {
 	}
 	if _, ok := byName["Plain.getX"]; ok {
 		t.Error("Plain has no Lombok annotations but got a synthesized getter")
+	}
+	var explicitGetters int
+	for _, s := range syms {
+		if s.QualifiedName == "Explicit.getName" {
+			explicitGetters++
+			if len(s.Modifiers) > 0 && s.Modifiers[0] == "lombok-generated" {
+				t.Error("explicit getter was replaced by Lombok synthesis")
+			}
+		}
+	}
+	if explicitGetters != 1 {
+		t.Errorf("Explicit.getName count=%d want 1", explicitGetters)
 	}
 }
 
@@ -600,6 +773,38 @@ plain_global = 3
 	}
 	if _, ok := byQN["plain_global"]; ok {
 		t.Error("plain module global should stay unindexed")
+	}
+}
+
+func TestCSharpTopLevelStatementsAndLocalFunction(t *testing.T) {
+	src := []byte(`Console.WriteLine(TopHelper());
+static int TopHelper() { return Math.Abs(-1); }
+`)
+	eng := astkit.NewEngine()
+	tree, err := eng.Parse(context.Background(), astkit.LangCSharp, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tree.Close()
+	syms, err := strategies.NewCSharp().Extract(tree, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]astkit.Symbol{}
+	for _, s := range syms {
+		got[s.Name] = s
+	}
+	if got["TopHelper"].Kind != astkit.KindFunction {
+		t.Fatalf("TopHelper=%+v", got["TopHelper"])
+	}
+	entry, ok := got["<top-level>"]
+	if !ok || len(entry.CallSites) == 0 {
+		t.Fatalf("top-level entry=%+v", entry)
+	}
+	for _, cs := range entry.CallSites {
+		if cs.Callee == "Math.Abs" {
+			t.Fatal("local-function body call leaked into top-level entry")
+		}
 	}
 }
 

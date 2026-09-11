@@ -81,11 +81,15 @@ pub use grep_regex as regex;
 pub mod hiargs;
 `
 	syms, imps := extract(t, astkit.LangRust, src)
-	if findImport(imps, "pub use grep_cli as cli") == nil {
+	if findImport(imps, "grep_cli as cli") == nil {
 		t.Errorf("extern crate re-export not recorded as pub use: %+v", imps)
 	}
-	if findImport(imps, "pub use grep_regex as regex") == nil {
+	if findImport(imps, "grep_regex as regex") == nil {
 		t.Errorf("pub use missing: %+v", imps)
+	}
+	_, visible := extract(t, astkit.LangRust, "pub(crate) use crate::inner::Thing;\npub(super) use super::Other;\n")
+	if findImport(visible, "crate::inner::Thing") == nil || findImport(visible, "super::Other") == nil {
+		t.Errorf("visibility-qualified use paths not normalized: %+v", visible)
 	}
 	var mods []string
 	for _, s := range syms {
@@ -115,6 +119,15 @@ use Vendor\Long\ClassName as Short;
 require_once 'bootstrap.php';
 function f() {
     include "inner.php";
+}
+
+func TestPHPImports_GroupUseSplitsMembers(t *testing.T) {
+	_, imps := extract(t, astkit.LangPHP, "<?php\nuse A\\{B, C as D};\n")
+	b := findImport(imps, "A\\B")
+	c := findImport(imps, "A\\C")
+	if b == nil || c == nil || c.Alias != "D" {
+		t.Fatalf("group use imports = %+v", imps)
+	}
 }
 `
 	_, imps := extract(t, astkit.LangPHP, src)

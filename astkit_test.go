@@ -42,6 +42,15 @@ func TestDetectLanguage(t *testing.T) {
 	}
 }
 
+func TestDetectLanguageSniffsAmbiguousHeader(t *testing.T) {
+	if got := astkit.DetectLanguage("shape.h", "namespace geo { class Shape {}; }"); got != astkit.LangCPP {
+		t.Errorf("C++ header language = %q, want cpp", got)
+	}
+	if got := astkit.DetectLanguage("point.h", "struct Point { int x; };"); got != astkit.LangC {
+		t.Errorf("plain C header language = %q, want c", got)
+	}
+}
+
 func TestIsAST_IsConfigData(t *testing.T) {
 	astLangs := []astkit.LanguageKey{
 		astkit.LangGo, astkit.LangTypeScript, astkit.LangTSX, astkit.LangJavaScript,
@@ -195,7 +204,6 @@ func TestLanguageKeyString(t *testing.T) {
 		t.Fatal("LangGo string broken")
 	}
 }
-
 
 func TestGuardDepth_RejectsPathologicalNesting(t *testing.T) {
 	eng := astkit.NewEngine()

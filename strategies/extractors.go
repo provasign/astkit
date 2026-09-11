@@ -1,6 +1,7 @@
 package strategies
 
 import (
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -101,16 +102,27 @@ func goReceiverTypeName(method *sitter.Node, src []byte) string {
 		if typeNode == nil {
 			continue
 		}
-		switch typeNode.Type() {
-		case "pointer_type":
-			for j := 0; j < int(typeNode.ChildCount()); j++ {
-				c := typeNode.Child(j)
-				if c != nil && c.Type() == "type_identifier" {
-					return c.Content(src)
-				}
-			}
-		case "type_identifier":
-			return typeNode.Content(src)
+		if name := goReceiverNamedType(typeNode, src); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// goReceiverNamedType unwraps pointer and generic receiver types. The Go
+// grammar nests Task[T] under generic_type (and *Task[T] under pointer_type),
+// so looking only at the receiver type's direct children loses the method's
+// parent entirely.
+func goReceiverNamedType(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	if n.Type() == "type_identifier" {
+		return n.Content(src)
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if name := goReceiverNamedType(n.Child(i), src); name != "" {
+			return name
 		}
 	}
 	return ""
@@ -142,13 +154,14 @@ func goTypeDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 		}
 		raw := goStandaloneDecl("type", spec.Content(src))
 		out = append(out, astkit.Symbol{
-			Kind:          kind,
-			Name:          name,
-			QualifiedName: name,
-			Signature:     internalast.FirstLine(raw),
-			Span:          internalast.NodeSpan(spec),
-			Exported:      internalast.IsCapitalized(name),
-			Body:          raw,
+			Kind:           kind,
+			Name:           name,
+			QualifiedName:  name,
+			Signature:      internalast.FirstLine(raw),
+			Span:           internalast.NodeSpan(spec),
+			Exported:       internalast.IsCapitalized(name),
+			Body:           raw,
+			TypeParameters: goTypeParameters(spec, src),
 		})
 	}
 	return out
@@ -243,6 +256,45 @@ func goIdentifierNames(n *sitter.Node, src []byte) []string {
 func extractJSNodes(root *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
 	jsVisit(root, filePath, blobSHA, language, src, imports, "", false, &out)
+	for name := range jsNamedExports(root, src) {
+		for i := range out {
+			if out[i].ParentName == "" && out[i].Name == name {
+				out[i].Exported = true
+			}
+		}
+	}
+	return out
+}
+
+// jsNamedExports collects the local binding in `export { local as public }`.
+// These clauses are separate statements, often after the declaration, so the
+// declaration visitor cannot learn export status while constructing a symbol.
+func jsNamedExports(root *sitter.Node, src []byte) map[string]bool {
+	out := map[string]bool{}
+	if root == nil {
+		return out
+	}
+	for i := 0; i < int(root.NamedChildCount()); i++ {
+		stmt := root.NamedChild(i)
+		if stmt == nil || stmt.Type() != "export_statement" || stmt.ChildByFieldName("source") != nil {
+			continue
+		}
+		for j := 0; j < int(stmt.NamedChildCount()); j++ {
+			clause := stmt.NamedChild(j)
+			if clause == nil || clause.Type() != "export_clause" {
+				continue
+			}
+			for k := 0; k < int(clause.NamedChildCount()); k++ {
+				spec := clause.NamedChild(k)
+				if spec == nil || spec.Type() != "export_specifier" {
+					continue
+				}
+				if name := spec.ChildByFieldName("name"); name != nil {
+					out[name.Content(src)] = true
+				}
+			}
+		}
+	}
 	return out
 }
 
@@ -347,6 +399,8 @@ func jsAssignFunc(n *sitter.Node, filePath, blobSHA, language string, src []byte
 			}
 		}
 		raw := assign.Content(src)
+		target := left.Content(src)
+		exported := strings.HasPrefix(target, "exports.") || strings.HasPrefix(target, "module.exports.")
 		k := astkit.KindFunction
 		if parent != "" {
 			k = astkit.KindMethod
@@ -358,7 +412,7 @@ func jsAssignFunc(n *sitter.Node, filePath, blobSHA, language string, src []byte
 			QualifiedName: name,
 			Signature:     internalast.FirstLine(raw),
 			Span:          internalast.NodeSpan(assign),
-			Exported:      true,
+			Exported:      exported,
 			Body:          raw,
 			ParentName:    parent,
 			CallSites:     jsCallSites(body, src),
@@ -373,6 +427,13 @@ func jsClassDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 	}
 	className := nameNode.Content(src)
 	raw := n.Content(src)
+	var decoratorCalls []astkit.CallSite
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		child := n.NamedChild(i)
+		if child != nil && child.Type() == "decorator" {
+			decoratorCalls = append(decoratorCalls, jsCallSites(child, src)...)
+		}
+	}
 	*out = append(*out, astkit.Symbol{
 		Kind:           astkit.KindClass,
 		Name:           className,
@@ -385,6 +446,7 @@ func jsClassDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 		Modifiers:      jsModifiers(n, src),
 		TypeParameters: jsTypeParameters(n, src),
 		Annotations:    jsDecorators(n, src),
+		CallSites:      decoratorCalls,
 	})
 	// Visit class body for methods. Methods are never directly exported.
 	body := n.ChildByFieldName("body")
@@ -425,10 +487,20 @@ func jsMethodDef(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 func jsFieldDef(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
 	nameNode := n.ChildByFieldName("name")
 	if nameNode == nil {
+		nameNode = n.ChildByFieldName("property")
+	}
+	if nameNode == nil {
 		return
 	}
 	name := nameNode.Content(src)
 	raw := n.Content(src)
+	var callSites []astkit.CallSite
+	if value := n.ChildByFieldName("value"); value != nil {
+		switch value.Type() {
+		case "arrow_function", "function", "function_expression":
+			callSites = jsCallSites(value.ChildByFieldName("body"), src)
+		}
+	}
 	*out = append(*out, astkit.Symbol{
 		Kind:          astkit.KindField,
 		Name:          name,
@@ -440,6 +512,7 @@ func jsFieldDef(n *sitter.Node, filePath, blobSHA, language string, src []byte, 
 		ParentName:    qualLast(parentClass),
 		Modifiers:     jsModifiers(n, src),
 		Annotations:   jsDecorators(n, src),
+		CallSites:     callSites,
 	})
 }
 
@@ -532,6 +605,47 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 				TypeParameters: jsTypeParameters(valueNode, src),
 				CallSites:      jsCallSites(body, src),
 			})
+		case "object":
+			objectName := nameNode.Content(src)
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindVariable, Name: objectName,
+				QualifiedName: qualJoin(parentClass, objectName),
+				Signature:     internalast.FirstLine(decl.Content(src)),
+				Span:          internalast.NodeSpan(decl), Exported: exported,
+				Body: decl.Content(src), ParentName: qualLast(parentClass),
+			})
+			objectParent := qualJoin(parentClass, objectName)
+			for j := 0; j < int(valueNode.NamedChildCount()); j++ {
+				member := valueNode.NamedChild(j)
+				if member == nil {
+					continue
+				}
+				if member.Type() == "method_definition" {
+					jsMethodDef(member, filePath, blobSHA, language, src, imports, objectParent, out)
+					continue
+				}
+				if member.Type() != "pair" {
+					continue
+				}
+				key, value := member.ChildByFieldName("key"), member.ChildByFieldName("value")
+				if key == nil || value == nil {
+					continue
+				}
+				switch value.Type() {
+				case "arrow_function", "function", "function_expression":
+				default:
+					continue
+				}
+				memberName := strings.Trim(key.Content(src), `"'`)
+				*out = append(*out, astkit.Symbol{
+					Kind: astkit.KindMethod, Name: memberName,
+					QualifiedName: qualJoin(objectParent, memberName),
+					Signature:     internalast.FirstLine(member.Content(src)),
+					Span:          internalast.NodeSpan(member), Body: member.Content(src),
+					ParentName: qualLast(objectParent),
+					CallSites:  jsCallSites(value.ChildByFieldName("body"), src),
+				})
+			}
 		}
 	}
 }
@@ -540,21 +654,24 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 
 func extractPythonNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
-	pythonVisit(root, filePath, blobSHA, src, imports, "", &out)
+	pythonVisit(root, filePath, blobSHA, src, imports, "", "", false, &out)
+	if top := pythonTopLevelSymbol(root, src); top != nil {
+		out = append(out, *top)
+	}
 	return out
 }
 
-func pythonVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+func pythonVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass, qualifier string, inFunction bool, out *[]astkit.Symbol) {
 	for i := 0; i < int(node.ChildCount()); i++ {
 		n := node.Child(i)
 		if n == nil {
 			continue
 		}
-		pythonVisitDefinition(n, filePath, blobSHA, src, imports, parentClass, nil, out)
+		pythonVisitDefinition(n, filePath, blobSHA, src, imports, parentClass, qualifier, inFunction, nil, out)
 	}
 }
 
-func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, decorators []string, out *[]astkit.Symbol) {
+func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass, qualifier string, inFunction bool, decorators []string, out *[]astkit.Symbol) {
 	switch n.Type() {
 	case "function_definition":
 		nameNode := n.ChildByFieldName("name")
@@ -563,7 +680,7 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 		}
 		name := nameNode.Content(src)
 		kind := astkit.KindFunction
-		if parentClass != "" {
+		if parentClass != "" && !inFunction {
 			kind = astkit.KindMethod
 			if name == "__init__" {
 				kind = astkit.KindConstructor
@@ -571,20 +688,22 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 		}
 		raw := n.Content(src)
 		body := n.ChildByFieldName("body")
+		qualified := qualJoin(qualifier, name)
 		*out = append(*out, astkit.Symbol{
 			Kind:          kind,
 			Name:          name,
-			QualifiedName: qualJoin(parentClass, name),
+			QualifiedName: qualified,
 			Signature:     internalast.FirstLine(raw),
 			Span:          internalast.NodeSpan(n),
 			Exported:      !strings.HasPrefix(name, "_"),
 			Body:          raw,
-			ParentName:    qualLast(parentClass),
+			ParentName:    qualLast(qualifier),
 			Modifiers:     pythonModifiers(name),
 			Annotations:   decorators,
 			CallSites:     pythonCallSites(body, src),
 			AttrSites:     pythonAttrSites(body, src),
 		})
+		pythonVisit(body, filePath, blobSHA, src, imports, parentClass, qualified, true, out)
 	case "class_definition":
 		nameNode := n.ChildByFieldName("name")
 		if nameNode == nil {
@@ -592,28 +711,46 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 		}
 		className := nameNode.Content(src)
 		raw := n.Content(src)
+		sig := internalast.SignatureBeforeBody(n, src)
+		kind := astkit.KindClass
+		if open, close := strings.IndexByte(sig, '('), strings.LastIndexByte(sig, ')'); open >= 0 && close > open {
+			for _, base := range strings.Split(sig[open+1:close], ",") {
+				base = strings.TrimSpace(base)
+				if i := strings.IndexByte(base, '['); i >= 0 {
+					base = base[:i]
+				}
+				if i := strings.LastIndexByte(base, '.'); i >= 0 {
+					base = base[i+1:]
+				}
+				if strings.TrimSpace(base) == "Protocol" {
+					kind = astkit.KindInterface
+					break
+				}
+			}
+		}
 		*out = append(*out, astkit.Symbol{
-			Kind:          astkit.KindClass,
+			Kind:          kind,
 			Name:          className,
-			QualifiedName: qualJoin(parentClass, className),
-			Signature:     internalast.SignatureBeforeBody(n, src),
+			QualifiedName: qualJoin(qualifier, className),
+			Signature:     sig,
 			Span:          internalast.NodeSpan(n),
 			Exported:      !strings.HasPrefix(className, "_"),
 			Body:          raw,
-			ParentName:    qualLast(parentClass),
+			ParentName:    qualLast(qualifier),
 			Modifiers:     pythonModifiers(className),
 			Annotations:   decorators,
 		})
 		body := n.ChildByFieldName("body")
 		if body != nil {
-			pythonVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, className), out)
+			classQualified := qualJoin(qualifier, className)
+			pythonVisit(body, filePath, blobSHA, src, imports, classQualified, classQualified, false, out)
 		}
 	case "decorated_definition":
 		decos := pythonDecorators(n, src)
 		for j := 0; j < int(n.ChildCount()); j++ {
 			inner := n.Child(j)
 			if inner != nil && (inner.Type() == "function_definition" || inner.Type() == "class_definition") {
-				pythonVisitDefinition(inner, filePath, blobSHA, src, imports, parentClass, decos, out)
+				pythonVisitDefinition(inner, filePath, blobSHA, src, imports, parentClass, qualifier, inFunction, decos, out)
 				return
 			}
 		}
@@ -624,8 +761,11 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 		// def in a try/except import fallback, or a platform-specific
 		// class in an `if sys.platform ...` branch. Recurse into every
 		// nested block so these are indexed rather than silently dropped.
-		pythonVisitBlocks(n, filePath, blobSHA, src, imports, parentClass, out)
+		pythonVisitBlocks(n, filePath, blobSHA, src, imports, parentClass, qualifier, inFunction, out)
 	case "expression_statement":
+		if inFunction {
+			return // function locals are not declarations in the repository graph
+		}
 		// Module scope: annotated assignment ("g: _AppCtxGlobalsProxy = ...")
 		// becomes a KindVariable — module globals are otherwise invisible,
 		// blocking call resolution through proxy globals (Flask's `g`).
@@ -693,7 +833,7 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 // each contained statement so conditionally-defined classes, functions, and
 // module-level annotated variables are still indexed. Condition and iterable
 // expressions are skipped — only block-bearing children are descended.
-func pythonVisitBlocks(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+func pythonVisitBlocks(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass, qualifier string, inFunction bool, out *[]astkit.Symbol) {
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)
 		if c == nil {
@@ -703,13 +843,53 @@ func pythonVisitBlocks(n *sitter.Node, filePath, blobSHA string, src []byte, imp
 		case c.Type() == "block":
 			for j := 0; j < int(c.ChildCount()); j++ {
 				if inner := c.Child(j); inner != nil {
-					pythonVisitDefinition(inner, filePath, blobSHA, src, imports, parentClass, nil, out)
+					pythonVisitDefinition(inner, filePath, blobSHA, src, imports, parentClass, qualifier, inFunction, nil, out)
 				}
 			}
 		case strings.HasSuffix(c.Type(), "_clause"):
 			// elif/else/except/finally/case clauses each wrap a block.
-			pythonVisitBlocks(c, filePath, blobSHA, src, imports, parentClass, out)
+			pythonVisitBlocks(c, filePath, blobSHA, src, imports, parentClass, qualifier, inFunction, out)
 		}
+	}
+}
+
+func pythonTopLevelSymbol(root *sitter.Node, src []byte) *astkit.Symbol {
+	calls := pythonCallSites(root, src)
+	attrs := pythonAttrSites(root, src)
+	if len(calls) == 0 && len(attrs) == 0 {
+		return nil
+	}
+	masked := append([]byte(nil), src...)
+	var maskDefinitions func(*sitter.Node)
+	maskDefinitions = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n != root && pythonNestedScope(n.Type()) {
+			start, end := int(n.StartByte()), int(n.EndByte())
+			if start < 0 {
+				start = 0
+			}
+			if end > len(masked) {
+				end = len(masked)
+			}
+			for i := start; i < end; i++ {
+				if masked[i] != '\n' && masked[i] != '\r' {
+					masked[i] = ' '
+				}
+			}
+			return
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			maskDefinitions(n.Child(i))
+		}
+	}
+	maskDefinitions(root)
+	body := string(masked)
+	return &astkit.Symbol{
+		Kind: astkit.KindFunction, Name: "<top-level>", QualifiedName: "<top-level>",
+		Signature: "<top-level>", Span: astkit.LineRange{Start: 1, End: strings.Count(body, "\n") + 1},
+		Body: body, CallSites: calls, AttrSites: attrs,
 	}
 }
 
@@ -771,6 +951,16 @@ func javaVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 				continue
 			}
 			javaFieldDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "enum_body_declarations":
+			javaVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "enum_constant":
+			if parentClass == "" {
+				continue
+			}
+			javaEnumConstantDecl(n, src, parentClass, out)
+			if body := n.ChildByFieldName("body"); body != nil {
+				javaVisit(body, filePath, blobSHA, src, imports, parentClass, out)
+			}
 		}
 	}
 }
@@ -807,11 +997,67 @@ func javaTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 		Annotations:    javaAnnotations(n, src),
 	})
 	body := n.ChildByFieldName("body")
+	if n.Type() == "record_declaration" {
+		javaRecordComponents(n, src, qualJoin(parentClass, className), out)
+	}
 	if body != nil {
 		before := len(*out)
 		javaVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, className), out)
 		synthesizeLombokAccessors(className, javaAnnotations(n, src), before, out)
 	}
+}
+
+// javaRecordComponents emits the implicit field and public accessor that Java
+// creates for each record header component. Neither declaration exists in the
+// record body, but callers and field references must still have graph targets.
+func javaRecordComponents(n *sitter.Node, src []byte, parentClass string, out *[]astkit.Symbol) {
+	params := n.ChildByFieldName("parameters")
+	if params == nil {
+		params = findChildByType(n, "formal_parameters")
+	}
+	if params == nil {
+		return
+	}
+	for i := 0; i < int(params.NamedChildCount()); i++ {
+		component := params.NamedChild(i)
+		if component == nil || component.Type() != "formal_parameter" {
+			continue
+		}
+		nameNode := component.ChildByFieldName("name")
+		typeNode := component.ChildByFieldName("type")
+		if nameNode == nil || typeNode == nil {
+			continue
+		}
+		name := nameNode.Content(src)
+		typ := strings.TrimSpace(typeNode.Content(src))
+		span := internalast.NodeSpan(component)
+		qualified := qualJoin(parentClass, name)
+		*out = append(*out,
+			astkit.Symbol{
+				Kind: astkit.KindField, Name: name, QualifiedName: qualified,
+				Signature: component.Content(src), Span: span, ParentName: qualLast(parentClass),
+				Modifiers: []string{"record-component"},
+			},
+			astkit.Symbol{
+				Kind: astkit.KindMethod, Name: name, QualifiedName: qualified,
+				Signature: typ + " " + name + "()", Span: span, ParentName: qualLast(parentClass),
+				Exported: true, Modifiers: []string{"public", "record-accessor"},
+			},
+		)
+	}
+}
+
+func javaEnumConstantDecl(n *sitter.Node, src []byte, parentClass string, out *[]astkit.Symbol) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(parentClass, name),
+		Signature: n.Content(src), Span: internalast.NodeSpan(n), Exported: true,
+		ParentName: qualLast(parentClass), Modifiers: []string{"public", "static", "final", "enum-constant"},
+	})
 }
 
 // synthesizeLombokAccessors emits getter/setter method symbols for fields of
@@ -843,6 +1089,12 @@ func synthesizeLombokAccessors(className string, classAnn []string, fieldsFrom i
 	}
 	var synth []astkit.Symbol
 	fields := (*out)[fieldsFrom:]
+	explicitMethods := map[string]bool{}
+	for i := range fields {
+		if fields[i].Kind == astkit.KindMethod && fields[i].ParentName == className {
+			explicitMethods[fields[i].Name] = true
+		}
+	}
 	for i := range fields {
 		f := &fields[i]
 		if f.Kind != astkit.KindField || f.ParentName != className {
@@ -870,11 +1122,11 @@ func synthesizeLombokAccessors(className string, classAnn []string, fieldsFrom i
 				Modifiers:     []string{"lombok-generated"},
 			}
 		}
-		if g {
+		if g && !explicitMethods[getter] {
 			synth = append(synth, mk(getter, "public "+getter+"() [lombok, from field "+name+"]"))
 		}
-		if s {
-			synth = append(synth, mk("set"+cap, "public set"+cap+"(...) [lombok, from field "+name+"]"))
+		if setter := "set" + cap; s && !explicitMethods[setter] {
+			synth = append(synth, mk(setter, "public "+setter+"(...) [lombok, from field "+name+"]"))
 		}
 	}
 	*out = append(*out, synth...)
@@ -912,18 +1164,86 @@ func javaMethodDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA st
 		Annotations:    javaAnnotations(n, src),
 		CallSites:      javaCallSites(body, src),
 	})
+	javaNestedExecutables(body, filePath, blobSHA, src, imports, parentClass, out)
+}
+
+func javaNestedExecutables(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	if node == nil {
+		return
+	}
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child == nil {
+			continue
+		}
+		switch child.Type() {
+		case "object_creation_expression":
+			if body := findChildByType(child, "class_body"); body != nil {
+				javaAnonymousClassDecl(child, body, filePath, blobSHA, src, imports, parentClass, out)
+				// Arguments can themselves contain lambdas/anonymous classes; the
+				// anonymous class body is owned by the synthetic class above.
+				for j := 0; j < int(child.NamedChildCount()); j++ {
+					nested := child.NamedChild(j)
+					if nested != nil && nested != body {
+						javaNestedExecutables(nested, filePath, blobSHA, src, imports, parentClass, out)
+					}
+				}
+				continue
+			}
+		case "lambda_expression":
+			javaLambdaDecl(child, filePath, blobSHA, src, imports, parentClass, out)
+			continue
+		case "class_declaration", "record_declaration":
+			javaTypeDecl(child, astkit.KindClass, filePath, blobSHA, src, imports, parentClass, out)
+			continue
+		case "interface_declaration":
+			javaTypeDecl(child, astkit.KindInterface, filePath, blobSHA, src, imports, parentClass, out)
+			continue
+		case "enum_declaration":
+			javaTypeDecl(child, astkit.KindEnum, filePath, blobSHA, src, imports, parentClass, out)
+			continue
+		}
+		javaNestedExecutables(child, filePath, blobSHA, src, imports, parentClass, out)
+	}
+}
+
+func javaSyntheticName(kind string, n *sitter.Node) string {
+	p := n.StartPoint()
+	return "<" + kind + "@" + strconv.Itoa(int(p.Row)+1) + ":" + strconv.Itoa(int(p.Column)+1) + ">"
+}
+
+func javaAnonymousClassDecl(n, body *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	name := javaSyntheticName("anonymous", n)
+	qualified := qualJoin(parentClass, name)
+	base := ""
+	if typ := n.ChildByFieldName("type"); typ != nil {
+		base = strings.TrimSpace(typ.Content(src))
+	}
+	signature := "class " + name
+	if base != "" {
+		signature += " extends " + base
+	}
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindClass, Name: name, QualifiedName: qualified,
+		ParentName: qualLast(parentClass), Signature: signature,
+		Span: internalast.NodeSpan(n), Body: n.Content(src), Modifiers: []string{"anonymous"},
+	})
+	javaVisit(body, filePath, blobSHA, src, imports, qualified, out)
+}
+
+func javaLambdaDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	name := javaSyntheticName("lambda", n)
+	body := n.ChildByFieldName("body")
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindFunction, Name: name, QualifiedName: qualJoin(parentClass, name),
+		ParentName: qualLast(parentClass), Signature: strings.TrimSpace(n.Content(src)),
+		Span: internalast.NodeSpan(n), Body: n.Content(src), Modifiers: []string{"lambda"},
+		CallSites: javaCallSites(body, src),
+	})
+	javaNestedExecutables(body, filePath, blobSHA, src, imports, parentClass, out)
 }
 
 func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
-	decl := internalast.FindChildByType(n, "variable_declarator")
-	if decl == nil {
-		return
-	}
-	nameNode := decl.ChildByFieldName("name")
-	if nameNode == nil {
-		return
-	}
-	name := nameNode.Content(src)
 	raw := n.Content(src)
 	// Full header, not FirstLine: an annotation on its own line before the
 	// field made FirstLine return just "@Deprecated" as the signature.
@@ -935,18 +1255,29 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 			exports = true
 		}
 	}
-	*out = append(*out, astkit.Symbol{
-		Kind:          astkit.KindField,
-		Name:          name,
-		QualifiedName: qualJoin(parentClass, name),
-		Signature:     sig,
-		Span:          internalast.NodeSpan(n),
-		Exported:      exports,
-		Body:          raw,
-		ParentName:    qualLast(parentClass),
-		Modifiers:     modifiers,
-		Annotations:   javaAnnotations(n, src),
-	})
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		decl := n.NamedChild(i)
+		if decl == nil || decl.Type() != "variable_declarator" {
+			continue
+		}
+		nameNode := decl.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		name := nameNode.Content(src)
+		*out = append(*out, astkit.Symbol{
+			Kind:          astkit.KindField,
+			Name:          name,
+			QualifiedName: qualJoin(parentClass, name),
+			Signature:     sig,
+			Span:          internalast.NodeSpan(n),
+			Exported:      exports,
+			Body:          raw,
+			ParentName:    qualLast(parentClass),
+			Modifiers:     modifiers,
+			Annotations:   javaAnnotations(n, src),
+		})
+	}
 }
 
 // ─── Rust ─────────────────────────────────────────────────────────────────────
@@ -954,7 +1285,56 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 func extractRustNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
 	rustVisit(root, filePath, blobSHA, src, imports, "", nil, "", &out)
+	impls := rustImplTraits(root, src)
+	for i := range out {
+		if out[i].Kind != astkit.KindStruct && out[i].Kind != astkit.KindEnum {
+			continue
+		}
+		for _, trait := range impls[out[i].Name] {
+			out[i].Annotations = append(out[i].Annotations, "implements:"+trait)
+		}
+	}
 	return out
+}
+
+// rustImplTraits records impl Trait for Type headers on their declared type.
+// This preserves empty impl blocks too; method annotations alone cannot carry
+// an implementation relation when the impl intentionally defines no methods.
+func rustImplTraits(root *sitter.Node, src []byte) map[string][]string {
+	out := map[string][]string{}
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type() == "impl_item" {
+			typeNode := n.ChildByFieldName("type")
+			traitNode := n.ChildByFieldName("trait")
+			if typeNode != nil && traitNode != nil {
+				typ := rustImplBaseName(typeNode.Content(src))
+				trait := rustImplBaseName(traitNode.Content(src))
+				if typ != "" && trait != "" {
+					out[typ] = append(out[typ], trait)
+				}
+			}
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(root)
+	return out
+}
+
+func rustImplBaseName(name string) string {
+	name = strings.TrimSpace(name)
+	if i := strings.IndexByte(name, '<'); i >= 0 {
+		name = name[:i]
+	}
+	if i := strings.LastIndex(name, "::"); i >= 0 {
+		name = name[i+2:]
+	}
+	return strings.TrimSpace(name)
 }
 
 func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, implBounds []string, implTrait string, out *[]astkit.Symbol) {
@@ -997,6 +1377,18 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 				Annotations:    annotations,
 				CallSites:      rustCallSites(body, src),
 			})
+			if body != nil {
+				scope := qualJoin(implType, name)
+				start := len(*out)
+				rustVisit(body, filePath, blobSHA, src, imports, "", nil, "", out)
+				for j := start; j < len(*out); j++ {
+					sym := &(*out)[j]
+					sym.QualifiedName = qualJoin(scope, sym.QualifiedName)
+					if sym.ParentName == "" {
+						sym.ParentName = name
+					}
+				}
+			}
 		case "struct_item":
 			rustNamedItem(n, astkit.KindStruct, filePath, blobSHA, src, imports, out)
 			rustStructFields(n, filePath, blobSHA, src, imports, out)
@@ -1042,10 +1434,22 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 			// every #[cfg(test)] function in the file. A declaration
 			// (`pub mod hiargs;`) becomes a module symbol so a lib.rs made
 			// of mod lines still exists to the graph.
+			rustNamedItem(n, astkit.KindModule, filePath, blobSHA, src, imports, out)
 			if body := n.ChildByFieldName("body"); body != nil {
+				nameNode := n.ChildByFieldName("name")
+				if nameNode == nil {
+					continue
+				}
+				moduleName := nameNode.Content(src)
+				start := len(*out)
 				rustVisit(body, filePath, blobSHA, src, imports, implType, implBounds, implTrait, out)
-			} else {
-				rustNamedItem(n, astkit.KindModule, filePath, blobSHA, src, imports, out)
+				for j := start; j < len(*out); j++ {
+					sym := &(*out)[j]
+					sym.QualifiedName = qualJoin(moduleName, sym.QualifiedName)
+					if sym.ParentName == "" && (sym.Kind == astkit.KindFunction || sym.Kind == astkit.KindModule) {
+						sym.ParentName = moduleName
+					}
+				}
 			}
 		}
 	}
@@ -1080,6 +1484,37 @@ func rustStructFields(n *sitter.Node, filePath, blobSHA string, src []byte, impo
 	}
 	body := internalast.FindChildByType(n, "field_declaration_list")
 	if body == nil {
+		body = internalast.FindChildByType(n, "ordered_field_declaration_list")
+	}
+	if body == nil {
+		return
+	}
+	if body.Type() == "ordered_field_declaration_list" {
+		fieldIndex := 0
+		public := false
+		for i := 0; i < int(body.NamedChildCount()); i++ {
+			child := body.NamedChild(i)
+			if child == nil {
+				continue
+			}
+			if child.Type() == "visibility_modifier" {
+				public = true
+				continue
+			}
+			name := strconv.Itoa(fieldIndex)
+			mods := []string(nil)
+			if public {
+				mods = []string{"pub"}
+			}
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindField, Name: name, QualifiedName: name,
+				Signature: child.Content(src), Span: internalast.NodeSpan(child),
+				Exported: public, Body: child.Content(src), ParentName: structName,
+				Modifiers: mods,
+			})
+			fieldIndex++
+			public = false
+		}
 		return
 	}
 	for i := 0; i < int(body.ChildCount()); i++ {
@@ -1206,7 +1641,13 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 				}
 				out = append(out, sym)
 			}
-		case "struct_specifier", "union_specifier":
+		case "struct_specifier":
+			if language == "cpp" {
+				out = append(out, cppClassSym(n, filePath, blobSHA, language, src, imports)...)
+			} else if sym := cTaggedTypeSym(n, astkit.KindStruct, filePath, blobSHA, language, src, imports); sym != nil {
+				out = append(out, *sym)
+			}
+		case "union_specifier":
 			if sym := cTaggedTypeSym(n, astkit.KindStruct, filePath, blobSHA, language, src, imports); sym != nil {
 				out = append(out, *sym)
 			}
@@ -1229,6 +1670,11 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 			}
 		case "template_declaration":
 			out = append(out, cppTemplateDecl(n, filePath, blobSHA, language, src, imports)...)
+		case "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else":
+			// Declarations in conditional branches are ordinary source symbols.
+			// Tree-sitter nests them below the preprocessor node rather than the
+			// translation unit, so explicitly descend into each guarded region.
+			out = append(out, extractCNodes(n, filePath, blobSHA, language, src, imports)...)
 		}
 	}
 	// A prototype (`static int do_dump(...);`) for a function defined in
@@ -1246,6 +1692,9 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 		}
 		out = kept
 	}
+	if language == "cpp" {
+		cppApplyDeclaredVisibility(out)
+	}
 
 	return out
 }
@@ -1260,22 +1709,89 @@ func cFuncSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, im
 	if name == "" {
 		return nil
 	}
+	if language == "cpp" && parentClass == "" {
+		parentClass = cppDeclaratorOwner(declarator.Content(src))
+	}
 	raw := n.Content(src)
+	modifiers := cStorageModifiers(n, src)
 	kind := astkit.KindFunction
+	qualifiedName := name
 	if parentClass != "" {
 		kind = astkit.KindMethod
+		ownerName := parentClass
+		if i := strings.LastIndex(ownerName, "::"); i >= 0 {
+			ownerName = ownerName[i+2:]
+		}
+		if language == "cpp" && name == ownerName {
+			kind = astkit.KindConstructor
+		}
+		qualifiedName = parentClass + "." + name
 	}
 	return &astkit.Symbol{
 		Kind:          kind,
 		Name:          name,
-		QualifiedName: name,
+		QualifiedName: qualifiedName,
 		Signature:     funcSig(n, src),
 		Span:          internalast.NodeSpan(n),
-		Exported:      !strings.HasPrefix(name, "_"),
+		Exported:      !strings.HasPrefix(name, "_") && !cHasModifier(modifiers, "static"),
 		Body:          raw,
 		ParentName:    parentClass,
+		Modifiers:     modifiers,
 		CallSites:     cCallSites(n, src),
 	}
+}
+
+func cStorageModifiers(n *sitter.Node, src []byte) []string {
+	var modifiers []string
+	for i := 0; n != nil && i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child == nil || child.Type() != "storage_class_specifier" {
+			continue
+		}
+		modifier := strings.TrimSpace(child.Content(src))
+		if modifier != "" && !cHasModifier(modifiers, modifier) {
+			modifiers = append(modifiers, modifier)
+		}
+	}
+	return modifiers
+}
+
+func cHasModifier(modifiers []string, want string) bool {
+	for _, modifier := range modifiers {
+		if modifier == want {
+			return true
+		}
+	}
+	return false
+}
+
+func cppDeclaratorOwner(declarator string) string {
+	head := declarator
+	if i := strings.IndexByte(head, '('); i >= 0 {
+		head = head[:i]
+	}
+	sep := strings.LastIndex(head, "::")
+	if sep < 0 {
+		return ""
+	}
+	owner := strings.TrimSpace(head[:sep])
+	var out strings.Builder
+	depth := 0
+	for _, r := range owner {
+		switch r {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				out.WriteRune(r)
+			}
+		}
+	}
+	return strings.TrimSpace(out.String())
 }
 
 // cCallSites extracts call sites from a C/C++ function/method definition:
@@ -1433,14 +1949,16 @@ func cDeclarationSyms(n *sitter.Node, filePath, blobSHA, language string, src []
 				continue
 			}
 			raw := n.Content(src)
+			modifiers := cStorageModifiers(n, src)
 			out = append(out, astkit.Symbol{
 				Kind:          astkit.KindFunction,
 				Name:          name,
 				QualifiedName: name,
 				Signature:     strings.TrimSpace(raw),
 				Span:          internalast.NodeSpan(n),
-				Exported:      !strings.HasPrefix(name, "_"),
+				Exported:      !strings.HasPrefix(name, "_") && !cHasModifier(modifiers, "static"),
 				Body:          raw,
+				Modifiers:     modifiers,
 			})
 		}
 	}
@@ -1516,8 +2034,12 @@ func cppClassSym(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 	}
 	className := nameNode.Content(src)
 	raw := n.Content(src)
+	kind := astkit.KindClass
+	if n.Type() == "struct_specifier" {
+		kind = astkit.KindStruct
+	}
 	out := []astkit.Symbol{{
-		Kind:          astkit.KindClass,
+		Kind:          kind,
 		Name:          className,
 		QualifiedName: className,
 		Signature:     internalast.SignatureBeforeBody(n, src),
@@ -1530,18 +2052,82 @@ func cppClassSym(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 	if body == nil {
 		return out
 	}
+	access := "private"
+	if kind == astkit.KindStruct {
+		access = "public"
+	}
 	for i := 0; i < int(body.ChildCount()); i++ {
 		child := body.Child(i)
 		if child == nil {
 			continue
 		}
+		if child.Type() == "access_specifier" {
+			if declared := strings.TrimSuffix(strings.TrimSpace(child.Content(src)), ":"); declared == "public" || declared == "private" || declared == "protected" {
+				access = declared
+			}
+			continue
+		}
 		if child.Type() == "function_definition" {
 			if sym := cFuncSym(child, filePath, blobSHA, language, src, imports, className); sym != nil {
+				cppSetMemberAccess(sym, access)
 				out = append(out, *sym)
+			}
+			continue
+		}
+		if child.Type() == "field_declaration" || child.Type() == "declaration" {
+			for _, sym := range cDeclarationSyms(child, filePath, blobSHA, language, src, imports) {
+				if sym.Kind != astkit.KindFunction {
+					continue
+				}
+				sym.Kind = astkit.KindMethod
+				if sym.Name == className {
+					sym.Kind = astkit.KindConstructor
+				}
+				sym.ParentName = className
+				sym.QualifiedName = className + "." + sym.Name
+				cppSetMemberAccess(&sym, access)
+				out = append(out, sym)
 			}
 		}
 	}
 	return out
+}
+
+func cppSetMemberAccess(sym *astkit.Symbol, access string) {
+	sym.Exported = access == "public"
+	for _, modifier := range sym.Modifiers {
+		if modifier == "public" || modifier == "private" || modifier == "protected" {
+			return
+		}
+	}
+	sym.Modifiers = append(sym.Modifiers, access)
+}
+
+func cppApplyDeclaredVisibility(symbols []astkit.Symbol) {
+	type visibility struct {
+		exported  bool
+		modifiers []string
+	}
+	declared := map[string]visibility{}
+	for i := range symbols {
+		if symbols[i].Kind != astkit.KindMethod {
+			continue
+		}
+		for _, modifier := range symbols[i].Modifiers {
+			if modifier == "public" || modifier == "private" || modifier == "protected" {
+				declared[symbols[i].QualifiedName] = visibility{symbols[i].Exported, append([]string(nil), symbols[i].Modifiers...)}
+				break
+			}
+		}
+	}
+	for i := range symbols {
+		visibility, ok := declared[symbols[i].QualifiedName]
+		if !ok {
+			continue
+		}
+		symbols[i].Exported = visibility.exported
+		symbols[i].Modifiers = append([]string(nil), visibility.modifiers...)
+	}
 }
 
 func cppNamespaceSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) *astkit.Symbol {
@@ -1574,7 +2160,7 @@ func cppTemplateDecl(n *sitter.Node, filePath, blobSHA, language string, src []b
 			if sym := cFuncSym(child, filePath, blobSHA, language, src, imports, ""); sym != nil {
 				return []astkit.Symbol{*sym}
 			}
-		case "class_specifier":
+		case "class_specifier", "struct_specifier":
 			return cppClassSym(child, filePath, blobSHA, language, src, imports)
 		}
 	}
@@ -1585,11 +2171,38 @@ func cppTemplateDecl(n *sitter.Node, filePath, blobSHA, language string, src []b
 
 func extractCSharpNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
-	csVisit(root, filePath, blobSHA, src, imports, "", &out)
+	csVisit(root, filePath, blobSHA, src, imports, "", false, &out)
+	if top := csTopLevelSymbol(root, src); top != nil {
+		out = append(out, *top)
+	}
 	return out
 }
 
-func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+func csTopLevelSymbol(root *sitter.Node, src []byte) *astkit.Symbol {
+	var sites []astkit.CallSite
+	start, end := 0, 0
+	for i := 0; i < int(root.ChildCount()); i++ {
+		n := root.Child(i)
+		if n == nil || n.Type() != "global_statement" || internalast.FindChildByType(n, "local_function_statement") != nil {
+			continue
+		}
+		if start == 0 {
+			start = int(n.StartPoint().Row) + 1
+		}
+		end = int(n.EndPoint().Row) + 1
+		sites = append(sites, csCallSites(n, src)...)
+	}
+	if start == 0 {
+		return nil
+	}
+	return &astkit.Symbol{
+		Kind: astkit.KindFunction, Name: "<top-level>", QualifiedName: "<top-level>",
+		Signature: "<top-level>", Span: astkit.LineRange{Start: start, End: end},
+		Body: string(src), CallSites: sites,
+	}
+}
+
+func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, parentInterface bool, out *[]astkit.Symbol) {
 	for i := 0; i < int(node.ChildCount()); i++ {
 		n := node.Child(i)
 		if n == nil {
@@ -1613,10 +2226,16 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 				Body:          raw,
 			})
 			if body := n.ChildByFieldName("body"); body != nil {
-				csVisit(body, filePath, blobSHA, src, imports, "", out)
+				csVisit(body, filePath, blobSHA, src, imports, "", false, out)
 			}
-		case "class_declaration", "record_declaration":
+		case "class_declaration":
 			csTypeDecl(n, astkit.KindClass, filePath, blobSHA, src, imports, parentClass, out)
+		case "record_declaration":
+			kind := astkit.KindClass
+			if strings.Contains(internalast.SignatureBeforeBody(n, src), "record struct") {
+				kind = astkit.KindStruct
+			}
+			csTypeDecl(n, kind, filePath, blobSHA, src, imports, parentClass, out)
 		case "struct_declaration":
 			csTypeDecl(n, astkit.KindStruct, filePath, blobSHA, src, imports, parentClass, out)
 		case "interface_declaration":
@@ -1625,14 +2244,18 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			csTypeDecl(n, astkit.KindEnum, filePath, blobSHA, src, imports, parentClass, out)
 		case "method_declaration", "constructor_declaration", "destructor_declaration":
 			csMethodDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "global_statement":
+			csVisit(n, filePath, blobSHA, src, imports, parentClass, parentInterface, out)
+		case "local_function_statement":
+			csMethodDecl(n, filePath, blobSHA, src, imports, parentClass, out)
 		case "property_declaration":
-			csPropertyDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+			csPropertyDecl(n, filePath, blobSHA, src, imports, parentClass, parentInterface, out)
 		case "field_declaration":
 			csFieldDecl(n, filePath, blobSHA, src, imports, parentClass, out)
 		case "file_scoped_namespace_declaration":
 			// `namespace Foo;` (C# 10): declarations follow as siblings in
 			// the same node, sharing this namespace.
-			csVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+			csVisit(n, filePath, blobSHA, src, imports, parentClass, parentInterface, out)
 		case "preproc_if", "preproc_elif", "preproc_else":
 			// Multi-target code lives inside #if/#elif/#else blocks; the
 			// grammar nests the conditional declarations as children. Not
@@ -1640,7 +2263,7 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			// `#if !(PORTABLE || ...)`) — the C# analog of Rust's mod_item.
 			// All branches are visited so a symbol guarded by any target is
 			// found; the oracle's chosen branch is always a subset.
-			csVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+			csVisit(n, filePath, blobSHA, src, imports, parentClass, parentInterface, out)
 		}
 	}
 }
@@ -1667,7 +2290,7 @@ func csTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA string
 		Annotations:    csAttributes(n, src),
 	})
 	if body := n.ChildByFieldName("body"); body != nil {
-		csVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, name), out)
+		csVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, name), kind == astkit.KindInterface, out)
 	}
 }
 
@@ -1680,8 +2303,14 @@ func csMethodDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports 
 	raw := n.Content(src)
 	modifiers := csModifiers(n, src)
 	kind := astkit.KindMethod
-	if n.Type() == "constructor_declaration" {
+	if parentClass == "" {
+		kind = astkit.KindFunction
+	} else if n.Type() == "constructor_declaration" {
 		kind = astkit.KindConstructor
+	}
+	sites := csCallSites(n, src)
+	if n.Type() == "constructor_declaration" {
+		sites = append(sites, csConstructorInitializerSites(n, src, parentClass)...)
 	}
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
@@ -1695,8 +2324,34 @@ func csMethodDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports 
 		Modifiers:      modifiers,
 		TypeParameters: csTypeParams(n, src),
 		Annotations:    csAttributes(n, src),
-		CallSites:      csCallSites(n, src),
+		CallSites:      sites,
 	})
+}
+
+func csConstructorInitializerSites(n *sitter.Node, src []byte, parentClass string) []astkit.CallSite {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child == nil || child.Type() != "constructor_initializer" {
+			continue
+		}
+		raw := strings.TrimSpace(child.Content(src))
+		callee := ""
+		switch {
+		case strings.HasPrefix(raw, ": base"):
+			callee = "super()"
+		case strings.HasPrefix(raw, ": this"):
+			callee = qualLast(parentClass)
+		}
+		if callee == "" {
+			return nil
+		}
+		argc := 0
+		if args := internalast.FindChildByType(child, "argument_list"); args != nil {
+			argc = int(args.NamedChildCount())
+		}
+		return []astkit.CallSite{{Callee: callee, Line: int(child.StartPoint().Row) + 1, Argc: argc}}
+	}
+	return nil
 }
 
 // csCallSites extracts invocation and object-creation call sites from a C#
@@ -1763,7 +2418,10 @@ func csCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
 					// WriteValue and bound the caller's own overload family.
 					[]string{"identifier", "this", "base", "this_expression", "base_expression"},
 					map[string]string{"member_access_expression": "name"},
-					map[string]string{"invocation_expression": "function"})
+					map[string]string{
+						"invocation_expression":      "function",
+						"object_creation_expression": "type",
+					})
 				return joinQualified(qual, method)
 			}
 			return ""
@@ -1821,7 +2479,7 @@ func csTypeLastName(n *sitter.Node, src []byte) string {
 	return strings.TrimSpace(text)
 }
 
-func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, parentInterface bool, out *[]astkit.Symbol) {
 	nameNode := n.ChildByFieldName("name")
 	if nameNode == nil {
 		return
@@ -1829,8 +2487,12 @@ func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, import
 	name := nameNode.Content(src)
 	raw := n.Content(src)
 	modifiers := csModifiers(n, src)
+	kind := astkit.KindField
+	if parentInterface {
+		kind = astkit.KindMethod
+	}
 	*out = append(*out, astkit.Symbol{
-		Kind:          astkit.KindField,
+		Kind:          kind,
 		Name:          name,
 		QualifiedName: qualJoin(parentClass, name),
 		Signature:     internalast.FirstLine(raw),
@@ -1840,6 +2502,7 @@ func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, import
 		ParentName:    qualLast(parentClass),
 		Modifiers:     modifiers,
 		Annotations:   csAttributes(n, src),
+		CallSites:     csCallSites(n, src),
 	})
 }
 
@@ -1850,23 +2513,23 @@ func csFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports [
 		if child == nil || child.Type() != "variable_declaration" {
 			continue
 		}
-		nameNode := child.ChildByFieldName("name")
-		if nameNode == nil {
-			continue
+		for j := 0; j < int(child.ChildCount()); j++ {
+			decl := child.Child(j)
+			if decl == nil || decl.Type() != "variable_declarator" {
+				continue
+			}
+			nameNode := decl.ChildByFieldName("name")
+			if nameNode == nil {
+				continue
+			}
+			name := nameNode.Content(src)
+			raw := decl.Content(src)
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(parentClass, name),
+				Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(decl),
+				Exported: csIsExported(modifiers), Body: raw, ParentName: qualLast(parentClass), Modifiers: modifiers,
+			})
 		}
-		name := nameNode.Content(src)
-		raw := child.Content(src)
-		*out = append(*out, astkit.Symbol{
-			Kind:          astkit.KindField,
-			Name:          name,
-			QualifiedName: qualJoin(parentClass, name),
-			Signature:     internalast.FirstLine(raw),
-			Span:          internalast.NodeSpan(child),
-			Exported:      csIsExported(modifiers),
-			Body:          raw,
-			ParentName:    qualLast(parentClass),
-			Modifiers:     modifiers,
-		})
 	}
 }
 
@@ -1948,11 +2611,33 @@ func phpVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports [
 			if sym := phpFuncSym(n, filePath, blobSHA, src, imports, parentClass); sym != nil {
 				*out = append(*out, *sym)
 			}
+		case "object_creation_expression":
+			if body := internalast.FindChildByType(n, "declaration_list"); body != nil {
+				phpAnonymousClassDecl(n, body, filePath, blobSHA, src, imports, out)
+			} else {
+				phpVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+			}
 		default:
 			// Recurse into program, namespace_definition, compound_statement, etc.
 			phpVisit(n, filePath, blobSHA, src, imports, parentClass, out)
 		}
 	}
+}
+
+func phpAnonymousClassDecl(n, body *sitter.Node, filePath, blobSHA string, src []byte, imports []string, out *[]astkit.Symbol) {
+	line := int(n.StartPoint().Row) + 1
+	name := "<anonymous@" + strconv.Itoa(line) + ">"
+	raw := n.Content(src)
+	*out = append(*out, astkit.Symbol{
+		Kind:          astkit.KindClass,
+		Name:          name,
+		QualifiedName: name,
+		Signature:     internalast.SignatureBeforeBody(n, src),
+		Span:          internalast.NodeSpan(n),
+		Exported:      false,
+		Body:          raw,
+	})
+	phpVisit(body, filePath, blobSHA, src, imports, name, out)
 }
 
 func phpFuncSym(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string) *astkit.Symbol {
@@ -1979,7 +2664,7 @@ func phpFuncSym(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 		Body:          raw,
 		ParentName:    parentClass,
 		Modifiers:     phpModifiers(n, src),
-		CallSites:     phpCallSites(n, src),
+		CallSites:     phpCallSites(n, src, parentClass),
 	}
 }
 
@@ -1988,7 +2673,7 @@ func phpFuncSym(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 // and object creation (new Foo()). Receiver qualifiers are preserved
 // ($repo->save → "repo.save", $this->run → "this.run") so the graph layer
 // can narrow by the receiver's inferred type instead of name alone.
-func phpCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
+func phpCallSites(decl *sitter.Node, src []byte, parentClass string) []astkit.CallSite {
 	return collectCallSites(decl, src, callSpec{
 		nodeTypes: []string{
 			"function_call_expression", "member_call_expression",
@@ -2018,7 +2703,7 @@ func phpCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
 				qual := phpScopeName(call.ChildByFieldName("scope"), src)
 				return joinQualified(qual, name.Content(src))
 			case "object_creation_expression":
-				return phpNewClassName(call, src)
+				return phpNewClassName(call, src, parentClass)
 			}
 			return ""
 		},
@@ -2060,7 +2745,7 @@ func phpScopeName(scope *sitter.Node, src []byte) string {
 
 // phpNewClassName returns the constructed class's bare name (new Foo() →
 // "Foo", new Ns\Foo() → "Foo"); dynamic `new $cls()` yields "".
-func phpNewClassName(call *sitter.Node, src []byte) string {
+func phpNewClassName(call *sitter.Node, src []byte, parentClass string) string {
 	for i := 0; i < int(call.ChildCount()); i++ {
 		c := call.Child(i)
 		if c == nil {
@@ -2068,7 +2753,11 @@ func phpNewClassName(call *sitter.Node, src []byte) string {
 		}
 		switch c.Type() {
 		case "name", "qualified_name":
-			return phpLastNamePart(c.Content(src))
+			name := phpLastNamePart(c.Content(src))
+			if (name == "self" || name == "static") && parentClass != "" {
+				return phpLastNamePart(parentClass)
+			}
+			return name
 		}
 	}
 	return ""

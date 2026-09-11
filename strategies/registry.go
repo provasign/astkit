@@ -8,6 +8,7 @@
 package strategies
 
 import (
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -271,7 +272,7 @@ func (r *rustStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.I
 		switch n.Type() {
 		case "use_declaration":
 			raw := strings.TrimSpace(internalast.NodeText(n, src))
-			path := strings.TrimSuffix(strings.TrimPrefix(raw, "use "), ";")
+			path := rustImportPath(raw, "use ")
 			imps = append(imps, astkit.ImportStatement{
 				Raw:  raw,
 				Path: strings.TrimSpace(path),
@@ -283,7 +284,7 @@ func (r *rustStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.I
 			// crate is built from these — so it is recorded in that form,
 			// which consumers already read as a re-export chain.
 			raw := strings.TrimSpace(internalast.NodeText(n, src))
-			path := strings.TrimSuffix(strings.Replace(raw, "extern crate ", "use ", 1), ";")
+			path := rustImportPath(raw, "extern crate ")
 			imps = append(imps, astkit.ImportStatement{
 				Raw:  raw,
 				Path: strings.TrimSpace(path),
@@ -292,6 +293,14 @@ func (r *rustStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.I
 		}
 	})
 	return imps, nil
+}
+
+func rustImportPath(raw, keyword string) string {
+	i := strings.Index(raw, keyword)
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimSuffix(raw[i+len(keyword):], ";"))
 }
 
 // ─── JavaScript / TypeScript / TSX ────────────────────────────────────────────
@@ -334,17 +343,54 @@ func (j *jsLike) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.ImportS
 		return nil, nil
 	}
 	var imps []astkit.ImportStatement
-	internalast.WalkChildren(tree.RootNode(), func(n *sitter.Node) {
-		if n.Type() != "import_statement" {
+	seen := map[string]bool{}
+	appendImport := func(n, sourceNode *sitter.Node) {
+		if sourceNode == nil {
 			return
 		}
-		sourceNode := n.ChildByFieldName("source")
 		path := strings.Trim(internalast.NodeText(sourceNode, src), `"'`+"`")
+		if path == "" {
+			return
+		}
+		line := int(n.StartPoint().Row) + 1
+		key := path + "\x00" + strconv.Itoa(line)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
 		imps = append(imps, astkit.ImportStatement{
 			Raw:  internalast.NodeText(n, src),
 			Path: path,
-			Line: int(n.StartPoint().Row) + 1,
+			Line: line,
 		})
+	}
+	internalast.WalkTree(tree.RootNode(), func(n *sitter.Node) {
+		switch n.Type() {
+		case "import_statement", "export_statement":
+			// export * from "./x" and export {X} from "./x" carry the
+			// same module dependency as an import statement.
+			appendImport(n, n.ChildByFieldName("source"))
+		case "call_expression":
+			fn := n.ChildByFieldName("function")
+			if fn == nil {
+				return
+			}
+			callee := internalast.NodeText(fn, src)
+			if callee != "require" && callee != "import" {
+				return
+			}
+			args := n.ChildByFieldName("arguments")
+			if args == nil {
+				return
+			}
+			for i := uint32(0); i < args.NamedChildCount(); i++ {
+				arg := args.NamedChild(int(i))
+				if arg != nil && (arg.Type() == "string" || arg.Type() == "template_string") {
+					appendImport(n, arg)
+					break
+				}
+			}
+		}
 	})
 	return imps, nil
 }
@@ -419,7 +465,10 @@ func (c *csharpStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit
 			return
 		}
 		raw := strings.TrimSpace(internalast.NodeText(n, src))
-		path := strings.TrimSuffix(strings.TrimPrefix(raw, "using "), ";")
+		path := strings.TrimSpace(strings.TrimSuffix(raw, ";"))
+		path = strings.TrimSpace(strings.TrimPrefix(path, "global "))
+		path = strings.TrimSpace(strings.TrimPrefix(path, "using "))
+		path = strings.TrimSpace(strings.TrimPrefix(path, "static "))
 		imps = append(imps, astkit.ImportStatement{
 			Raw:  raw,
 			Path: strings.TrimSpace(path),
@@ -455,6 +504,41 @@ func (p *phpStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.Im
 		case "namespace_use_declaration":
 			raw := strings.TrimSpace(internalast.NodeText(n, src))
 			line := int(n.StartPoint().Row) + 1
+			if group := internalast.FindChildByType(n, "namespace_use_group"); group != nil {
+				prefix := ""
+				for i := 0; i < int(n.ChildCount()); i++ {
+					child := n.Child(i)
+					if child != nil && child.Type() == "namespace_name" {
+						prefix = strings.Trim(internalast.NodeText(child, src), "\\")
+						break
+					}
+				}
+				for i := 0; i < int(group.ChildCount()); i++ {
+					clause := group.Child(i)
+					if clause == nil || clause.Type() != "namespace_use_group_clause" {
+						continue
+					}
+					imp := astkit.ImportStatement{Raw: raw, Line: line}
+					for j := 0; j < int(clause.ChildCount()); j++ {
+						child := clause.Child(j)
+						if child == nil {
+							continue
+						}
+						switch child.Type() {
+						case "namespace_name", "name":
+							if imp.Path == "" {
+								imp.Path = strings.Trim(prefix+"\\"+internalast.NodeText(child, src), "\\")
+							}
+						case "namespace_aliasing_clause":
+							imp.Alias = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(internalast.NodeText(child, src)), "as"))
+						}
+					}
+					if imp.Path != "" {
+						imps = append(imps, imp)
+					}
+				}
+				return
+			}
 			// One ImportStatement per use clause, with the qualified name as
 			// Path and any `as` binding as Alias — consumers resolve Path
 			// verbatim, so it must never be the whole statement text.

@@ -2,6 +2,7 @@ package astkit
 
 import (
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -39,10 +40,12 @@ const (
 	LangJCL   LanguageKey = "jcl"
 )
 
-// DetectLanguage returns the language for a given file path. The content
-// argument is currently unused but reserved for future shebang/heredoc
-// disambiguation.
-func DetectLanguage(path, _ string) LanguageKey {
+var cppHeaderMarker = regexp.MustCompile(`(?m)^\s*(?:template\s*<|namespace\b|class\s+[A-Za-z_]|extern\s+"C")`)
+
+// DetectLanguage returns the language for a given file path. Ambiguous .h
+// headers are parsed as C++ when their contents contain a declaration form
+// that is not valid C; otherwise they retain the conservative C default.
+func DetectLanguage(path, content string) LanguageKey {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".go":
 		return LangGo
@@ -58,7 +61,12 @@ func DetectLanguage(path, _ string) LanguageKey {
 		return LangJava
 	case ".rs":
 		return LangRust
-	case ".c", ".h":
+	case ".c":
+		return LangC
+	case ".h":
+		if cppHeaderMarker.MatchString(content) {
+			return LangCPP
+		}
 		return LangC
 	case ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx":
 		return LangCPP
