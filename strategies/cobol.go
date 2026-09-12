@@ -28,10 +28,10 @@ const (
 // and arrives in a later phase).
 type cobolStrategy struct{}
 
-func NewCOBOL() *cobolStrategy                       { return &cobolStrategy{} }
+func NewCOBOL() *cobolStrategy                        { return &cobolStrategy{} }
 func (c *cobolStrategy) Language() astkit.LanguageKey { return astkit.LangCOBOL }
 func (c *cobolStrategy) Extensions() []string {
-	return []string{".cbl", ".cob", ".cobol", ".cpy", ".ccp", ".cpb"}
+	return []string{".cbl", ".cob", ".cobol", ".cpy", ".ccp", ".cpb", ".copy"}
 }
 func (c *cobolStrategy) ExtractsFromText() bool { return true }
 
@@ -125,29 +125,34 @@ func detectFixedFormat(lines []string) bool {
 }
 
 var (
-	reProgramID  = regexp.MustCompile(`(?i)^\s*PROGRAM-ID\s*[.]?\s+([A-Za-z0-9][A-Za-z0-9-]*)`)
-	reDivision   = regexp.MustCompile(`(?i)^\s*(IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION`)
-	reDataItem   = regexp.MustCompile(`(?i)^\s*(\d{1,2})\s+([A-Za-z0-9][A-Za-z0-9-]*)(.*)$`)
-	rePicture    = regexp.MustCompile(`(?i)\bPIC(?:TURE)?\s+(?:IS\s+)?([^\s.]+)`)
-	reRedefines  = regexp.MustCompile(`(?i)\bREDEFINES\s+([A-Za-z0-9-]+)`)
-	reOccurs     = regexp.MustCompile(`(?i)\bOCCURS\s+(\d+)`)
-	reSection    = regexp.MustCompile(`(?i)^\s*([A-Za-z0-9][A-Za-z0-9-]*)\s+SECTION\s*\.`)
-	reParagraph  = regexp.MustCompile(`^\s{0,3}([A-Za-z0-9][A-Za-z0-9-]*)\s*\.\s*$`)
-	reFD         = regexp.MustCompile(`(?i)^\s*FD\s+([A-Za-z0-9-]+)`)
-	reSelect     = regexp.MustCompile(`(?i)\bSELECT\s+(?:OPTIONAL\s+)?([A-Za-z0-9-]+)\s+ASSIGN\s+TO\s+([A-Za-z0-9-]+)`)
-	rePerform    = regexp.MustCompile(`(?i)\bPERFORM\s+([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+(?:THRU|THROUGH)\s+([A-Za-z0-9-]+))?`)
-	reCallLit    = regexp.MustCompile(`(?i)\bCALL\s+['"]([^'"]+)['"]`)
-	reCallVar    = regexp.MustCompile(`(?i)\bCALL\s+([A-Za-z][A-Za-z0-9-]*)`)
+	reProgramID = regexp.MustCompile(`(?i)^\s*PROGRAM-ID\s*[.]?\s+([A-Za-z0-9][A-Za-z0-9-]*)`)
+	reDivision  = regexp.MustCompile(`(?i)^\s*(IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION`)
+	reDataItem  = regexp.MustCompile(`(?i)^\s*(\d{1,2})\s+([A-Za-z0-9][A-Za-z0-9-]*)(.*)$`)
+	rePicture   = regexp.MustCompile(`(?i)\bPIC(?:TURE)?\s+(?:IS\s+)?([^\s.]+)`)
+	reRedefines = regexp.MustCompile(`(?i)\bREDEFINES\s+([A-Za-z0-9-]+)`)
+	reOccurs    = regexp.MustCompile(`(?i)\bOCCURS\s+(\d+)`)
+	reSection   = regexp.MustCompile(`(?i)^\s*([A-Za-z0-9][A-Za-z0-9-]*)\s+SECTION\s*\.`)
+	reParagraph = regexp.MustCompile(`^\s{0,3}([A-Za-z0-9][A-Za-z0-9-]*)\s*\.\s*$`)
+	reFD        = regexp.MustCompile(`(?i)^\s*FD\s+([A-Za-z0-9-]+)`)
+	reSelect    = regexp.MustCompile(`(?i)\bSELECT\s+(?:OPTIONAL\s+)?([A-Za-z0-9-]+)\s+ASSIGN\s+TO\s+([A-Za-z0-9-]+)`)
+	rePerform   = regexp.MustCompile(`(?i)\bPERFORM\s+([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+(?:THRU|THROUGH)\s+([A-Za-z0-9-]+))?`)
+	reCallLit   = regexp.MustCompile(`(?i)\bCALL\s+['"]([^'"]+)['"]`)
+	reCallVar   = regexp.MustCompile(`(?i)\bCALL\s+([A-Za-z][A-Za-z0-9-]*)`)
 	// Member names cannot start with a digit (PDS naming): a leading-digit
 	// match is a sequence number or numeric operand, not a member
 	// (field-reported: 68 numeric "members" like 053300).
-	reCopy       = regexp.MustCompile(`(?i)\bCOPY\s+([A-Za-z@#$][A-Za-z0-9@#$-]*)(?:\s+(?:OF|IN)\s+([A-Za-z0-9-]+))?`)
-	reReserved   = regexp.MustCompile(`(?i)^(EXIT|STOP|GOBACK|END|ELSE|WHEN|UNTIL|VARYING|TIMES)$`)
+	reCopy     = regexp.MustCompile(`(?i)\bCOPY\s+([A-Za-z@#$][A-Za-z0-9@#$-]*)(?:\s+(?:OF|IN)\s+([A-Za-z0-9-]+))?`)
+	reReserved = regexp.MustCompile(`(?i)^(EXIT|STOP|GOBACK|END|ELSE|WHEN|UNTIL|VARYING|TIMES|WITH|TEST|THRU|THROUGH|FROM|BY|GIVING)$`)
 )
 
 func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
 	_ = tree // text strategy: tree is nil by design
-	lines := normalizeCOBOL(src)
+	normalized := normalizeCOBOL(src)
+	fileEnd := 0
+	if len(normalized) > 0 {
+		fileEnd = normalized[len(normalized)-1].orig
+	}
+	lines := joinCOBOLDataClauses(normalized)
 
 	var syms []astkit.Symbol
 	var programName string
@@ -158,9 +163,14 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 		name  string
 	}
 	var stack []lvl
-	var lastItem string // most recent data item; 88-levels bind to it
+	var lastItem string            // most recent data item; 88-levels bind to it
 	var currentProc *astkit.Symbol // paragraph/section receiving call sites
-	var progSym *astkit.Symbol
+	progIndex := -1
+	type performRange struct {
+		caller, first, last string
+		line                int
+	}
+	var performRanges []performRange
 
 	qualify := func() string {
 		parts := make([]string, len(stack))
@@ -192,7 +202,7 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 				Exported:  true,
 			}
 			syms = append(syms, s)
-			progSym = &syms[len(syms)-1]
+			progIndex = len(syms) - 1
 			programName = name
 			continue
 		}
@@ -224,7 +234,9 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 				case 88:
 					kind = kindConditionName
 				case 66:
-					// RENAMES alternate view; keep as data item with clause in signature
+					// RENAMES is an alternate record view, never a child of the
+					// elementary item that happened to precede it.
+					stack = stack[:0]
 				case 77:
 					stack = stack[:0]
 				default:
@@ -282,6 +294,7 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 					ParentName: programName,
 					Signature:  strings.TrimSpace(ln.text),
 					Span:       astkit.LineRange{Start: ln.orig, End: ln.orig},
+					Body:       strings.TrimSpace(ln.text),
 				}
 				currentProc = &s
 				continue
@@ -294,13 +307,14 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 					ParentName: programName,
 					Signature:  strings.TrimSpace(ln.text),
 					Span:       astkit.LineRange{Start: ln.orig, End: ln.orig},
+					Body:       strings.TrimSpace(ln.text),
 				}
 				currentProc = &s
 				continue
 			}
 			target := currentProc
-			if target == nil {
-				target = progSym
+			if target == nil && progIndex >= 0 {
+				target = &syms[progIndex]
 			}
 			if target != nil {
 				for _, pm := range rePerform.FindAllStringSubmatch(ln.text, -1) {
@@ -309,6 +323,7 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 					}
 					if pm[2] != "" && !reReserved.MatchString(pm[2]) {
 						target.CallSites = append(target.CallSites, astkit.CallSite{Callee: pm[2], Line: ln.orig})
+						performRanges = append(performRanges, performRange{target.QualifiedName, pm[1], pm[2], ln.orig})
 					}
 				}
 				if cm := reCallLit.FindStringSubmatch(ln.text); cm != nil {
@@ -326,20 +341,76 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 		// Body carries the normalized statement text so graph consumers can
 		// resolve field references without re-normalizing the file.
 		if currentProc != nil && division == "PROCEDURE" {
-			if ln.orig > currentProc.Span.End {
-				currentProc.Span.End = ln.orig
-			}
-			if currentProc.Body != "" {
+			for currentProc.Span.End < ln.orig {
 				currentProc.Body += "\n"
+				currentProc.Span.End++
 			}
 			currentProc.Body += strings.TrimSpace(ln.text)
 		}
 	}
 	flushProc()
-	if progSym != nil && len(lines) > 0 {
-		progSym.Span.End = lines[len(lines)-1].orig
+	if progIndex >= 0 && fileEnd > 0 {
+		syms[progIndex].Span.End = fileEnd
+	}
+	paragraphOrder := map[string]int{}
+	for idx := range syms {
+		if syms[idx].Kind == kindParagraph || syms[idx].Kind == kindSection {
+			paragraphOrder[strings.ToUpper(syms[idx].Name)] = idx
+		}
+	}
+	for _, span := range performRanges {
+		first, firstOK := paragraphOrder[strings.ToUpper(span.first)]
+		last, lastOK := paragraphOrder[strings.ToUpper(span.last)]
+		if !firstOK || !lastOK || first >= last {
+			continue
+		}
+		caller := -1
+		for idx := range syms {
+			if syms[idx].QualifiedName == span.caller {
+				caller = idx
+				break
+			}
+		}
+		if caller < 0 {
+			continue
+		}
+		for idx := first + 1; idx < last; idx++ {
+			if syms[idx].Kind == kindParagraph || syms[idx].Kind == kindSection {
+				syms[caller].CallSites = append(syms[caller].CallSites, astkit.CallSite{Callee: syms[idx].Name, Line: span.line})
+			}
+		}
 	}
 	return syms, nil
+}
+
+func joinCOBOLDataClauses(lines []srcLine) []srcLine {
+	out := make([]srcLine, 0, len(lines))
+	division := "DATA"
+	for idx := 0; idx < len(lines); idx++ {
+		line := lines[idx]
+		if match := reDivision.FindStringSubmatch(line.text); match != nil {
+			division = strings.ToUpper(match[1])
+			out = append(out, line)
+			continue
+		}
+		if division != "DATA" || reDataItem.FindStringSubmatch(line.text) == nil || strings.HasSuffix(strings.TrimSpace(line.text), ".") {
+			out = append(out, line)
+			continue
+		}
+		for idx+1 < len(lines) {
+			next := lines[idx+1]
+			if reDivision.MatchString(next.text) || reDataItem.MatchString(next.text) {
+				break
+			}
+			line.text += " " + strings.TrimSpace(next.text)
+			idx++
+			if strings.HasSuffix(strings.TrimSpace(next.text), ".") {
+				break
+			}
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 var (

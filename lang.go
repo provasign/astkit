@@ -80,7 +80,7 @@ func DetectLanguage(path, content string) LanguageKey {
 		return LangYAML
 	case ".toml":
 		return LangTOML
-	case ".cbl", ".cob", ".cobol", ".cpy", ".ccp", ".cpb":
+	case ".cbl", ".cob", ".cobol", ".cpy", ".ccp", ".cpb", ".copy":
 		return LangCOBOL
 	case ".jcl", ".prc":
 		return LangJCL

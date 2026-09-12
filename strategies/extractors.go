@@ -1959,6 +1959,7 @@ func cDeclarationSyms(n *sitter.Node, filePath, blobSHA, language string, src []
 				Exported:      !strings.HasPrefix(name, "_") && !cHasModifier(modifiers, "static"),
 				Body:          raw,
 				Modifiers:     modifiers,
+				Annotations:   []string{"declaration"},
 			})
 		}
 	}

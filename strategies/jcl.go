@@ -32,10 +32,12 @@ func (j *jclStrategy) ExtractsFromText() bool       { return true }
 
 var (
 	reJCLStmt = regexp.MustCompile(`^//([A-Za-z0-9$#@]{0,8})\s+(JOB|EXEC|DD|PROC|PEND|SET|INCLUDE|JCLLIB|OUTPUT)\b\s*(.*)$`)
-	rePGM     = regexp.MustCompile(`(?i)\bPGM=([A-Za-z0-9$#@]+)`)
-	reProcRef = regexp.MustCompile(`(?i)\bPROC=([A-Za-z0-9$#@]+)`)
+	rePGM     = regexp.MustCompile(`(?i)\bPGM=(&?[A-Za-z0-9$#@]+)`)
+	reProcRef = regexp.MustCompile(`(?i)\bPROC=(&?[A-Za-z0-9$#@]+)`)
 	reDSN     = regexp.MustCompile(`(?i)\bDSN(?:AME)?=([A-Za-z0-9$#@.&()+-]+)`)
 	reBareOp  = regexp.MustCompile(`^([A-Za-z0-9$#@]+)`)
+	reSet     = regexp.MustCompile(`(?i)^\s*([A-Za-z0-9$#@]+)\s*=\s*([A-Za-z0-9$#@.&()+-]+)`)
+	reInclude = regexp.MustCompile(`(?i)\bMEMBER=([A-Za-z0-9$#@]+)`)
 )
 
 // joinJCL merges continued statements: a statement whose operand field ends
@@ -72,6 +74,14 @@ func (j *jclStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, e
 	var jobName, procName string
 	var stepCount int
 	var lastStep, lastDD string
+	symbols := map[string]string{}
+	resolve := func(value string) string {
+		value = strings.ToUpper(strings.TrimSpace(value))
+		if strings.HasPrefix(value, "&") {
+			return symbols[strings.TrimPrefix(value, "&")]
+		}
+		return value
+	}
 
 	for _, ln := range joinJCL(src) {
 		m := reJCLStmt.FindStringSubmatch(ln.text)
@@ -98,6 +108,10 @@ func (j *jclStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, e
 			})
 		case "PEND":
 			procName = ""
+		case "SET":
+			if assignment := reSet.FindStringSubmatch(operands); assignment != nil {
+				symbols[strings.ToUpper(assignment[1])] = resolve(assignment[2])
+			}
 		case "DD":
 			if name != "" {
 				lastDD = name // concatenated DDs ("//  DD") reuse the name
@@ -133,11 +147,17 @@ func (j *jclStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, e
 			}
 			// What the step runs: PGM=X, PROC=X, or bare `EXEC PROCNAME`.
 			if pm := rePGM.FindStringSubmatch(operands); pm != nil {
-				s.CallSites = append(s.CallSites, astkit.CallSite{Callee: strings.ToUpper(pm[1]), Line: ln.orig})
+				if callee := resolve(pm[1]); callee != "" {
+					s.CallSites = append(s.CallSites, astkit.CallSite{Callee: callee, Line: ln.orig})
+				}
 			} else if pm := reProcRef.FindStringSubmatch(operands); pm != nil {
-				s.CallSites = append(s.CallSites, astkit.CallSite{Callee: strings.ToUpper(pm[1]), Line: ln.orig})
-			} else if pm := reBareOp.FindStringSubmatch(strings.TrimSpace(operands)); pm != nil {
-				s.CallSites = append(s.CallSites, astkit.CallSite{Callee: strings.ToUpper(pm[1]), Line: ln.orig})
+				if callee := resolve(pm[1]); callee != "" {
+					s.CallSites = append(s.CallSites, astkit.CallSite{Callee: callee, Line: ln.orig})
+				}
+			} else if !strings.Contains(operands, "=") {
+				if pm := reBareOp.FindStringSubmatch(strings.TrimSpace(operands)); pm != nil {
+					s.CallSites = append(s.CallSites, astkit.CallSite{Callee: strings.ToUpper(pm[1]), Line: ln.orig})
+				}
 			}
 			syms = append(syms, s)
 			lastStep = name
@@ -155,7 +175,16 @@ func (j *jclStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.Im
 		if m == nil {
 			continue
 		}
-		if strings.ToUpper(m[2]) != "DD" {
+		op := strings.ToUpper(m[2])
+		if op == "INCLUDE" {
+			if member := reInclude.FindStringSubmatch(m[3]); member != nil {
+				imports = append(imports, astkit.ImportStatement{
+					Raw: strings.TrimSpace(ln.text), Path: strings.ToUpper(member[1]), Group: "jcl-member", Line: ln.orig,
+				})
+			}
+			continue
+		}
+		if op != "DD" {
 			continue
 		}
 		if m[1] != "" {

@@ -356,3 +356,101 @@ func TestCOBOL_NoNumericMembers(t *testing.T) {
 		t.Fatalf("want only REALMEM, got %+v", imports)
 	}
 }
+
+func TestCOBOLProgramSpanAndMainlinePerformRange(t *testing.T) {
+	src := `IDENTIFICATION DIVISION.
+PROGRAM-ID. RANGEJOB.
+PROCEDURE DIVISION.
+    PERFORM A THRU C.
+A.
+    DISPLAY 'A'.
+B.
+    DISPLAY 'B'.
+C.
+    GOBACK.`
+	syms := extractCOBOL(t, src)
+	program := find(t, syms, "program", "RANGEJOB")
+	if program.Span.End != 10 {
+		t.Fatalf("program span = %+v, want end 10", program.Span)
+	}
+	called := map[string]bool{}
+	for _, call := range program.CallSites {
+		called[call.Callee] = true
+	}
+	for _, name := range []string{"A", "B", "C"} {
+		if !called[name] {
+			t.Fatalf("PERFORM A THRU C missing %s: %+v", name, program.CallSites)
+		}
+	}
+}
+
+func TestCOBOLContinuedPictureAndLevel66Hierarchy(t *testing.T) {
+	src := `DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 WS-REC.
+  05 WS-NAME
+     PIC X(20).
+  05 WS-NEXT PIC X.
+66 WS-ALIAS RENAMES WS-NAME.`
+	syms := extractCOBOL(t, src)
+	name := find(t, syms, "data-item", "WS-NAME")
+	if name.ParentName != "WS-REC" || len(name.Modifiers) == 0 || name.Modifiers[0] != "pic:X(20)" {
+		t.Fatalf("continued PIC item = %+v", name)
+	}
+	next := find(t, syms, "data-item", "WS-NEXT")
+	if next.ParentName != "WS-REC" {
+		t.Fatalf("elementary item incorrectly opened a group: %+v", next)
+	}
+	alias := find(t, syms, "data-item", "WS-ALIAS")
+	if alias.ParentName != "" {
+		t.Fatalf("level-66 item parent = %q, want record-level", alias.ParentName)
+	}
+}
+
+func TestCOBOLPerformWithTestAfterDoesNotCallWith(t *testing.T) {
+	src := "IDENTIFICATION DIVISION.\nPROGRAM-ID. LOOPJOB.\nPROCEDURE DIVISION.\nMAIN.\n PERFORM WITH TEST AFTER UNTIL DONE.\n GOBACK."
+	syms := extractCOBOL(t, src)
+	main := find(t, syms, "paragraph", "MAIN")
+	for _, call := range main.CallSites {
+		if call.Callee == "WITH" {
+			t.Fatalf("spurious WITH call: %+v", main.CallSites)
+		}
+	}
+}
+
+func TestJCLSymbolicExecAndInclude(t *testing.T) {
+	src := `//PROBEJOB JOB
+// SET PROG=FIXPROG
+//S1 EXEC PGM=&PROG
+//S2 EXEC PROC=&MISSING
+// INCLUDE MEMBER=COMMON`
+	syms, err := NewJCL().Extract(nil, []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1 := find(t, syms, "step", "S1")
+	if len(s1.CallSites) != 1 || s1.CallSites[0].Callee != "FIXPROG" {
+		t.Fatalf("resolved symbolic PGM calls = %+v", s1.CallSites)
+	}
+	s2 := find(t, syms, "step", "S2")
+	if len(s2.CallSites) != 0 {
+		t.Fatalf("unresolved symbolic PROC must not call literal PROC/PGM: %+v", s2.CallSites)
+	}
+	imports, err := NewJCL().ExtractImports(nil, []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imports) != 1 || imports[0].Path != "COMMON" || imports[0].Group != "jcl-member" {
+		t.Fatalf("JCL INCLUDE imports = %+v", imports)
+	}
+}
+
+func TestCOBOLExtensionsIncludeCopy(t *testing.T) {
+	found := false
+	for _, ext := range NewCOBOL().Extensions() {
+		found = found || ext == ".copy"
+	}
+	if !found || astkit.DetectLanguage("record.copy", "") != astkit.LangCOBOL {
+		t.Fatal(".copy must be recognized as COBOL")
+	}
+}

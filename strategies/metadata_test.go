@@ -1,6 +1,7 @@
 package strategies_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -1011,6 +1012,25 @@ int adder(int a) { return a + counter; }
 	}
 	if !got["adder"] {
 		t.Errorf("expected adder function, got %v", got)
+	}
+}
+
+func TestC_FunctionPrototypeIsMarkedDeclaration(t *testing.T) {
+	src := `json_t *json_null(void);
+json_t *json_true(void) { return 0; }
+`
+	syms, _ := extract(t, astkit.LangC, src)
+	for _, symbol := range syms {
+		switch symbol.Name {
+		case "json_null":
+			if !slices.Contains(symbol.Annotations, "declaration") {
+				t.Fatalf("prototype annotations = %v, want declaration", symbol.Annotations)
+			}
+		case "json_true":
+			if slices.Contains(symbol.Annotations, "declaration") {
+				t.Fatalf("definition was marked declaration: %v", symbol.Annotations)
+			}
+		}
 	}
 }
 
