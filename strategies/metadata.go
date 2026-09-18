@@ -2,6 +2,7 @@ package strategies
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -280,9 +281,18 @@ func argToken(c *sitter.Node, src []byte) string {
 				return "#" + name
 			}
 		}
-	case "lambda_expression", "method_reference", "arrow_function", "lambda":
+	case "lambda_expression":
 		// A lambda binds only a functional-interface parameter; consumers
-		// rule out primitive, array and String overload slots.
+		// rule out primitive, array and String overload slots. The
+		// parameter COUNT additionally splits same-arity overloads whose
+		// only difference is which functional interface they take
+		// (Supplier<T> vs Function<Integer,T>): `() -> x` is 0-ary,
+		// `x -> x` and `(x,y) -> x` count their bound names.
+		if n := javaLambdaArity(c); n >= 0 {
+			return "#lambda:" + strconv.Itoa(n)
+		}
+		return "#lambda"
+	case "method_reference", "arrow_function", "lambda":
 		return "#lambda"
 	case "method_invocation", "call_expression", "call":
 		// Consumers can resolve the called function's return type.
@@ -294,6 +304,30 @@ func argToken(c *sitter.Node, src []byte) string {
 		}
 	}
 	return ""
+}
+
+// javaLambdaArity counts a Java lambda_expression's bound parameters:
+// 0 for `() -> ...`, 1 for a bare `x -> ...` or single-element
+// `(x) -> ...`, N for `(x, y, ...) -> ...`. Returns -1 when the shape is
+// unrecognized (never guess wrong; the caller falls back to "#lambda").
+func javaLambdaArity(c *sitter.Node) int {
+	params := c.ChildByFieldName("parameters")
+	if params == nil {
+		return -1
+	}
+	switch params.Type() {
+	case "identifier":
+		return 1
+	case "formal_parameters", "inferred_parameters":
+		n := 0
+		for i := 0; i < int(params.NamedChildCount()); i++ {
+			if params.NamedChild(i) != nil {
+				n++
+			}
+		}
+		return n
+	}
+	return -1
 }
 
 func goCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
@@ -777,8 +811,8 @@ func rustMacroCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			if tt := internalast.FindChildByType(n, "token_tree"); tt != nil {
 				text := rustMacroStringRe.ReplaceAllString(tt.Content(src), `""`)
 				line := int(n.StartPoint().Row) + 1
-				for _, m := range rustMacroCallRe.FindAllStringSubmatch(text, -1) {
-					path := m[1]
+				for _, m := range rustMacroCallRe.FindAllStringSubmatchIndex(text, -1) {
+					path := text[m[2]:m[3]]
 					name := path
 					qual := ""
 					if i := strings.LastIndex(path, "::"); i >= 0 {
@@ -787,6 +821,20 @@ func rustMacroCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 					} else if i := strings.LastIndexByte(path, '.'); i >= 0 {
 						name = path[i+1:]
 						qual = rustLastSegment(path[:i])
+					} else if q := rustMacroChainQualifier(text, m[0]); q != "" {
+						// `ig.matched("", false).is_ignore()`: the regex
+						// scan (no nested-structure awareness) matches
+						// "ig.matched(" first, consuming it whole, so the
+						// re-scan for the NEXT call starts past its "(" and
+						// can only see the bare trailing ".is_ignore(" —
+						// the receiver chain up to the dot is invisible to
+						// a fresh match. Recover it by walking backward
+						// from a chained call's own start: skip the ".",
+						// find the immediately preceding call's closing
+						// paren, and use ITS name as the call-result
+						// qualifier, matching astkit's ordinary "name()"
+						// convention for a chained receiver.
+						qual = q
 					}
 					if rustKeywordCallees[name] || name == "" {
 						continue
@@ -805,6 +853,65 @@ func rustMacroCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	}
 	walk(body)
 	return out
+}
+
+// rustMacroChainQualifier looks backward from a macro-scanned call's start
+// (the byte offset of its first identifier char) for ").ident(" immediately
+// preceding it — a call chained onto a PRIOR call's result, invisible to
+// rustMacroCallRe's single-pass scan because the prior call already
+// consumed up through its own "(". Returns "priorName()" (the call-result
+// marker astkit's ordinary receiver-chain resolution already understands),
+// or "" when the call isn't chained this way.
+func rustMacroChainQualifier(text string, start int) string {
+	i := start
+	for i > 0 && (text[i-1] == ' ' || text[i-1] == '\t' || text[i-1] == '\n') {
+		i--
+	}
+	if i == 0 || text[i-1] != '.' {
+		return ""
+	}
+	i--
+	for i > 0 && (text[i-1] == ' ' || text[i-1] == '\t' || text[i-1] == '\n') {
+		i--
+	}
+	if i == 0 || text[i-1] != ')' {
+		return ""
+	}
+	close := i - 1
+	depth := 1
+	j := close
+	for j > 0 && depth > 0 {
+		j--
+		switch text[j] {
+		case ')':
+			depth++
+		case '(':
+			depth--
+		}
+	}
+	if depth != 0 {
+		return ""
+	}
+	// j is the matching "(": the identifier immediately before it names
+	// the prior call. Walk back over identifier characters only — a
+	// non-identifier boundary (another ")", a "]", an operator) means the
+	// callee isn't a simple name and the chain is too irregular to trust.
+	end := j
+	for j > 0 && rustIdentByte(text[j-1]) {
+		j--
+	}
+	if j == end || (j > 0 && text[j-1] == ')') {
+		return ""
+	}
+	name := text[j:end]
+	if name == "" || rustKeywordCallees[name] {
+		return ""
+	}
+	return name + "()"
+}
+
+func rustIdentByte(b byte) bool {
+	return b == '_' || b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
 }
 
 // rustLastSegment reduces a dotted/scoped prefix to its final segment.
