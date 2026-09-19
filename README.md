@@ -24,7 +24,16 @@ other for parsing.
 
 | AST extraction | Detection only (no symbols) |
 |---|---|
-| Go, Python, Java, Rust, JavaScript, TypeScript, TSX, C, C++, C#, PHP | JSON, YAML, TOML |
+| Go, Python, Java, Rust, JavaScript, TypeScript, TSX, C, C++, C#, PHP, Swift, Kotlin, Objective-C, COBOL, JCL | JSON, YAML, TOML |
+
+Swift, Kotlin and Objective-C (v0.13.0+) extract classes, structs, enums,
+protocols/interfaces, extensions, categories, methods, constructors (named
+after their type, like Java/C#), properties and instance variables, with
+receiver-qualified call sites. Kotlin desugars `a in b` → `b.contains(a)`,
+`a + b` → `a.plus(b)`, and constructor delegation; Swift records argument
+labels (`label:value`) so overloads are told apart; Objective-C joins
+selectors (`doThing:withOption:`) and types `[[Type alloc] init]` chains
+as `Type()`. Grove measures all three against compiler oracles.
 
 ## Usage
 
@@ -53,9 +62,14 @@ go build ./...
 go test ./...
 ```
 
-Grammar bindings come from `github.com/smacker/go-tree-sitter`. Adding a
-language means registering its grammar in `engine.go` and providing a
-`Strategy` under `strategies/`.
+Grammar bindings come from `github.com/smacker/go-tree-sitter`, except
+Objective-C, whose grammar (tree-sitter-grammars/tree-sitter-objc, MIT) is
+vendored under `thirdparty/tsobjc` because the go-tree-sitter fork does not
+ship it. Adding a language means registering its grammar in `engine.go` and
+providing a `Strategy` under `strategies/`. Strategies are hand-written tree
+walks over node types (no `.scm` queries); the Swift and Kotlin grammars are
+positional (Kotlin has no field names at all), so their walkers index
+children by position.
 
 ## License
 
