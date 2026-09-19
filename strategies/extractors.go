@@ -1,6 +1,7 @@
 package strategies
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -1622,6 +1623,114 @@ func rustWherePredicates(n *sitter.Node, src []byte) []string {
 // both use identical node types for the constructs we care about (functions,
 // structs, enums, classes in C++).
 
+// cMacroKeywords are call-looking tokens in a macro body that are not calls.
+var cMacroKeywords = map[string]bool{
+	"if": true, "while": true, "for": true, "switch": true, "return": true, "sizeof": true,
+	"defined": true, "__attribute__": true, "__typeof__": true, "typeof": true, "do": true,
+	"else": true, "case": true, "alignof": true, "_Alignof": true, "__extension__": true,
+	"static_assert": true, "_Static_assert": true, "__builtin_expect": true,
+}
+
+var cMacroCallRe = regexp.MustCompile(`\b([A-Za-z_]\w*)\s*\(`)
+
+// cMacroSym emits a `#define` as a KindMacro symbol. A function-like
+// macro's Signature is "#define NAME(a, b)" (its parameter names, which a
+// consumer substitutes with the invocation's arguments); its CallSites are
+// the calls its body text makes, so a caller that invokes the macro can be
+// credited with them — the C preprocessor is what makes
+// `json_object_foreach(o, k, v)` call json_object_iter and `RUN_TEST(f)`
+// call UnityDefaultTestRun(f, ..). Tree-sitter keeps the body as opaque
+// preproc_arg text, so calls are found lexically.
+func cMacroSym(n *sitter.Node, filePath, blobSHA, language string, src []byte) *astkit.Symbol {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return nil
+	}
+	name := nameNode.Content(src)
+	params := ""
+	var paramNames []string
+	if p := n.ChildByFieldName("parameters"); p != nil {
+		params = strings.Join(strings.Fields(p.Content(src)), "")
+		for _, x := range strings.Split(strings.Trim(params, "()"), ",") {
+			if x = strings.TrimSpace(x); x != "" {
+				paramNames = append(paramNames, x)
+			}
+		}
+	}
+	body := ""
+	if v := n.ChildByFieldName("value"); v != nil {
+		body = v.Content(src)
+	}
+	isParam := map[string]bool{}
+	for _, p := range paramNames {
+		isParam[p] = true
+	}
+	var sites []astkit.CallSite
+	for _, m := range cMacroCallRe.FindAllStringSubmatchIndex(body, -1) {
+		callee := body[m[2]:m[3]]
+		if cMacroKeywords[callee] {
+			continue
+		}
+		open := m[1] - 1 // index of '('
+		args, argc := cMacroArgs(body, open)
+		sites = append(sites, astkit.CallSite{
+			Callee: callee, Line: int(n.StartPoint().Row) + 1, Argc: argc, Args: args,
+		})
+	}
+	sig := "#define " + name + params
+	return &astkit.Symbol{
+		Kind: astkit.KindMacro, Name: name, QualifiedName: name, Signature: sig,
+		Span: internalast.NodeSpan(n), Exported: true, Body: n.Content(src),
+		CallSites: sites,
+	}
+}
+
+// cMacroArgs tokenizes the argument list opening at body[open]: an
+// identifier stays (a macro parameter name is substituted downstream, a
+// function name becomes a reference), a string or stringized `#param`
+// argument is "#String", a number "#int", anything else "".
+func cMacroArgs(body string, open int) ([]string, int) {
+	depth := 0
+	start := open + 1
+	var raw []string
+	for i := open; i < len(body); i++ {
+		switch body[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				raw = append(raw, body[start:i])
+				i = len(body)
+			}
+		case ',':
+			if depth == 1 {
+				raw = append(raw, body[start:i])
+				start = i + 1
+			}
+		}
+	}
+	if len(raw) == 1 && strings.TrimSpace(raw[0]) == "" {
+		return nil, 0
+	}
+	out := make([]string, len(raw))
+	for i, a := range raw {
+		a = strings.TrimSpace(a)
+		switch {
+		case a == "":
+		case strings.HasPrefix(a, "#") || strings.HasPrefix(a, "\""):
+			out[i] = "#String"
+		case a[0] >= '0' && a[0] <= '9':
+			out[i] = "#int"
+		default:
+			if ok, _ := regexp.MatchString(`^[A-Za-z_]\w*$`, a); ok {
+				out[i] = a
+			}
+		}
+	}
+	return out, len(raw)
+}
+
 func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
 	defined := map[string]bool{} // function names with a body in this file
@@ -1679,6 +1788,19 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 			// Tree-sitter nests them below the preprocessor node rather than the
 			// translation unit, so explicitly descend into each guarded region.
 			out = append(out, extractCNodes(n, filePath, blobSHA, language, src, imports)...)
+		case "preproc_function_def", "preproc_def":
+			if sym := cMacroSym(n, filePath, blobSHA, language, src); sym != nil {
+				out = append(out, *sym)
+			}
+		case "linkage_specification":
+			// `extern "C" { ... }` — in a C header it sits under `#ifdef
+			// __cplusplus`, and the C grammar hands the whole rest of the
+			// header to its declaration_list (the closing brace is under
+			// another #ifdef). Everything Unity's unity.h and jansson.h
+			// declare lives inside one; not descending hid all of it.
+			if body := n.ChildByFieldName("body"); body != nil {
+				out = append(out, extractCNodes(body, filePath, blobSHA, language, src, imports)...)
+			}
 		}
 	}
 	// A prototype (`static int do_dump(...);`) for a function defined in
@@ -1710,6 +1832,15 @@ func cFuncSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, im
 		return nil
 	}
 	name := cDeclaratorName(declarator, src)
+	if name == "" && declarator.Type() == "parenthesized_declarator" {
+		// `int CJSON_CDECL main(void) {…}`: an unexpanded calling-convention
+		// macro makes the grammar read `int CJSON_CDECL` as a declaration
+		// and `main(void)` as a definition whose type is `main` and whose
+		// declarator is the bare parameter list. The type is the name.
+		if t := n.ChildByFieldName("type"); t != nil && t.Type() == "type_identifier" {
+			name = t.Content(src)
+		}
+	}
 	if name == "" {
 		return nil
 	}

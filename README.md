@@ -35,6 +35,14 @@ labels (`label:value`) so overloads are told apart; Objective-C joins
 selectors (`doThing:withOption:`) and types `[[Type alloc] init]` chains
 as `Type()`. Grove measures all three against compiler oracles.
 
+C, C++ and Objective-C (v0.14.3+) also emit every `#define` as a `macro`
+symbol: its signature is `#define NAME(a,b)` and its call sites are the
+body's lexical calls with parameter names as arguments (`#x` and string
+literals become `#String`), so a caller can expand `RUN_TEST(f)` into the
+calls it makes. Declarations inside an `extern "C" {` block and functions
+with a calling-convention macro between type and name (`int CDECL main()`)
+are extracted.
+
 ## Usage
 
 ```go

@@ -22,6 +22,7 @@ const (
 	KindDecorator   SymbolKind = "decorator"
 	KindAnnotation  SymbolKind = "annotation"
 	KindFile        SymbolKind = "file"
+	KindMacro       SymbolKind = "macro" // C-family function-like/object-like #define; its body's calls attach to invokers
 	KindOther       SymbolKind = "other"
 )
 
