@@ -28,6 +28,11 @@ func TestDetectLanguage(t *testing.T) {
 		"a.hpp":       astkit.LangCPP,
 		"a.cs":        astkit.LangCSharp,
 		"a.php":       astkit.LangPHP,
+		"a.swift":     astkit.LangSwift,
+		"a.kt":        astkit.LangKotlin,
+		"a.kts":       astkit.LangKotlin,
+		"a.m":         astkit.LangObjC,
+		"a.mm":        astkit.LangObjC,
 		"config.json": astkit.LangJSON,
 		"x.yaml":      astkit.LangYAML,
 		"x.YML":       astkit.LangYAML,
@@ -56,6 +61,7 @@ func TestIsAST_IsConfigData(t *testing.T) {
 		astkit.LangGo, astkit.LangTypeScript, astkit.LangTSX, astkit.LangJavaScript,
 		astkit.LangPython, astkit.LangJava, astkit.LangRust, astkit.LangC,
 		astkit.LangCPP, astkit.LangCSharp, astkit.LangPHP,
+		astkit.LangSwift, astkit.LangKotlin, astkit.LangObjC,
 	}
 	for _, l := range astLangs {
 		if !astkit.IsAST(l) {
@@ -92,6 +98,9 @@ func TestEngineParse_AllASTLanguages(t *testing.T) {
 		astkit.LangCPP:        "int main(){return 0;}\n",
 		astkit.LangCSharp:     "class A { void F(){} }\n",
 		astkit.LangPHP:        "<?php function f(){}\n",
+		astkit.LangSwift:      "func f() {}\n",
+		astkit.LangKotlin:     "fun f() {}\n",
+		astkit.LangObjC:       "@interface Foo : NSObject\n@end\n",
 	}
 	for lang, src := range cases {
 		tree, err := eng.Parse(context.Background(), lang, []byte(src))

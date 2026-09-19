@@ -2823,6 +2823,983 @@ func phpIsExported(n *sitter.Node, src []byte) bool {
 	return true
 }
 
+// ─── Swift ────────────────────────────────────────────────────────────────────
+//
+// The vendored Swift grammar models class/struct/enum/extension/actor under
+// one node type, class_declaration, discriminated by its "declaration_kind"
+// field (the keyword token itself). Protocols get their own node type.
+// Function/init/deinit bodies are walked only for call sites, never
+// recursed into for nested declarations — property_declaration also covers
+// local `let`/`var` bindings inside a function body, and descending would
+// misreport every local variable as a field.
+
+func extractSwiftNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
+	var out []astkit.Symbol
+	swiftVisit(root, filePath, blobSHA, src, imports, "", &out)
+	extConf := swiftExtensionConformances(root, src)
+	for i := range out {
+		switch out[i].Kind {
+		case astkit.KindClass, astkit.KindStruct, astkit.KindEnum:
+		default:
+			continue
+		}
+		for _, p := range extConf[out[i].Name] {
+			out[i].Annotations = append(out[i].Annotations, "implements:"+p)
+		}
+	}
+	return out
+}
+
+// swiftExtensionConformances records protocol names an `extension X: P {}`
+// adds to X. Unlike a class's own declaration (whose conformance list is
+// part of its Signature, parsed downstream by Grove), an extension's
+// conformances live in a separate declaration entirely and would otherwise
+// be invisible — the Rust-strategy analog of rustImplTraits.
+func swiftExtensionConformances(root *sitter.Node, src []byte) map[string][]string {
+	out := map[string][]string{}
+	internalast.WalkTree(root, func(n *sitter.Node) {
+		if n == nil || n.Type() != "class_declaration" || swiftDeclarationKind(n, src) != "extension" {
+			return
+		}
+		nameNode := n.ChildByFieldName("name")
+		if nameNode == nil {
+			return
+		}
+		name := nameNode.Content(src)
+		if p := swiftInheritedNames(n, src); len(p) > 0 {
+			out[name] = append(out[name], p...)
+		}
+	})
+	return out
+}
+
+// swiftDeclarationKind returns the keyword distinguishing what a Swift
+// class_declaration node represents ("class", "struct", "enum",
+// "extension", "actor").
+func swiftDeclarationKind(n *sitter.Node, src []byte) string {
+	if k := n.ChildByFieldName("declaration_kind"); k != nil {
+		return k.Content(src)
+	}
+	return "class"
+}
+
+// swiftInheritedNames returns the superclass/protocol names off a
+// class_declaration or protocol_declaration's inheritance_specifier list.
+func swiftInheritedNames(n *sitter.Node, src []byte) []string {
+	var names []string
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil || c.Type() != "inheritance_specifier" {
+			continue
+		}
+		t := c.ChildByFieldName("inherits_from")
+		if t == nil {
+			continue
+		}
+		if name := swiftTypeLastName(t, src); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func swiftTypeLastName(n *sitter.Node, src []byte) string {
+	text := strings.TrimSpace(n.Content(src))
+	if i := strings.IndexAny(text, "<&"); i >= 0 {
+		text = strings.TrimSpace(text[:i])
+	}
+	if i := strings.LastIndexByte(text, '.'); i >= 0 {
+		text = text[i+1:]
+	}
+	return text
+}
+
+func swiftVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		n := node.Child(i)
+		if n == nil {
+			continue
+		}
+		switch n.Type() {
+		case "class_declaration":
+			swiftClassLikeDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "protocol_declaration":
+			swiftProtocolDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "function_declaration":
+			swiftFunctionDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "init_declaration":
+			swiftInitDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "deinit_declaration":
+			swiftDeinitDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "property_declaration":
+			swiftPropertyDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "typealias_declaration":
+			swiftNamedItem(n, astkit.KindType, filePath, blobSHA, src, imports, out)
+		case "subscript_declaration":
+			swiftSubscriptDecl(n, filePath, blobSHA, src, imports, implType, out)
+		}
+	}
+}
+
+// swiftClassLikeDecl handles class/struct/enum/actor declarations directly,
+// and extensions by recursing into the body with no new symbol of its own
+// (an extension declares no type; its members attach to the extended type).
+func swiftClassLikeDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentChain string, out *[]astkit.Symbol) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	kindWord := swiftDeclarationKind(n, src)
+	body := n.ChildByFieldName("body")
+
+	if kindWord == "extension" {
+		// No new type is declared; members attach to the extended type. The
+		// extended type's own name is looked up (not qualJoin'd) because a
+		// top-level extension of a nested type still names it unqualified
+		// (extension Outer.Inner), which qualLast already reduces correctly.
+		if body != nil {
+			swiftVisit(body, filePath, blobSHA, src, imports, qualLast(name), out)
+		}
+		return
+	}
+
+	kind := astkit.KindClass
+	switch kindWord {
+	case "struct":
+		kind = astkit.KindStruct
+	case "enum":
+		kind = astkit.KindEnum
+	}
+	modifiers := swiftModifiers(n, src)
+	if kindWord == "actor" {
+		modifiers = append(modifiers, "actor")
+	}
+	*out = append(*out, astkit.Symbol{
+		Kind:           kind,
+		Name:           name,
+		QualifiedName:  qualJoin(parentChain, name),
+		Signature:      internalast.SignatureBeforeBody(n, src),
+		Span:           internalast.NodeSpan(n),
+		Exported:       swiftIsExported(modifiers),
+		Body:           n.Content(src),
+		ParentName:     qualLast(parentChain),
+		Modifiers:      modifiers,
+		TypeParameters: swiftTypeParameters(n, src),
+		Annotations:    swiftAttributes(n, src),
+	})
+	if body == nil {
+		return
+	}
+	chain := qualJoin(parentChain, name)
+	if body.Type() == "enum_class_body" {
+		swiftEnumCases(body, src, name, out)
+	}
+	swiftVisit(body, filePath, blobSHA, src, imports, chain, out)
+}
+
+func swiftEnumCases(body *sitter.Node, src []byte, enumName string, out *[]astkit.Symbol) {
+	for i := 0; i < int(body.ChildCount()); i++ {
+		e := body.Child(i)
+		if e == nil || e.Type() != "enum_entry" {
+			continue
+		}
+		// A single `case a, b, c` entry repeats the "name" field per case.
+		for j := 0; j < int(e.ChildCount()); j++ {
+			if e.FieldNameForChild(j) != "name" {
+				continue
+			}
+			c := e.Child(j)
+			if c == nil {
+				continue
+			}
+			name := c.Content(src)
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindConst, Name: name, QualifiedName: qualJoin(enumName, name),
+				Signature: name, Span: internalast.NodeSpan(e), Exported: true,
+				Body: e.Content(src), ParentName: enumName,
+			})
+		}
+	}
+}
+
+func swiftProtocolDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentChain string, out *[]astkit.Symbol) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	modifiers := swiftModifiers(n, src)
+	*out = append(*out, astkit.Symbol{
+		Kind:          astkit.KindInterface,
+		Name:          name,
+		QualifiedName: qualJoin(parentChain, name),
+		Signature:     internalast.SignatureBeforeBody(n, src),
+		Span:          internalast.NodeSpan(n),
+		Exported:      swiftIsExported(modifiers),
+		Body:          n.Content(src),
+		ParentName:    qualLast(parentChain),
+		Modifiers:     modifiers,
+		Annotations:   swiftAttributes(n, src),
+	})
+	body := n.ChildByFieldName("body")
+	if body == nil {
+		return
+	}
+	for i := 0; i < int(body.ChildCount()); i++ {
+		m := body.Child(i)
+		if m == nil {
+			continue
+		}
+		switch m.Type() {
+		case "protocol_function_declaration":
+			nameNode := m.ChildByFieldName("name")
+			if nameNode == nil {
+				continue
+			}
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindMethod, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
+				Signature: internalast.FirstLine(m.Content(src)), Span: internalast.NodeSpan(m),
+				Exported: true, Body: m.Content(src), ParentName: name,
+			})
+		case "protocol_property_declaration":
+			swiftPropertyDecl(m, filePath, blobSHA, src, imports, name, out)
+		}
+	}
+}
+
+// swiftPropertyNames returns every bound identifier a property declaration
+// names (usually one; `var a, b: Int` declares several under repeated
+// "name" fields, mirroring swiftEnumCases).
+func swiftPropertyNames(n *sitter.Node, src []byte) []string {
+	var names []string
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if n.FieldNameForChild(i) != "name" {
+			continue
+		}
+		c := n.Child(i)
+		if c == nil {
+			continue
+		}
+		names = append(names, swiftPatternName(c, src))
+	}
+	return names
+}
+
+func swiftPatternName(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	if bi := n.ChildByFieldName("bound_identifier"); bi != nil {
+		return bi.Content(src)
+	}
+	if n.Type() == "simple_identifier" {
+		return n.Content(src)
+	}
+	return strings.TrimSpace(n.Content(src))
+}
+
+func swiftPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+	names := swiftPropertyNames(n, src)
+	if len(names) == 0 {
+		return
+	}
+	modifiers := swiftModifiers(n, src)
+	raw := n.Content(src)
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		*out = append(*out, astkit.Symbol{
+			Kind: astkit.KindField, Name: name, QualifiedName: name,
+			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(n),
+			Exported: swiftIsExported(modifiers), Body: raw, ParentName: qualLast(implType),
+			Modifiers: modifiers, Annotations: swiftAttributes(n, src),
+		})
+	}
+}
+
+func swiftFunctionDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	kind := astkit.KindFunction
+	if implType != "" {
+		kind = astkit.KindMethod
+	}
+	modifiers := swiftModifiers(n, src)
+	body := n.ChildByFieldName("body")
+	*out = append(*out, astkit.Symbol{
+		Kind:           kind,
+		Name:           name,
+		QualifiedName:  name,
+		Signature:      funcSig(n, src),
+		Span:           internalast.NodeSpan(n),
+		Exported:       swiftIsExported(modifiers),
+		Body:           n.Content(src),
+		ParentName:     qualLast(implType),
+		Modifiers:      modifiers,
+		TypeParameters: swiftTypeParameters(n, src),
+		Annotations:    swiftAttributes(n, src),
+		CallSites:      sharedNavCallSites(body, src),
+	})
+}
+
+func swiftInitDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+	modifiers := swiftModifiers(n, src)
+	body := n.ChildByFieldName("body")
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindConstructor, Name: "init", QualifiedName: "init",
+		Signature: funcSig(n, src), Span: internalast.NodeSpan(n),
+		Exported: swiftIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType),
+		Modifiers: modifiers, Annotations: swiftAttributes(n, src),
+		CallSites: sharedNavCallSites(body, src),
+	})
+}
+
+func swiftDeinitDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+	body := n.ChildByFieldName("body")
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindMethod, Name: "deinit", QualifiedName: "deinit",
+		Signature: "deinit", Span: internalast.NodeSpan(n),
+		Body: n.Content(src), ParentName: qualLast(implType), CallSites: sharedNavCallSites(body, src),
+	})
+}
+
+func swiftSubscriptDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+	modifiers := swiftModifiers(n, src)
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindMethod, Name: "subscript", QualifiedName: qualJoin(qualLast(implType), "subscript"),
+		Signature: internalast.FirstLine(n.Content(src)), Span: internalast.NodeSpan(n),
+		Exported: swiftIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType), Modifiers: modifiers,
+	})
+}
+
+func swiftNamedItem(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA string, src []byte, imports []string, out *[]astkit.Symbol) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	modifiers := swiftModifiers(n, src)
+	*out = append(*out, astkit.Symbol{
+		Kind: kind, Name: name, QualifiedName: name,
+		Signature: internalast.FirstLine(n.Content(src)), Span: internalast.NodeSpan(n),
+		Exported: swiftIsExported(modifiers), Body: n.Content(src), Modifiers: modifiers,
+		Annotations: swiftAttributes(n, src),
+	})
+}
+
+func swiftModifiers(n *sitter.Node, src []byte) []string {
+	var out []string
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil || c.Type() != "modifiers" {
+			continue
+		}
+		for j := 0; j < int(c.ChildCount()); j++ {
+			m := c.Child(j)
+			if m == nil || !m.IsNamed() || m.Type() == "attribute" {
+				continue
+			}
+			out = append(out, strings.TrimSpace(m.Content(src)))
+		}
+	}
+	return out
+}
+
+func swiftIsExported(modifiers []string) bool {
+	for _, m := range modifiers {
+		switch m {
+		case "public", "open":
+			return true
+		}
+	}
+	return false
+}
+
+func swiftAttributes(n *sitter.Node, src []byte) []string {
+	var out []string
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c != nil && c.Type() == "attribute" {
+			out = append(out, strings.TrimSpace(c.Content(src)))
+		}
+	}
+	return out
+}
+
+func swiftTypeParameters(n *sitter.Node, src []byte) []string {
+	tp := internalast.FindChildByType(n, "type_parameters")
+	if tp == nil {
+		return nil
+	}
+	var out []string
+	for i := 0; i < int(tp.ChildCount()); i++ {
+		c := tp.Child(i)
+		if c != nil && c.Type() == "type_parameter" {
+			out = append(out, strings.TrimSpace(c.Content(src)))
+		}
+	}
+	return out
+}
+
+// ─── Kotlin ───────────────────────────────────────────────────────────────────
+//
+// Unlike every other grammar astkit supports, the vendored Kotlin grammar
+// exposes no field names at all — every relationship (declaration name,
+// body, superclass list) is purely positional, so every helper here walks
+// by node type instead of ChildByFieldName.
+
+func extractKotlinNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
+	var out []astkit.Symbol
+	kotlinVisit(root, filePath, blobSHA, src, imports, "", &out)
+	return out
+}
+
+// kotlinTypeName returns a class/interface/object declaration's name: the
+// grammar's only direct type_identifier child (a superclass's type_identifier
+// is nested inside a delegation_specifier, one level deeper).
+func kotlinTypeName(n *sitter.Node) *sitter.Node {
+	return internalast.FindChildByType(n, "type_identifier")
+}
+
+// kotlinDeclarationKeyword distinguishes class/interface/enum: the grammar
+// reuses class_declaration for all three, discriminated by an anonymous
+// leading keyword token rather than a field.
+func kotlinDeclarationKeyword(n *sitter.Node) string {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil || c.IsNamed() {
+			continue
+		}
+		switch c.Type() {
+		case "class", "interface", "enum":
+			return c.Type()
+		}
+	}
+	return "class"
+}
+
+func kotlinVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		n := node.Child(i)
+		if n == nil {
+			continue
+		}
+		switch n.Type() {
+		case "class_declaration":
+			kotlinClassDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "object_declaration":
+			kotlinObjectDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "companion_object":
+			// An anonymous singleton nested in a class; its members are
+			// accessible as ClassName.member, so attribute them directly to
+			// the enclosing class rather than modeling a separate type.
+			if body := internalast.FindChildByType(n, "class_body"); body != nil {
+				kotlinVisit(body, filePath, blobSHA, src, imports, implType, out)
+			}
+		case "function_declaration":
+			kotlinFunctionDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "property_declaration":
+			kotlinPropertyDecl(n, filePath, blobSHA, src, imports, implType, out)
+		}
+	}
+}
+
+func kotlinClassDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentChain string, out *[]astkit.Symbol) {
+	nameNode := kotlinTypeName(n)
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	keyword := kotlinDeclarationKeyword(n)
+	kind := astkit.KindClass
+	switch keyword {
+	case "interface":
+		kind = astkit.KindInterface
+	case "enum":
+		kind = astkit.KindEnum
+	}
+	modifiers := kotlinModifiers(n, src)
+	*out = append(*out, astkit.Symbol{
+		Kind:           kind,
+		Name:           name,
+		QualifiedName:  qualJoin(parentChain, name),
+		Signature:      kotlinSignatureBeforeBody(n, src),
+		Span:           internalast.NodeSpan(n),
+		Exported:       kotlinIsExported(modifiers),
+		Body:           n.Content(src),
+		ParentName:     qualLast(parentChain),
+		Modifiers:      modifiers,
+		TypeParameters: kotlinTypeParameters(n, src),
+		Annotations:    kotlinAnnotations(n, src),
+	})
+	if pc := internalast.FindChildByType(n, "primary_constructor"); pc != nil {
+		kotlinPrimaryConstructorFields(pc, src, name, out)
+	}
+	body := internalast.FindChildByType(n, "class_body")
+	if body == nil {
+		body = internalast.FindChildByType(n, "enum_class_body")
+	}
+	if body == nil {
+		return
+	}
+	chain := qualJoin(parentChain, name)
+	if body.Type() == "enum_class_body" {
+		kotlinEnumEntries(body, src, name, out)
+	}
+	kotlinVisit(body, filePath, blobSHA, src, imports, chain, out)
+}
+
+func kotlinObjectDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentChain string, out *[]astkit.Symbol) {
+	nameNode := kotlinTypeName(n)
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	modifiers := append(kotlinModifiers(n, src), "object")
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindClass, Name: name, QualifiedName: qualJoin(parentChain, name),
+		Signature: kotlinSignatureBeforeBody(n, src), Span: internalast.NodeSpan(n),
+		Exported: kotlinIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(parentChain),
+		Modifiers: modifiers, Annotations: kotlinAnnotations(n, src),
+	})
+	if body := internalast.FindChildByType(n, "class_body"); body != nil {
+		kotlinVisit(body, filePath, blobSHA, src, imports, qualJoin(parentChain, name), out)
+	}
+}
+
+func kotlinPrimaryConstructorFields(pc *sitter.Node, src []byte, className string, out *[]astkit.Symbol) {
+	for i := 0; i < int(pc.ChildCount()); i++ {
+		p := pc.Child(i)
+		if p == nil || p.Type() != "class_parameter" {
+			continue
+		}
+		if internalast.FindChildByType(p, "binding_pattern_kind") == nil {
+			continue // a plain constructor argument, not a val/var property
+		}
+		nameNode := internalast.FindChildByType(p, "simple_identifier")
+		if nameNode == nil {
+			continue
+		}
+		modifiers := kotlinModifiers(p, src)
+		*out = append(*out, astkit.Symbol{
+			Kind: astkit.KindField, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
+			Signature: strings.TrimSpace(p.Content(src)), Span: internalast.NodeSpan(p),
+			Exported: kotlinIsExported(modifiers), Body: p.Content(src), ParentName: className,
+			Modifiers: modifiers,
+		})
+	}
+}
+
+func kotlinEnumEntries(body *sitter.Node, src []byte, enumName string, out *[]astkit.Symbol) {
+	for i := 0; i < int(body.ChildCount()); i++ {
+		e := body.Child(i)
+		if e == nil || e.Type() != "enum_entry" {
+			continue
+		}
+		nameNode := internalast.FindChildByType(e, "simple_identifier")
+		if nameNode == nil {
+			continue
+		}
+		name := nameNode.Content(src)
+		*out = append(*out, astkit.Symbol{
+			Kind: astkit.KindConst, Name: name, QualifiedName: qualJoin(enumName, name),
+			Signature: name, Span: internalast.NodeSpan(e), Exported: true,
+			Body: e.Content(src), ParentName: enumName,
+		})
+	}
+}
+
+// kotlinPropertyDecl handles a val/var member declaration. Only invoked as a
+// direct child of a class_body (via kotlinVisit) — property_declaration also
+// covers local bindings inside a function body, which are never visited
+// here, avoiding misreporting locals as fields.
+func kotlinPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+	vd := internalast.FindChildByType(n, "variable_declaration")
+	if vd == nil {
+		return
+	}
+	nameNode := internalast.FindChildByType(vd, "simple_identifier")
+	if nameNode == nil {
+		return
+	}
+	modifiers := kotlinModifiers(n, src)
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindField, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
+		Signature: internalast.FirstLine(n.Content(src)), Span: internalast.NodeSpan(n),
+		Exported: kotlinIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType),
+		Modifiers: modifiers, Annotations: kotlinAnnotations(n, src),
+	})
+}
+
+func kotlinFunctionDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
+	nameNode := internalast.FindChildByType(n, "simple_identifier")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	kind := astkit.KindFunction
+	if implType != "" {
+		kind = astkit.KindMethod
+	}
+	modifiers := kotlinModifiers(n, src)
+	body := internalast.FindChildByType(n, "function_body")
+	*out = append(*out, astkit.Symbol{
+		Kind:           kind,
+		Name:           name,
+		QualifiedName:  name,
+		Signature:      kotlinFuncSig(n, src),
+		Span:           internalast.NodeSpan(n),
+		Exported:       kotlinIsExported(modifiers),
+		Body:           n.Content(src),
+		ParentName:     qualLast(implType),
+		Modifiers:      modifiers,
+		TypeParameters: kotlinTypeParameters(n, src),
+		Annotations:    kotlinAnnotations(n, src),
+		CallSites:      sharedNavCallSites(body, src),
+	})
+}
+
+// kotlinFuncSig returns a function declaration's header (through its
+// parameter list and return type) without the body — funcSig cannot be
+// reused here since it looks up the body via ChildByFieldName("body"), and
+// this grammar carries no field names.
+func kotlinFuncSig(n *sitter.Node, src []byte) string {
+	body := internalast.FindChildByType(n, "function_body")
+	if body == nil {
+		return internalast.FirstLine(strings.TrimSpace(n.Content(src)))
+	}
+	start := n.StartByte()
+	bodyStart := body.StartByte()
+	if bodyStart <= start {
+		return internalast.FirstLine(n.Content(src))
+	}
+	sig := strings.TrimSpace(string(src[start:bodyStart]))
+	sig = strings.TrimRight(sig, " \t\n{=")
+	return strings.TrimSpace(sig)
+}
+
+// kotlinSignatureBeforeBody returns a class/interface/object declaration's
+// header (through its superclass list) without the body — analogous to
+// internalast.SignatureBeforeBody, which cannot be reused here since it
+// locates the body via ChildByFieldName("body") and this grammar carries no
+// field names.
+func kotlinSignatureBeforeBody(n *sitter.Node, src []byte) string {
+	body := internalast.FindChildByType(n, "class_body")
+	if body == nil {
+		body = internalast.FindChildByType(n, "enum_class_body")
+	}
+	if body == nil {
+		return internalast.FirstLine(strings.TrimSpace(n.Content(src)))
+	}
+	start := n.StartByte()
+	bodyStart := body.StartByte()
+	if bodyStart <= start {
+		return internalast.FirstLine(n.Content(src))
+	}
+	sig := strings.TrimSpace(string(src[start:bodyStart]))
+	return strings.Join(strings.Fields(sig), " ")
+}
+
+func kotlinModifiers(n *sitter.Node, src []byte) []string {
+	mods := internalast.FindChildByType(n, "modifiers")
+	if mods == nil {
+		return nil
+	}
+	var out []string
+	for i := 0; i < int(mods.ChildCount()); i++ {
+		c := mods.Child(i)
+		if c == nil || !c.IsNamed() || c.Type() == "annotation" {
+			continue
+		}
+		out = append(out, strings.TrimSpace(c.Content(src)))
+	}
+	return out
+}
+
+func kotlinIsExported(modifiers []string) bool {
+	for _, m := range modifiers {
+		switch m {
+		case "private", "internal":
+			return false
+		}
+	}
+	// Kotlin's default visibility (no modifier present) is public.
+	return true
+}
+
+func kotlinAnnotations(n *sitter.Node, src []byte) []string {
+	mods := internalast.FindChildByType(n, "modifiers")
+	if mods == nil {
+		return nil
+	}
+	var out []string
+	for i := 0; i < int(mods.ChildCount()); i++ {
+		c := mods.Child(i)
+		if c != nil && c.Type() == "annotation" {
+			out = append(out, strings.TrimSpace(c.Content(src)))
+		}
+	}
+	return out
+}
+
+func kotlinTypeParameters(n *sitter.Node, src []byte) []string {
+	tp := internalast.FindChildByType(n, "type_parameters")
+	if tp == nil {
+		return nil
+	}
+	var out []string
+	for i := 0; i < int(tp.ChildCount()); i++ {
+		c := tp.Child(i)
+		if c != nil && c.Type() == "type_parameter" {
+			out = append(out, strings.TrimSpace(c.Content(src)))
+		}
+	}
+	return out
+}
+
+// ─── Objective-C ────────────────────────────────────────────────────────────
+//
+// Objective-C is a strict superset of C: astkit's existing C extractor
+// (extractCNodes) already covers every plain C top-level construct a .m
+// file may contain (functions, structs, enums, typedefs, #if-guarded
+// regions) unchanged when passed "objc" as its language parameter — its
+// only two `language == "cpp"` branches simply never fire for it. This
+// walker layers the Objective-C-specific constructs
+// (@interface/@protocol/@implementation and their members) on top.
+//
+// Unlike every class-based grammar astkit supports, an
+// @interface/@protocol/@implementation has no enclosing "body" node — its
+// member declarations are flat siblings of the header tokens (name,
+// superclass, category parens, protocol list) between the opening keyword
+// and @end. objcHeaderText locates the header/member boundary itself
+// instead of reading a body field.
+
+func extractObjCNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
+	out := extractCNodes(root, filePath, blobSHA, "objc", src, imports)
+	for i := 0; i < int(root.ChildCount()); i++ {
+		n := root.Child(i)
+		if n == nil {
+			continue
+		}
+		switch n.Type() {
+		case "protocol_declaration":
+			objcProtocolDecl(n, src, &out)
+		case "class_interface":
+			objcInterfaceDecl(n, src, &out)
+		case "class_implementation":
+			objcImplementationDecl(n, src, &out)
+		}
+	}
+	return out
+}
+
+var objcMemberNodeTypes = map[string]bool{
+	"property_declaration": true,
+	"method_declaration":   true,
+	"instance_variables":   true,
+	"@end":                 true,
+}
+
+// objcHeaderText returns n's text from its start up to its first member
+// declaration (or the whole node, if it declares none) — the
+// name/superclass/protocol-list text buildExtendsImplements's "objc" case
+// (Grove-side) parses.
+func objcHeaderText(n *sitter.Node, src []byte) string {
+	start := n.StartByte()
+	end := n.EndByte()
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c != nil && objcMemberNodeTypes[c.Type()] {
+			end = c.StartByte()
+			break
+		}
+	}
+	if end > uint32(len(src)) {
+		end = uint32(len(src))
+	}
+	if start >= end {
+		return internalast.FirstLine(n.Content(src))
+	}
+	return strings.Join(strings.Fields(string(src[start:end])), " ")
+}
+
+// objcCategoryName returns the category name of `@interface Foo (Bar)` — a
+// category adds methods to an existing class, so it declares no new type —
+// or "" for an ordinary (non-category) interface, recognized by having no
+// "superclass" field.
+func objcCategoryName(n *sitter.Node, src []byte) string {
+	if n.ChildByFieldName("superclass") != nil {
+		return ""
+	}
+	sawOpenParen := false
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil {
+			continue
+		}
+		switch {
+		case c.Type() == "(":
+			sawOpenParen = true
+		case sawOpenParen && c.Type() == "identifier":
+			return c.Content(src)
+		}
+	}
+	return ""
+}
+
+func objcInterfaceDecl(n *sitter.Node, src []byte, out *[]astkit.Symbol) {
+	nameNode := n.NamedChild(0)
+	if nameNode == nil || nameNode.Type() != "identifier" {
+		return
+	}
+	className := nameNode.Content(src)
+	if objcCategoryName(n, src) == "" {
+		*out = append(*out, astkit.Symbol{
+			Kind: astkit.KindClass, Name: className, QualifiedName: className,
+			Signature: objcHeaderText(n, src), Span: internalast.NodeSpan(n),
+			Exported: true, Body: n.Content(src),
+		})
+	}
+	objcMembers(n, className, src, out)
+}
+
+func objcProtocolDecl(n *sitter.Node, src []byte, out *[]astkit.Symbol) {
+	nameNode := n.NamedChild(0)
+	if nameNode == nil || nameNode.Type() != "identifier" {
+		return
+	}
+	name := nameNode.Content(src)
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindInterface, Name: name, QualifiedName: name,
+		Signature: objcHeaderText(n, src), Span: internalast.NodeSpan(n),
+		Exported: true, Body: n.Content(src),
+	})
+	objcMembers(n, name, src, out)
+}
+
+// objcMembers emits property and (bodyless) method-declaration symbols for
+// the direct children of an @interface/@protocol node.
+func objcMembers(n *sitter.Node, parentName string, src []byte, out *[]astkit.Symbol) {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil {
+			continue
+		}
+		switch c.Type() {
+		case "property_declaration":
+			objcPropertyDecl(c, parentName, src, out)
+		case "method_declaration":
+			objcMethodDeclSym(c, parentName, src, out)
+		}
+	}
+}
+
+func objcPropertyDecl(n *sitter.Node, parentName string, src []byte, out *[]astkit.Symbol) {
+	// A @property line's "Type *name;" tail parses as a struct_declaration
+	// (this grammar reuses the C field-declaration shape for it); the
+	// first identifier inside it is the property name.
+	decl := internalast.FindChildByType(n, "struct_declaration")
+	if decl == nil {
+		return
+	}
+	var nameNode *sitter.Node
+	internalast.WalkTree(decl, func(c *sitter.Node) {
+		if nameNode == nil && c != nil && c.Type() == "identifier" {
+			nameNode = c
+		}
+	})
+	if nameNode == nil {
+		return
+	}
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindField, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
+		Signature: strings.Join(strings.Fields(n.Content(src)), " "), Span: internalast.NodeSpan(n),
+		Exported: true, Body: n.Content(src), ParentName: parentName,
+	})
+}
+
+func objcMethodDeclSym(n *sitter.Node, parentName string, src []byte, out *[]astkit.Symbol) {
+	sel := objcDeclSelector(n, src)
+	if sel == "" {
+		return
+	}
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindMethod, Name: sel, QualifiedName: sel,
+		Signature: strings.Join(strings.Fields(n.Content(src)), " "), Span: internalast.NodeSpan(n),
+		Exported: true, Body: n.Content(src), ParentName: parentName,
+		Modifiers: objcMethodModifiers(n),
+	})
+}
+
+func objcMethodModifiers(n *sitter.Node) []string {
+	if objcIsClassMethod(n) {
+		return []string{"class"}
+	}
+	return nil
+}
+
+// objcImplementationDecl emits the real (bodied, call-site-bearing) method
+// symbols from an @implementation block. It emits no class symbol of its
+// own: @implementation restates no superclass/protocol information the
+// @interface declaration (commonly in a separate .h file) doesn't already
+// carry, and Grove's ParentName-based resolution finds these methods
+// against the interface's class symbol across files without one.
+func objcImplementationDecl(n *sitter.Node, src []byte, out *[]astkit.Symbol) {
+	nameNode := n.NamedChild(0)
+	if nameNode == nil || nameNode.Type() != "identifier" {
+		return
+	}
+	className := nameNode.Content(src)
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil || c.Type() != "implementation_definition" {
+			continue
+		}
+		for j := 0; j < int(c.ChildCount()); j++ {
+			m := c.Child(j)
+			if m != nil && m.Type() == "method_definition" {
+				objcMethodDefSym(m, className, src, out)
+			}
+		}
+	}
+}
+
+func objcMethodDefSym(n *sitter.Node, parentName string, src []byte, out *[]astkit.Symbol) {
+	sel := objcDeclSelector(n, src)
+	if sel == "" {
+		return
+	}
+	body := internalast.FindChildByType(n, "compound_statement")
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindMethod, Name: sel, QualifiedName: sel,
+		Signature: objcMethodSigBeforeBody(n, src), Span: internalast.NodeSpan(n),
+		Exported: true, Body: n.Content(src), ParentName: parentName,
+		Modifiers: objcMethodModifiers(n),
+		CallSites: objcCallSites(body, src),
+	})
+}
+
+// objcMethodSigBeforeBody returns a method_definition's header (through its
+// parameter list and return type) without the body.
+func objcMethodSigBeforeBody(n *sitter.Node, src []byte) string {
+	body := internalast.FindChildByType(n, "compound_statement")
+	if body == nil {
+		return internalast.FirstLine(strings.TrimSpace(n.Content(src)))
+	}
+	start := n.StartByte()
+	bodyStart := body.StartByte()
+	if bodyStart <= start {
+		return internalast.FirstLine(n.Content(src))
+	}
+	sig := strings.TrimSpace(string(src[start:bodyStart]))
+	return strings.Join(strings.Fields(sig), " ")
+}
+
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
 // funcSig returns the function/method signature without the body.

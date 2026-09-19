@@ -23,6 +23,9 @@ const (
 	LangCPP        LanguageKey = "cpp"
 	LangCSharp     LanguageKey = "csharp"
 	LangPHP        LanguageKey = "php"
+	LangSwift      LanguageKey = "swift"
+	LangKotlin     LanguageKey = "kotlin"
+	LangObjC       LanguageKey = "objc"
 
 	// Non-AST data formats — recognized for detection only; astkit does not
 	// extract symbols from them. Callers (e.g. Fuse) handle these via
@@ -74,6 +77,16 @@ func DetectLanguage(path, content string) LanguageKey {
 		return LangCSharp
 	case ".php":
 		return LangPHP
+	case ".swift":
+		return LangSwift
+	case ".kt", ".kts":
+		return LangKotlin
+	case ".m", ".mm":
+		// Objective-C++ (.mm) is a strict superset the vendored Objective-C
+		// grammar does not fully model (raw C++ constructs inside a .mm
+		// file can mis-parse); treated as best-effort Objective-C, same
+		// spirit as the .h ambiguity above.
+		return LangObjC
 	case ".json":
 		return LangJSON
 	case ".yaml", ".yml":

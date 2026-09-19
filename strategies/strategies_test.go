@@ -57,6 +57,7 @@ func TestDefault_RegistersAllLanguages(t *testing.T) {
 		astkit.LangGo, astkit.LangPython, astkit.LangJava, astkit.LangRust,
 		astkit.LangJavaScript, astkit.LangTypeScript, astkit.LangTSX,
 		astkit.LangC, astkit.LangCPP, astkit.LangCSharp, astkit.LangPHP,
+		astkit.LangSwift, astkit.LangKotlin, astkit.LangObjC,
 	} {
 		if reg.Get(l) == nil {
 			t.Errorf("strategy missing for %s", l)
@@ -78,6 +79,9 @@ func TestStrategy_Extensions(t *testing.T) {
 		astkit.LangCPP:        ".cpp",
 		astkit.LangCSharp:     ".cs",
 		astkit.LangPHP:        ".php",
+		astkit.LangSwift:      ".swift",
+		astkit.LangKotlin:     ".kt",
+		astkit.LangObjC:       ".m",
 	}
 	for lang, want := range cases {
 		exts := reg.Get(lang).Extensions()
@@ -392,6 +396,71 @@ pub fn hello(n: &str) -> String { n.to_string() }
 		t.Errorf("missing in %v", got)
 	}
 	if len(imps) != 1 {
+		t.Errorf("imports=%v", imps)
+	}
+}
+
+func TestExtract_Swift(t *testing.T) {
+	src := `import Foundation
+
+protocol Greeter {
+    func greet() -> String
+}
+
+public class Person: Greeter {
+    public func greet() -> String { return "hi" }
+}
+`
+	syms, imps := extract(t, astkit.LangSwift, src)
+	got := names(syms)
+	if !contains(got, "Greeter") || !contains(got, "Person") || !contains(got, "greet") {
+		t.Errorf("missing in %v", got)
+	}
+	if len(imps) != 1 || imps[0].Path != "Foundation" {
+		t.Errorf("imports=%v", imps)
+	}
+}
+
+func TestExtract_Kotlin(t *testing.T) {
+	src := `package com.example
+
+import kotlin.math.PI
+
+interface Greeter {
+    fun greet(): String
+}
+
+class Person : Greeter {
+    override fun greet(): String = "hi"
+}
+`
+	syms, imps := extract(t, astkit.LangKotlin, src)
+	got := names(syms)
+	if !contains(got, "Greeter") || !contains(got, "Person") || !contains(got, "greet") {
+		t.Errorf("missing in %v", got)
+	}
+	if len(imps) != 1 || imps[0].Path != "kotlin.math.PI" {
+		t.Errorf("imports=%v", imps)
+	}
+}
+
+func TestExtract_ObjC(t *testing.T) {
+	src := `#import <Foundation/Foundation.h>
+
+@protocol Greeter
+- (NSString *)greet;
+@end
+
+@interface Person : NSObject <Greeter>
+- (NSString *)greet;
+@end
+`
+	syms, imps := extract(t, astkit.LangObjC, src)
+	got := names(syms)
+	if !contains(got, "Greeter") || !contains(got, "Person") || !contains(got, "greet") {
+		t.Errorf("missing in %v", got)
+	}
+	if len(imps) != 1 || imps[0].Path != "Foundation/Foundation.h" {
 		t.Errorf("imports=%v", imps)
 	}
 }

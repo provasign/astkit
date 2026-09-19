@@ -174,25 +174,26 @@ func callArgs(call *sitter.Node, src []byte) []string {
 // type marker. Covers the literal node types of the Java/TS/JS/Go/Python
 // grammars; unknown shapes return "".
 func argToken(c *sitter.Node, src []byte) string {
-	if c.Type() == "argument" {
-		// C# wraps each argument in an `argument` node:
-		// (name_colon)? ('ref'|'out'|'in')? expression. The value expression
+	if c.Type() == "argument" || c.Type() == "value_argument" {
+		// C# wraps each argument in an `argument` node; Swift/Kotlin wrap
+		// each in a `value_argument` node — both shapes are (label)?
+		// (ref/out/in or external-name)? expression. The value expression
 		// is the last named child; unwrap it so literals/identifiers classify
-		// instead of the wrapper returning "" (left C# Args empty entirely).
+		// instead of the wrapper returning "" (left Args empty entirely).
 		if nc := int(c.NamedChildCount()); nc > 0 {
 			return argToken(c.NamedChild(nc-1), src)
 		}
 		return ""
 	}
 	switch c.Type() {
-	case "identifier":
+	case "identifier", "simple_identifier":
 		return string(c.Content(src))
 	case "string_literal", "interpreted_string_literal", "raw_string_literal", "string":
 		return "#String"
 	case "character_literal", "rune_literal":
 		return "#char"
 	case "decimal_integer_literal", "hex_integer_literal", "octal_integer_literal",
-		"binary_integer_literal", "int_literal", "integer", "integer_literal":
+		"binary_integer_literal", "int_literal", "integer", "integer_literal", "number_literal":
 		text := string(c.Content(src))
 		switch {
 		case strings.HasSuffix(text, "L") || strings.HasSuffix(text, "l"):
@@ -945,6 +946,328 @@ func rustPathQualifier(path *sitter.Node, src []byte) string {
 		p = p[i+2:]
 	}
 	return p
+}
+
+// ─── Swift / Kotlin call sites ────────────────────────────────────────────────
+//
+// The vendored Swift and Kotlin grammars share identical node shapes for
+// calls and member access (call_expression → call_suffix → value_arguments;
+// navigation_expression → target, navigation_suffix) but — unlike every other
+// grammar astkit supports — expose no field names on any of them. Every
+// relationship is purely positional, so these helpers walk by node type and
+// child index instead of ChildByFieldName, and are shared by both languages.
+
+// sharedNavCallSites walks body for call_expression nodes and returns one
+// CallSite per call. Nested closures/lambdas are covered (no separate scope
+// boundary is tracked), matching how other languages attribute lambda calls
+// to their enclosing declaration.
+func sharedNavCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
+	if body == nil {
+		return nil
+	}
+	var out []astkit.CallSite
+	internalast.WalkTree(body, func(n *sitter.Node) {
+		if n == nil || n.Type() != "call_expression" || n.NamedChildCount() < 1 {
+			return
+		}
+		callee := navCalleeName(n.NamedChild(0), src)
+		if callee == "" {
+			return
+		}
+		out = append(out, astkit.CallSite{
+			Callee: callee,
+			Line:   int(n.StartPoint().Row) + 1,
+			Argc:   navCallArgc(n),
+			Args:   navCallArgs(n, src),
+		})
+	})
+	return out
+}
+
+// navCalleeName reduces a call_expression's callee operand (its first named
+// child) to astkit's "Receiver.callee" convention.
+func navCalleeName(callee *sitter.Node, src []byte) string {
+	if callee == nil {
+		return ""
+	}
+	switch callee.Type() {
+	case "simple_identifier":
+		return callee.Content(src)
+	case "navigation_expression":
+		if callee.NamedChildCount() < 2 {
+			return ""
+		}
+		name := navSuffixName(callee.NamedChild(1), src)
+		if name == "" {
+			return ""
+		}
+		return joinQualified(navQualifierName(callee.NamedChild(0), src), name)
+	}
+	return ""
+}
+
+// navSuffixName returns the member name a navigation_suffix (".foo") names.
+func navSuffixName(suffix *sitter.Node, src []byte) string {
+	if suffix == nil || suffix.NamedChildCount() < 1 {
+		return ""
+	}
+	c := suffix.NamedChild(0)
+	if c == nil || c.Type() != "simple_identifier" {
+		return ""
+	}
+	return c.Content(src)
+}
+
+// navQualifierName reduces a navigation_expression's target (receiver) to
+// one identifier, mirroring qualifierName's contract for other grammars.
+// self/this stay literal (matching how csCallSites keeps "this"/"base"
+// explicit) so Grove's implicit-self resolution sees the same "self.x"/
+// "this.x" shape it already special-cases for Java/C#/C++.
+func navQualifierName(target *sitter.Node, src []byte) string {
+	if target == nil {
+		return ""
+	}
+	switch target.Type() {
+	case "simple_identifier":
+		return target.Content(src)
+	case "self_expression":
+		return "self"
+	case "this_expression":
+		return "this"
+	case "navigation_expression":
+		if target.NamedChildCount() < 2 {
+			return ""
+		}
+		return navSuffixName(target.NamedChild(1), src)
+	case "call_expression":
+		if target.NamedChildCount() < 1 {
+			return ""
+		}
+		name := navCalleeName(target.NamedChild(0), src)
+		if name == "" {
+			return ""
+		}
+		return name + "()"
+	}
+	return ""
+}
+
+// navCallArguments finds a call_expression's value_arguments node: the
+// grammar nests it inside a positional call_suffix child, not a field.
+func navCallArguments(call *sitter.Node) *sitter.Node {
+	for i := 0; i < int(call.ChildCount()); i++ {
+		c := call.Child(i)
+		if c != nil && c.Type() == "call_suffix" {
+			return internalast.FindChildByType(c, "value_arguments")
+		}
+	}
+	return nil
+}
+
+func navCallArgc(call *sitter.Node) int {
+	args := navCallArguments(call)
+	if args == nil {
+		return 0
+	}
+	n := 0
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		if c := args.NamedChild(i); c != nil && c.Type() == "value_argument" {
+			n++
+		}
+	}
+	return n
+}
+
+func navCallArgs(call *sitter.Node, src []byte) []string {
+	args := navCallArguments(call)
+	if args == nil {
+		return nil
+	}
+	var out []string
+	any := false
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		arg := args.NamedChild(i)
+		if arg == nil || arg.Type() != "value_argument" {
+			continue
+		}
+		v := ""
+		if nc := int(arg.NamedChildCount()); nc > 0 {
+			v = argToken(arg.NamedChild(nc-1), src)
+		}
+		if v != "" {
+			any = true
+		}
+		out = append(out, v)
+	}
+	if !any {
+		return nil
+	}
+	return out
+}
+
+// ─── Objective-C message sends ─────────────────────────────────────────────
+//
+// Objective-C calls ("message sends") have no analog anywhere else astkit
+// supports: `[receiver keyword1:arg1 keyword2:arg2]` names its callee across
+// N "method"-fielded identifier children (one per keyword), not one. The
+// selector is their colon-joined concatenation ("keyword1:keyword2:"), and
+// it is this joined form — not any single keyword — that both a method
+// declaration/definition and every call to it are named by, so definitions
+// and call sites agree on one string to match against.
+
+// objcJoinSelectorParts joins keyword-message parts ("doThing", "withOption")
+// into astkit/Grove's one agreed-on selector string ("doThing:withOption:"),
+// or returns the lone part bare when the message/method is unary (no ":").
+func objcJoinSelectorParts(parts []string, hasColon bool) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	if !hasColon {
+		return parts[0]
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString(p)
+		b.WriteByte(':')
+	}
+	return b.String()
+}
+
+// objcCallSelector reconstructs the full selector from a message_expression
+// (a call): its keyword parts are the "method"-fielded identifier children.
+func objcCallSelector(n *sitter.Node, src []byte) string {
+	var parts []string
+	hasColon := false
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil {
+			continue
+		}
+		if n.FieldNameForChild(i) == "method" {
+			parts = append(parts, c.Content(src))
+		}
+		if c.Type() == ":" {
+			hasColon = true
+		}
+	}
+	return objcJoinSelectorParts(parts, hasColon)
+}
+
+// objcDeclSelector reconstructs the full selector from a
+// method_declaration/method_definition (a declaration). Unlike
+// message_expression, this grammar attaches no field name to a
+// declaration's keyword-part identifiers — they are its only direct
+// "identifier"-typed children (the return type's identifier is nested
+// inside a method_type/type_name wrapper, a different node type, so there
+// is no ambiguity to filter out) — and unlike message_expression, the ":"
+// itself is NOT a direct child here: it is nested one level down inside
+// each method_parameter. A keyword method is therefore recognized by the
+// presence of at least one method_parameter child, not by a direct ":".
+func objcDeclSelector(n *sitter.Node, src []byte) string {
+	var parts []string
+	hasParam := false
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil {
+			continue
+		}
+		switch c.Type() {
+		case "identifier":
+			parts = append(parts, c.Content(src))
+		case "method_parameter":
+			hasParam = true
+		}
+	}
+	return objcJoinSelectorParts(parts, hasParam)
+}
+
+// objcIsClassMethod reports whether a method_declaration/method_definition
+// is declared with a leading `+` (a class/factory method) rather than `-`
+// (an instance method).
+func objcIsClassMethod(n *sitter.Node) bool {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if c := n.Child(i); c != nil && c.Type() == "+" {
+			return true
+		}
+	}
+	return false
+}
+
+// objcMessageArgs returns a message_expression's argument-expression nodes:
+// the grammar places each one as the sibling immediately after a ":" token,
+// with no field name of its own.
+func objcMessageArgs(n *sitter.Node) []*sitter.Node {
+	var args []*sitter.Node
+	for i := 0; i < int(n.ChildCount())-1; i++ {
+		if c := n.Child(i); c != nil && c.Type() == ":" {
+			if arg := n.Child(i + 1); arg != nil {
+				args = append(args, arg)
+			}
+		}
+	}
+	return args
+}
+
+// objcCallSites walks body for message_expression nodes and returns one
+// CallSite per send, receiver-qualified in astkit's usual "Receiver.callee"
+// form. self/super stay literal, matching how every other language keeps
+// its own receiver keyword explicit in the Callee (rustCallSites' "self",
+// csCallSites' "this"/"base").
+func objcCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
+	if body == nil {
+		return nil
+	}
+	var out []astkit.CallSite
+	internalast.WalkTree(body, func(n *sitter.Node) {
+		if n == nil || n.Type() != "message_expression" {
+			return
+		}
+		sel := objcCallSelector(n, src)
+		if sel == "" {
+			return
+		}
+		qual := objcReceiverQualifier(n.ChildByFieldName("receiver"), src)
+		args := objcMessageArgs(n)
+		var argToks []string
+		any := false
+		for _, a := range args {
+			v := argToken(a, src)
+			if v != "" {
+				any = true
+			}
+			argToks = append(argToks, v)
+		}
+		if !any {
+			argToks = nil
+		}
+		out = append(out, astkit.CallSite{
+			Callee: joinQualified(qual, sel),
+			Line:   int(n.StartPoint().Row) + 1,
+			Argc:   len(args),
+			Args:   argToks,
+		})
+	})
+	return out
+}
+
+// objcReceiverQualifier reduces a message send's receiver to one identifier:
+// a bare name (self, super, a local variable, or a class name) stays
+// literal; a nested message send (`[[Person alloc] init]`) reduces to its
+// own selector plus the "name()" call-result marker used elsewhere
+// (qualifierName's contract for other grammars).
+func objcReceiverQualifier(recv *sitter.Node, src []byte) string {
+	if recv == nil {
+		return ""
+	}
+	switch recv.Type() {
+	case "identifier":
+		return recv.Content(src)
+	case "message_expression":
+		if sel := objcCallSelector(recv, src); sel != "" {
+			return sel + "()"
+		}
+	}
+	return ""
 }
 
 // ─── Modifiers ───────────────────────────────────────────────────────────────

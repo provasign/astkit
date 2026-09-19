@@ -34,6 +34,9 @@ func Default() *astkit.Registry {
 	r.Register(NewCPP())
 	r.Register(NewCSharp())
 	r.Register(NewPHP())
+	r.Register(NewSwift())
+	r.Register(NewKotlin())
+	r.Register(NewObjC())
 	// Mainframe text strategies (no grammar; Extract accepts a nil tree).
 	r.Register(NewCOBOL())
 	r.Register(NewJCL())
@@ -599,6 +602,134 @@ func (p *phpStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.Im
 			}
 			imps = append(imps, imp)
 		}
+	})
+	return imps, nil
+}
+
+// ─── Swift ────────────────────────────────────────────────────────────────────
+
+type swiftStrategy struct{}
+
+func NewSwift() *swiftStrategy                        { return &swiftStrategy{} }
+func (s *swiftStrategy) Language() astkit.LanguageKey { return astkit.LangSwift }
+func (s *swiftStrategy) Extensions() []string         { return []string{".swift"} }
+func (s *swiftStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
+	if tree == nil {
+		return nil, nil
+	}
+	return extractSwiftNodes(tree.RootNode(), "", "", src, nil), nil
+}
+func (s *swiftStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.ImportStatement, error) {
+	if tree == nil {
+		return nil, nil
+	}
+	var imps []astkit.ImportStatement
+	internalast.WalkTree(tree.RootNode(), func(n *sitter.Node) {
+		if n.Type() != "import_declaration" {
+			return
+		}
+		raw := strings.TrimSpace(internalast.NodeText(n, src))
+		imps = append(imps, astkit.ImportStatement{
+			Raw: raw, Path: swiftImportPath(raw), Line: int(n.StartPoint().Row) + 1,
+		})
+	})
+	return imps, nil
+}
+
+// swiftImportPath strips the `import` keyword and an optional `import kind`
+// qualifier (`import struct Foundation.Date`) — Grove scopes Swift imports
+// at whole-module granularity, so the submodule/member suffix is kept but
+// not specially parsed.
+func swiftImportPath(raw string) string {
+	raw = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "import"))
+	for _, kw := range []string{"struct ", "class ", "enum ", "protocol ", "func ", "var ", "let ", "typealias "} {
+		if strings.HasPrefix(raw, kw) {
+			raw = strings.TrimPrefix(raw, kw)
+			break
+		}
+	}
+	return strings.TrimSpace(raw)
+}
+
+// ─── Kotlin ───────────────────────────────────────────────────────────────────
+
+type kotlinStrategy struct{}
+
+func NewKotlin() *kotlinStrategy                        { return &kotlinStrategy{} }
+func (k *kotlinStrategy) Language() astkit.LanguageKey { return astkit.LangKotlin }
+func (k *kotlinStrategy) Extensions() []string         { return []string{".kt", ".kts"} }
+func (k *kotlinStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
+	if tree == nil {
+		return nil, nil
+	}
+	return extractKotlinNodes(tree.RootNode(), "", "", src, nil), nil
+}
+func (k *kotlinStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.ImportStatement, error) {
+	if tree == nil {
+		return nil, nil
+	}
+	var imps []astkit.ImportStatement
+	internalast.WalkTree(tree.RootNode(), func(n *sitter.Node) {
+		if n.Type() != "import_header" {
+			return
+		}
+		raw := strings.TrimSpace(internalast.NodeText(n, src))
+		path, alias := kotlinImportPath(raw)
+		imps = append(imps, astkit.ImportStatement{
+			Raw: raw, Path: path, Alias: alias, Line: int(n.StartPoint().Row) + 1,
+		})
+	})
+	return imps, nil
+}
+
+func kotlinImportPath(raw string) (path, alias string) {
+	raw = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "import"))
+	if idx := strings.Index(raw, " as "); idx >= 0 {
+		alias = strings.TrimSpace(raw[idx+4:])
+		raw = strings.TrimSpace(raw[:idx])
+	}
+	return raw, alias
+}
+
+// ─── Objective-C ────────────────────────────────────────────────────────────
+
+type objcStrategy struct{}
+
+func NewObjC() *objcStrategy                        { return &objcStrategy{} }
+func (o *objcStrategy) Language() astkit.LanguageKey { return astkit.LangObjC }
+func (o *objcStrategy) Extensions() []string         { return []string{".m", ".mm"} }
+func (o *objcStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
+	if tree == nil {
+		return nil, nil
+	}
+	return extractObjCNodes(tree.RootNode(), "", "", src, nil), nil
+}
+func (o *objcStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.ImportStatement, error) {
+	if tree == nil {
+		return nil, nil
+	}
+	var imps []astkit.ImportStatement
+	internalast.WalkTree(tree.RootNode(), func(n *sitter.Node) {
+		if n.Type() != "preproc_include" {
+			return
+		}
+		raw := strings.TrimSpace(internalast.NodeText(n, src))
+		var path string
+		internalast.WalkTree(n, func(c *sitter.Node) {
+			if path != "" || c == nil {
+				return
+			}
+			switch c.Type() {
+			case "system_lib_string":
+				path = strings.Trim(internalast.NodeText(c, src), "<>")
+			case "string_literal":
+				path = strings.Trim(internalast.NodeText(c, src), `"`)
+			}
+		})
+		if path == "" {
+			return
+		}
+		imps = append(imps, astkit.ImportStatement{Raw: raw, Path: path, Line: int(n.StartPoint().Row) + 1})
 	})
 	return imps, nil
 }

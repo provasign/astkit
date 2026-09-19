@@ -13,11 +13,15 @@ import (
 	"github.com/smacker/go-tree-sitter/golang"
 	"github.com/smacker/go-tree-sitter/java"
 	"github.com/smacker/go-tree-sitter/javascript"
+	"github.com/smacker/go-tree-sitter/kotlin"
 	"github.com/smacker/go-tree-sitter/php"
 	"github.com/smacker/go-tree-sitter/python"
 	"github.com/smacker/go-tree-sitter/rust"
+	"github.com/smacker/go-tree-sitter/swift"
 	tstsx "github.com/smacker/go-tree-sitter/typescript/tsx"
 	tstype "github.com/smacker/go-tree-sitter/typescript/typescript"
+
+	"github.com/provasign/astkit/thirdparty/tsobjc"
 )
 
 // DefaultParseTimeout caps tree-sitter parse calls. Callers can override per
@@ -101,6 +105,12 @@ func treeSitterLanguage(lang LanguageKey) (*sitter.Language, bool) {
 		return csharp.GetLanguage(), true
 	case LangPHP:
 		return php.GetLanguage(), true
+	case LangSwift:
+		return swift.GetLanguage(), true
+	case LangKotlin:
+		return kotlin.GetLanguage(), true
+	case LangObjC:
+		return tsobjc.GetLanguage(), true
 	default:
 		return nil, false
 	}
