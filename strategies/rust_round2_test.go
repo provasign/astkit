@@ -1,6 +1,7 @@
 package strategies_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/provasign/astkit"
@@ -79,5 +80,23 @@ func TestRustTupleStructFieldsAreNumbered(t *testing.T) {
 	}
 	if !fields["0"].Exported || fields["1"].Exported {
 		t.Fatalf("tuple field visibility = 0:%v 1:%v", fields["0"].Exported, fields["1"].Exported)
+	}
+}
+
+// A const/static item is a symbol: its declared type (`&[&dyn Flag]`) is
+// what types `for flag in FLAGS.iter()` in Grove's local-type inference.
+func TestRustConstItemIsExtracted(t *testing.T) {
+	src := "pub(super) const FLAGS: &[&dyn Flag] = &[&AfterContext, &Binary];\nstatic COUNT: usize = 0;\n"
+	syms, _ := extract(t, astkit.LangRust, src)
+	got := map[string]astkit.Symbol{}
+	for _, s := range syms {
+		got[s.Name] = s
+	}
+	flags, ok := got["FLAGS"]
+	if !ok || flags.Kind != astkit.KindVariable || !strings.HasPrefix(flags.Signature, "pub(super) const FLAGS: &[&dyn Flag]") {
+		t.Fatalf("FLAGS = %+v", flags)
+	}
+	if c, ok := got["COUNT"]; !ok || c.Kind != astkit.KindVariable {
+		t.Fatalf("COUNT = %+v", c)
 	}
 }

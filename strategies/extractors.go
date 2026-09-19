@@ -1394,6 +1394,10 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 			rustStructFields(n, filePath, blobSHA, src, imports, out)
 		case "enum_item":
 			rustNamedItem(n, astkit.KindEnum, filePath, blobSHA, src, imports, out)
+		case "const_item", "static_item":
+			// `const FLAGS: &[&dyn Flag] = &[...]`: the declared type is
+			// what types `for flag in FLAGS.iter()` downstream.
+			rustNamedItem(n, astkit.KindVariable, filePath, blobSHA, src, imports, out)
 		case "trait_item":
 			rustNamedItem(n, astkit.KindTrait, filePath, blobSHA, src, imports, out)
 			// Trait bodies declare the methods dynamic dispatch goes
