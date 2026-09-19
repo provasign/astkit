@@ -149,8 +149,10 @@ func TestObjCChainedAllocInitCallSites(t *testing.T) {
 		for _, cs := range s.CallSites {
 			callees[cs.Callee] = true
 		}
-		if !callees["Person.alloc"] || !callees["alloc().initWithName:"] {
-			t.Fatalf("call sites = %+v, want Person.alloc and alloc().initWithName:", s.CallSites)
+		// The inner `[Person alloc]` yields a Person, so the outer send's
+		// receiver is written `Person()` — Grove's call-result form.
+		if !callees["Person.alloc"] || !callees["Person().initWithName:"] {
+			t.Fatalf("call sites = %+v, want Person.alloc and Person().initWithName:", s.CallSites)
 		}
 		return
 	}

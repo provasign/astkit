@@ -303,6 +303,13 @@ func argToken(c *sitter.Node, src []byte) string {
 		if fn := c.ChildByFieldName("function"); fn != nil && fn.Type() == "identifier" {
 			return "call:" + string(fn.Content(src))
 		}
+		// Swift/Kotlin: positional callee; `Type(...)` is a constructor
+		// call whose result is that type.
+		if c.NamedChildCount() > 0 {
+			if fn := c.NamedChild(0); fn != nil && fn.Type() == "simple_identifier" {
+				return "call:" + string(fn.Content(src))
+			}
+		}
 	}
 	return ""
 }
@@ -961,16 +968,72 @@ func rustPathQualifier(path *sitter.Node, src []byte) string {
 // CallSite per call. Nested closures/lambdas are covered (no separate scope
 // boundary is tracked), matching how other languages attribute lambda calls
 // to their enclosing declaration.
-func sharedNavCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
+//
+// labelArgs selects Swift's Args encoding: in Swift an argument label is
+// part of the callee's identity (`init(parseJSON:)` and `init(jsonObject:)`
+// are different functions, and the compiler tells same-arity overloads
+// apart by exactly these labels), so each Args entry is "label:value" —
+// "_" for an unlabeled argument — instead of the bare value token every
+// other language records. Kotlin passes false: its named arguments are
+// optional sugar that never distinguish overloads.
+func sharedNavCallSites(body *sitter.Node, src []byte, labelArgs bool) []astkit.CallSite {
 	if body == nil {
 		return nil
 	}
 	var out []astkit.CallSite
 	internalast.WalkTree(body, func(n *sitter.Node) {
-		if n == nil || n.Type() != "call_expression" || n.NamedChildCount() < 1 {
+		if n == nil {
 			return
 		}
-		callee := navCalleeName(n.NamedChild(0), src)
+		switch n.Type() {
+		case "check_expression":
+			// Kotlin `a in b` / `a !in b` desugars to `b.contains(a)` — an
+			// `operator fun contains` call with no call syntax at all.
+			if site, ok := navInOperatorSite(n, src, labelArgs); ok {
+				out = append(out, site)
+			}
+			return
+		case "additive_expression", "multiplicative_expression":
+			// Kotlin `a + b` is `a.plus(b)` when a's type declares
+			// `operator fun plus` (turtle's `Executable("ls") + args`).
+			// Swift operators are static functions, not methods — skip.
+			if !labelArgs {
+				if site, ok := navBinaryOperatorSite(n, src); ok {
+					out = append(out, site)
+				}
+			}
+			return
+		case "constructor_delegation_call":
+			// Kotlin `constructor(...) : this(...)` / `: super(...)`, the
+			// same forms Grove resolves for Java/C# as "this()"/"super()".
+			if n.ChildCount() > 0 {
+				if kw := n.Child(0); kw != nil && (kw.Type() == "this" || kw.Type() == "super") {
+					out = append(out, astkit.CallSite{
+						Callee: kw.Type() + "()",
+						Line:   int(n.StartPoint().Row) + 1,
+						Argc:   navValueArgumentCount(internalast.FindChildByType(n, "value_arguments")),
+					})
+				}
+			}
+			return
+		}
+		if n.Type() != "call_expression" || n.NamedChildCount() < 1 {
+			return
+		}
+		var callee string
+		if navIsSubscript(n, src) {
+			// `x[i]` is a call_expression whose suffix is bracketed: a
+			// subscript access, which Swift routes through the receiver
+			// type's `subscript` declaration (astkit names it exactly
+			// that). Read literally it would be a call to a function named
+			// after the receiver.
+			callee = joinQualified(navQualifierName(n.NamedChild(0), src), "subscript")
+			if callee == "subscript" {
+				return
+			}
+		} else {
+			callee = navCalleeName(n.NamedChild(0), src)
+		}
 		if callee == "" {
 			return
 		}
@@ -978,7 +1041,7 @@ func sharedNavCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			Callee: callee,
 			Line:   int(n.StartPoint().Row) + 1,
 			Argc:   navCallArgc(n),
-			Args:   navCallArgs(n, src),
+			Args:   navCallArgs(n, src, labelArgs),
 		})
 	})
 	return out
@@ -1047,9 +1110,92 @@ func navQualifierName(target *sitter.Node, src []byte) string {
 		if name == "" {
 			return ""
 		}
-		return name + "()"
+		// A call-result receiver is named by the call alone
+		// (`a.b(x).c()` → receiver "b()"), the convention Grove's
+		// call-result typing reads for every language; carrying the
+		// inner chain would make the qualifier unparseable.
+		return name[strings.LastIndexByte(name, '.')+1:] + "()"
 	}
 	return ""
+}
+
+// navInOperatorSite turns a Kotlin check_expression carrying `in`/`!in`
+// (not `is`) into the `rhs.contains(lhs)` call it denotes.
+func navInOperatorSite(n *sitter.Node, src []byte, labelArgs bool) (astkit.CallSite, bool) {
+	isIn := false
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if c := n.Child(i); c != nil && (c.Type() == "in" || c.Type() == "!in") {
+			isIn = true
+		}
+	}
+	if !isIn || n.NamedChildCount() < 2 {
+		return astkit.CallSite{}, false
+	}
+	qual := navQualifierName(n.NamedChild(1), src)
+	if qual == "" {
+		return astkit.CallSite{}, false
+	}
+	arg := argToken(n.NamedChild(0), src)
+	if labelArgs {
+		arg = "_:" + arg
+	}
+	return astkit.CallSite{
+		Callee: joinQualified(qual, "contains"),
+		Line:   int(n.StartPoint().Row) + 1,
+		Argc:   1,
+		Args:   []string{arg},
+	}, true
+}
+
+// kotlinBinaryOperators maps Kotlin's overloadable arithmetic operators to
+// the operator functions they invoke.
+var kotlinBinaryOperators = map[string]string{
+	"+": "plus", "-": "minus", "*": "times", "/": "div", "%": "rem",
+}
+
+// navBinaryOperatorSite turns `lhs <op> rhs` into the `lhs.<opfun>(rhs)`
+// call it denotes. A literal or nested-expression left operand has no
+// qualifier to resolve against and yields nothing.
+func navBinaryOperatorSite(n *sitter.Node, src []byte) (astkit.CallSite, bool) {
+	if n.ChildCount() != 3 || n.NamedChildCount() != 2 {
+		return astkit.CallSite{}, false
+	}
+	op := kotlinBinaryOperators[n.Child(1).Type()]
+	if op == "" {
+		return astkit.CallSite{}, false
+	}
+	qual := navQualifierName(n.NamedChild(0), src)
+	if qual == "" {
+		return astkit.CallSite{}, false
+	}
+	return astkit.CallSite{
+		Callee: joinQualified(qual, op),
+		Line:   int(n.StartPoint().Row) + 1,
+		Argc:   1,
+		Args:   []string{argToken(n.NamedChild(1), src)},
+	}, true
+}
+
+// navValueArgumentCount counts the value_argument children of a
+// value_arguments node (nil-safe).
+func navValueArgumentCount(args *sitter.Node) int {
+	if args == nil {
+		return 0
+	}
+	n := 0
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		if c := args.NamedChild(i); c != nil && c.Type() == "value_argument" {
+			n++
+		}
+	}
+	return n
+}
+
+// navIsSubscript reports whether a call_expression is a subscript access
+// (`x[i]`): its argument list is bracketed rather than parenthesized.
+func navIsSubscript(call *sitter.Node, src []byte) bool {
+	args := navCallArguments(call)
+	return args != nil && strings.HasPrefix(args.Content(src), "[")
 }
 
 // navCallArguments finds a call_expression's value_arguments node: the
@@ -1078,7 +1224,7 @@ func navCallArgc(call *sitter.Node) int {
 	return n
 }
 
-func navCallArgs(call *sitter.Node, src []byte) []string {
+func navCallArgs(call *sitter.Node, src []byte, labelArgs bool) []string {
 	args := navCallArguments(call)
 	if args == nil {
 		return nil
@@ -1094,7 +1240,17 @@ func navCallArgs(call *sitter.Node, src []byte) []string {
 		if nc := int(arg.NamedChildCount()); nc > 0 {
 			v = argToken(arg.NamedChild(nc-1), src)
 		}
-		if v != "" {
+		if labelArgs {
+			// The label is a value_argument_label child; its absence is an
+			// unlabeled (`_`) argument, which is itself a fact the callee's
+			// declaration must agree with.
+			label := "_"
+			if l := internalast.FindChildByType(arg, "value_argument_label"); l != nil {
+				label = strings.TrimSpace(l.Content(src))
+			}
+			v = label + ":" + v
+			any = true
+		} else if v != "" {
 			any = true
 		}
 		out = append(out, v)
@@ -1263,11 +1419,50 @@ func objcReceiverQualifier(recv *sitter.Node, src []byte) string {
 	case "identifier":
 		return recv.Content(src)
 	case "message_expression":
-		if sel := objcCallSelector(recv, src); sel != "" {
-			return sel + "()"
+		sel := objcCallSelector(recv, src)
+		if sel == "" {
+			return ""
+		}
+		// `[[Type alloc] init]`, `[[self alloc] initWith...]`, `[Type new]`:
+		// the inner send yields an instance of its receiver's class, so
+		// the outer send's receiver is that class — written `Type()`,
+		// the call-result form Grove types by name.
+		if objcSelectorReturnsReceiver(sel) && recv.NamedChildCount() > 0 {
+			if inner := recv.NamedChild(0); inner != nil {
+				switch inner.Type() {
+				case "identifier":
+					return inner.Content(src) + "()"
+				case "message_expression":
+					if q := objcReceiverQualifier(inner, src); strings.HasSuffix(q, "()") {
+						return q
+					}
+				}
+			}
+		}
+		return sel + "()"
+	case "field_expression":
+		// `[self.delegate foo]`: the receiver is the property, whose
+		// declared type the enclosing class's @interface carries.
+		if recv.NamedChildCount() >= 2 {
+			if base := recv.NamedChild(0); base != nil && base.Type() == "identifier" && base.Content(src) == "self" {
+				if field := recv.NamedChild(1); field != nil && field.Type() == "field_identifier" {
+					return field.Content(src)
+				}
+			}
 		}
 	}
 	return ""
+}
+
+// objcSelectorReturnsReceiver reports whether a selector, by Cocoa
+// convention, returns an instance of the receiver's own class: alloc, new,
+// init and initWith..., copy/mutableCopy, self, class.
+func objcSelectorReturnsReceiver(sel string) bool {
+	switch sel {
+	case "alloc", "new", "init", "copy", "mutableCopy", "self", "class", "sharedInstance":
+		return true
+	}
+	return strings.HasPrefix(sel, "initWith") || strings.HasPrefix(sel, "init:")
 }
 
 // ─── Modifiers ───────────────────────────────────────────────────────────────

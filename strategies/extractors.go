@@ -3143,19 +3143,31 @@ func swiftFunctionDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imp
 		Modifiers:      modifiers,
 		TypeParameters: swiftTypeParameters(n, src),
 		Annotations:    swiftAttributes(n, src),
-		CallSites:      sharedNavCallSites(body, src),
+		CallSites:      sharedNavCallSites(body, src, true),
 	})
 }
 
+// swiftInitDecl names the symbol after the enclosing type, not literally
+// "init" — Swift constructs an instance by calling the type name
+// (`Person(name: "x")`), never `init(...)` directly, so a caller's bare
+// callee is the type name. Naming every overload identically to its type,
+// the same convention astkit's Java/C# strategies already use for their
+// own constructors, is what lets Grove's name-indexed candidate lookup
+// (idx.byName[typeName]) find them at all; every overload keeping the
+// SAME name is also what makes arity-based overload narrowing
+// (declParamCount/filterByArgc, from each Symbol's own Signature) the
+// right and sufficient disambiguator downstream — no astkit-side change
+// needed there.
 func swiftInitDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
 	modifiers := swiftModifiers(n, src)
 	body := n.ChildByFieldName("body")
+	name := qualLast(implType)
 	*out = append(*out, astkit.Symbol{
-		Kind: astkit.KindConstructor, Name: "init", QualifiedName: "init",
+		Kind: astkit.KindConstructor, Name: name, QualifiedName: name,
 		Signature: funcSig(n, src), Span: internalast.NodeSpan(n),
-		Exported: swiftIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType),
+		Exported: swiftIsExported(modifiers), Body: n.Content(src), ParentName: name,
 		Modifiers: modifiers, Annotations: swiftAttributes(n, src),
-		CallSites: sharedNavCallSites(body, src),
+		CallSites: sharedNavCallSites(body, src, true),
 	})
 }
 
@@ -3164,16 +3176,19 @@ func swiftDeinitDecl(n *sitter.Node, filePath, blobSHA string, src []byte, impor
 	*out = append(*out, astkit.Symbol{
 		Kind: astkit.KindMethod, Name: "deinit", QualifiedName: "deinit",
 		Signature: "deinit", Span: internalast.NodeSpan(n),
-		Body: n.Content(src), ParentName: qualLast(implType), CallSites: sharedNavCallSites(body, src),
+		Body: n.Content(src), ParentName: qualLast(implType), CallSites: sharedNavCallSites(body, src, true),
 	})
 }
 
 func swiftSubscriptDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, out *[]astkit.Symbol) {
 	modifiers := swiftModifiers(n, src)
+	// A subscript's code lives in its get/set accessor blocks, not a single
+	// "body" field; walking the whole declaration reaches both.
 	*out = append(*out, astkit.Symbol{
 		Kind: astkit.KindMethod, Name: "subscript", QualifiedName: qualJoin(qualLast(implType), "subscript"),
 		Signature: internalast.FirstLine(n.Content(src)), Span: internalast.NodeSpan(n),
 		Exported: swiftIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType), Modifiers: modifiers,
+		CallSites: sharedNavCallSites(n, src, true),
 	})
 }
 
@@ -3305,8 +3320,57 @@ func kotlinVisit(node *sitter.Node, filePath, blobSHA string, src []byte, import
 			kotlinFunctionDecl(n, filePath, blobSHA, src, imports, implType, out)
 		case "property_declaration":
 			kotlinPropertyDecl(n, filePath, blobSHA, src, imports, implType, out)
+		case "secondary_constructor":
+			kotlinSecondaryConstructor(n, src, implType, out)
 		}
 	}
+}
+
+// kotlinConstructorSymbol emits a constructor named after its class (the
+// Java/C#/Swift convention: `Person(...)` is what a caller writes), with a
+// Signature of the form `Person(params)` so parameter parsing and arity
+// narrowing read it like any callable.
+func kotlinConstructorSymbol(className, qualified, params string, span astkit.LineRange, body string, modifiers []string, sites []astkit.CallSite, out *[]astkit.Symbol) {
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindConstructor, Name: className, QualifiedName: qualified,
+		Signature: className + strings.Join(strings.Fields(params), " "), Span: span,
+		Exported: kotlinIsExported(modifiers), Body: body, ParentName: className,
+		Modifiers: modifiers, CallSites: sites,
+	})
+}
+
+func kotlinPrimaryConstructorSites(pc, body *sitter.Node, src []byte) []astkit.CallSite {
+	var sites []astkit.CallSite
+	if pc != nil {
+		sites = append(sites, sharedNavCallSites(pc, src, false)...)
+	}
+	if body == nil {
+		return sites
+	}
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		c := body.NamedChild(i)
+		if c == nil {
+			continue
+		}
+		switch c.Type() {
+		case "anonymous_initializer":
+			sites = append(sites, sharedNavCallSites(c, src, false)...)
+		case "property_declaration":
+			if internalast.FindChildByType(c, "getter") == nil && internalast.FindChildByType(c, "setter") == nil {
+				sites = append(sites, sharedNavCallSites(c, src, false)...)
+			}
+		}
+	}
+	return sites
+}
+
+func kotlinSecondaryConstructor(n *sitter.Node, src []byte, implType string, out *[]astkit.Symbol) {
+	params := "()"
+	if p := internalast.FindChildByType(n, "function_value_parameters"); p != nil {
+		params = p.Content(src)
+	}
+	kotlinConstructorSymbol(qualLast(implType), implType, params, internalast.NodeSpan(n), n.Content(src),
+		kotlinModifiers(n, src), sharedNavCallSites(n, src, false), out)
 }
 
 func kotlinClassDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentChain string, out *[]astkit.Symbol) {
@@ -3337,12 +3401,32 @@ func kotlinClassDecl(n *sitter.Node, filePath, blobSHA string, src []byte, impor
 		TypeParameters: kotlinTypeParameters(n, src),
 		Annotations:    kotlinAnnotations(n, src),
 	})
-	if pc := internalast.FindChildByType(n, "primary_constructor"); pc != nil {
+	pc := internalast.FindChildByType(n, "primary_constructor")
+	if pc != nil {
 		kotlinPrimaryConstructorFields(pc, src, name, out)
 	}
 	body := internalast.FindChildByType(n, "class_body")
 	if body == nil {
 		body = internalast.FindChildByType(n, "enum_class_body")
+	}
+	if kind == astkit.KindClass {
+		// Every class has a constructor kotlinc emits and callers invoke as
+		// `Name(...)`: the primary one (its parameter list), or the implicit
+		// no-arg one when the class declares neither a primary nor a
+		// secondary constructor. Its span is the header, not the body, so
+		// a constructor site inside the class binds the constructor, not
+		// the class.
+		//
+		// kotlinc compiles parameter defaults, property initializers and
+		// `init` blocks into that constructor, so their calls are its
+		// call sites (property getters/setters run their own code).
+		sites := kotlinPrimaryConstructorSites(pc, body, src)
+		switch {
+		case pc != nil:
+			kotlinConstructorSymbol(name, qualJoin(parentChain, name), pc.Content(src), internalast.NodeSpan(pc), pc.Content(src), modifiers, sites, out)
+		case body == nil || internalast.FindChildByType(body, "secondary_constructor") == nil:
+			kotlinConstructorSymbol(name, qualJoin(parentChain, name), "()", internalast.NodeSpan(nameNode), name+"()", modifiers, sites, out)
+		}
 	}
 	if body == nil {
 		return
@@ -3460,7 +3544,7 @@ func kotlinFunctionDecl(n *sitter.Node, filePath, blobSHA string, src []byte, im
 		Modifiers:      modifiers,
 		TypeParameters: kotlinTypeParameters(n, src),
 		Annotations:    kotlinAnnotations(n, src),
-		CallSites:      sharedNavCallSites(body, src),
+		CallSites:      sharedNavCallSites(body, src, false),
 	})
 }
 
@@ -3695,32 +3779,72 @@ func objcMembers(n *sitter.Node, parentName string, src []byte, out *[]astkit.Sy
 			objcPropertyDecl(c, parentName, src, out)
 		case "method_declaration":
 			objcMethodDeclSym(c, parentName, src, out)
+		case "instance_variables":
+			objcInstanceVariables(c, parentName, src, out)
+		}
+	}
+}
+
+// objcInstanceVariables emits one field per declarator of an @interface's
+// or @implementation's `{ Type *a, *b; }` block.
+func objcInstanceVariables(block *sitter.Node, parentName string, src []byte, out *[]astkit.Symbol) {
+	for i := 0; i < int(block.NamedChildCount()); i++ {
+		iv := block.NamedChild(i)
+		if iv == nil || iv.Type() != "instance_variable" {
+			continue
+		}
+		if decl := internalast.FindChildByType(iv, "struct_declaration"); decl != nil {
+			objcFieldSymbols(decl, "", parentName, src, internalast.NodeSpan(iv), iv.Content(src), out)
+		}
+	}
+}
+
+// objcFieldSymbols emits one KindField per declarator of a
+// struct_declaration (`Type *a, *b;`), each with a single-declarator
+// Signature (`prefix Type *a;`) that Grove's ivar/property typing reads.
+func objcFieldSymbols(decl *sitter.Node, prefix, parentName string, src []byte, span astkit.LineRange, body string, out *[]astkit.Symbol) {
+	var typeParts []string
+	for i := 0; i < int(decl.ChildCount()); i++ {
+		c := decl.Child(i)
+		if c == nil {
+			continue
+		}
+		if c.Type() == "struct_declarator" {
+			var nameNode *sitter.Node
+			internalast.WalkTree(c, func(x *sitter.Node) {
+				if x != nil && x.Type() == "identifier" {
+					nameNode = x
+				}
+			})
+			if nameNode == nil {
+				continue
+			}
+			sig := strings.TrimSpace(prefix + " " + strings.Join(typeParts, " ") + " " + strings.Join(strings.Fields(c.Content(src)), "") + ";")
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindField, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
+				Signature: sig, Span: span, Exported: true, Body: body, ParentName: parentName,
+			})
+			continue
+		}
+		if c.IsNamed() {
+			typeParts = append(typeParts, strings.Join(strings.Fields(c.Content(src)), " "))
 		}
 	}
 }
 
 func objcPropertyDecl(n *sitter.Node, parentName string, src []byte, out *[]astkit.Symbol) {
 	// A @property line's "Type *name;" tail parses as a struct_declaration
-	// (this grammar reuses the C field-declaration shape for it); the
-	// first identifier inside it is the property name.
+	// (this grammar reuses the C field-declaration shape for it); each
+	// declarator (`T *a, *b;`) is a property.
 	decl := internalast.FindChildByType(n, "struct_declaration")
 	if decl == nil {
 		return
 	}
-	var nameNode *sitter.Node
-	internalast.WalkTree(decl, func(c *sitter.Node) {
-		if nameNode == nil && c != nil && c.Type() == "identifier" {
-			nameNode = c
-		}
-	})
-	if nameNode == nil {
-		return
+	prefix := "@property"
+	if attrs := internalast.FindChildByType(n, "property_attributes_declaration"); attrs != nil {
+		prefix += " " + strings.Join(strings.Fields(attrs.Content(src)), " ")
 	}
-	*out = append(*out, astkit.Symbol{
-		Kind: astkit.KindField, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
-		Signature: strings.Join(strings.Fields(n.Content(src)), " "), Span: internalast.NodeSpan(n),
-		Exported: true, Body: n.Content(src), ParentName: parentName,
-	})
+	objcFieldSymbols(decl, prefix, parentName, src, internalast.NodeSpan(n), n.Content(src), out)
 }
 
 func objcMethodDeclSym(n *sitter.Node, parentName string, src []byte, out *[]astkit.Symbol) {
@@ -3757,6 +3881,10 @@ func objcImplementationDecl(n *sitter.Node, src []byte, out *[]astkit.Symbol) {
 	className := nameNode.Content(src)
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)
+		if c != nil && c.Type() == "instance_variables" {
+			objcInstanceVariables(c, className, src, out)
+			continue
+		}
 		if c == nil || c.Type() != "implementation_definition" {
 			continue
 		}

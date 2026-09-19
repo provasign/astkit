@@ -86,7 +86,9 @@ func TestKotlinNestedClassIsQualifiedByOuter(t *testing.T) {
 	syms, _ := extract(t, astkit.LangKotlin, src)
 	byName := map[string]astkit.Symbol{}
 	for _, sym := range syms {
-		byName[sym.Name] = sym
+		if sym.Kind != astkit.KindConstructor {
+			byName[sym.Name] = sym
+		}
 	}
 	inner, ok := byName["Inner"]
 	if !ok || inner.ParentName != "Outer" || inner.QualifiedName != "Outer.Inner" {

@@ -655,7 +655,7 @@ func swiftImportPath(raw string) string {
 
 type kotlinStrategy struct{}
 
-func NewKotlin() *kotlinStrategy                        { return &kotlinStrategy{} }
+func NewKotlin() *kotlinStrategy                       { return &kotlinStrategy{} }
 func (k *kotlinStrategy) Language() astkit.LanguageKey { return astkit.LangKotlin }
 func (k *kotlinStrategy) Extensions() []string         { return []string{".kt", ".kts"} }
 func (k *kotlinStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
@@ -695,7 +695,7 @@ func kotlinImportPath(raw string) (path, alias string) {
 
 type objcStrategy struct{}
 
-func NewObjC() *objcStrategy                        { return &objcStrategy{} }
+func NewObjC() *objcStrategy                         { return &objcStrategy{} }
 func (o *objcStrategy) Language() astkit.LanguageKey { return astkit.LangObjC }
 func (o *objcStrategy) Extensions() []string         { return []string{".m", ".mm"} }
 func (o *objcStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol, error) {
