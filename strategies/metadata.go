@@ -188,6 +188,14 @@ func argToken(c *sitter.Node, src []byte) string {
 	switch c.Type() {
 	case "identifier", "simple_identifier":
 		return string(c.Content(src))
+	case "this", "self":
+		// `new Outer(this)` — a keyword node, not an identifier node, in
+		// every grammar here; the bare word is itself the token a consumer
+		// resolves against the enclosing type ("this" → the caller's own
+		// class). Without it the argument list came back empty and an
+		// overload taking the enclosing type was indistinguishable from
+		// every unrelated one.
+		return string(c.Content(src))
 	case "string_literal", "interpreted_string_literal", "raw_string_literal", "string",
 		"verbatim_string_literal", "interpolated_string_expression":
 		return "#String"

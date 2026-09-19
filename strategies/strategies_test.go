@@ -884,3 +884,28 @@ func keysOf(m map[string]astkit.Symbol) []string {
 	}
 	return out
 }
+
+// `new Outer(this)` records "this" as the argument (the keyword is its own
+// grammar node, not an identifier node), so a caller can type it against
+// the enclosing class — commons-io's `new WildcardFileFilter(this)` inside
+// its Builder.get().
+func TestExtract_Java_ThisArgumentToken(t *testing.T) {
+	src := `package x;
+public class Outer {
+  public static class Builder {
+    public Outer get() { return new Outer(this); }
+  }
+}
+`
+	syms, _ := extract(t, astkit.LangJava, src)
+	for _, s := range syms {
+		if s.Name != "get" {
+			continue
+		}
+		if len(s.CallSites) != 1 || len(s.CallSites[0].Args) != 1 || s.CallSites[0].Args[0] != "this" {
+			t.Fatalf("get() call sites = %+v", s.CallSites)
+		}
+		return
+	}
+	t.Fatalf("get() not extracted: %+v", syms)
+}

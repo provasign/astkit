@@ -43,6 +43,11 @@ calls it makes. Declarations inside an `extern "C" {` block and functions
 with a calling-convention macro between type and name (`int CDECL main()`)
 are extracted.
 
+A call argument that is the bare keyword `this`/`self` (v0.14.4+) is
+recorded as that word: it is its own grammar node in every language here,
+not an identifier node, so `new Outer(this)` used to carry an empty
+argument list. Consumers can now type it against the enclosing class.
+
 ## Usage
 
 ```go
