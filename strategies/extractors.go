@@ -2255,6 +2255,8 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			csMethodDecl(n, filePath, blobSHA, src, imports, parentClass, out)
 		case "property_declaration":
 			csPropertyDecl(n, filePath, blobSHA, src, imports, parentClass, parentInterface, out)
+		case "indexer_declaration":
+			csIndexerDecl(n, filePath, blobSHA, src, imports, parentClass, out)
 		case "field_declaration":
 			csFieldDecl(n, filePath, blobSHA, src, imports, parentClass, out)
 		case "file_scoped_namespace_declaration":
@@ -2416,22 +2418,78 @@ func csCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
 				if method == "" {
 					return ""
 				}
-				qual := qualifierName(fn.ChildByFieldName("expression"), src,
+				recv := fn.ChildByFieldName("expression")
+				qual := qualifierName(recv, src,
 					// tree-sitter-c-sharp names the receiver keywords plainly
 					// ("this", "base"); the *_expression spellings matched
 					// nothing, so base.WriteValue(v) arrived as a bare
 					// WriteValue and bound the caller's own overload family.
-					[]string{"identifier", "this", "base", "this_expression", "base_expression"},
+					// predefined_type: `string.Join(...)` is a static call on
+					// the runtime's String, never a bare Join.
+					[]string{"identifier", "this", "base", "this_expression", "base_expression", "predefined_type"},
 					map[string]string{"member_access_expression": "name"},
 					map[string]string{
 						"invocation_expression":      "function",
 						"object_creation_expression": "type",
 					})
+				if qual == "" {
+					qual = csTypedReceiver(recv, src)
+				}
 				return joinQualified(qual, method)
 			}
 			return ""
 		},
 	})
+}
+
+// csTypedReceiver names the static type of a receiver qualifierName cannot
+// reduce to an identifier, so the call does not arrive bare (a bare C# call
+// means implicit `this`): a string literal or interpolation is a `string`
+// (`"{0}".FormatWith(..)` binds the string extension), a cast names the
+// cast type (`((ICollection<JToken>)a).CopyTo(..)`). Returns "" otherwise.
+func csTypedReceiver(recv *sitter.Node, src []byte) string {
+	if recv == nil {
+		return ""
+	}
+	switch recv.Type() {
+	case "string_literal", "verbatim_string_literal", "interpolated_string_expression", "raw_string_literal":
+		return "string"
+	case "character_literal":
+		return "char"
+	case "boolean_literal":
+		return "bool"
+	case "parenthesized_expression":
+		for i := 0; i < int(recv.NamedChildCount()); i++ {
+			inner := recv.NamedChild(i)
+			if inner != nil && inner.Type() == "cast_expression" {
+				return csTypeLastName(inner.ChildByFieldName("type"), src)
+			}
+		}
+	case "element_access_expression":
+		// `o["x"].Children()` / `a[0].Replace(..)`: the receiver is an
+		// element of `o` — written "o[]", which Grove types by o's
+		// indexer or array element type.
+		base := recv.ChildByFieldName("expression")
+		if base == nil && recv.NamedChildCount() > 0 {
+			base = recv.NamedChild(0)
+		}
+		if base != nil {
+			switch base.Type() {
+			case "identifier", "this":
+				return base.Content(src) + "[]"
+			case "member_access_expression":
+				if name := base.ChildByFieldName("name"); name != nil {
+					return csNameToken(name, src) + "[]"
+				}
+			case "element_access_expression":
+				// rss["channel"]["item"].Children(): one "[]" per level.
+				if inner := csTypedReceiver(base, src); inner != "" {
+					return inner + "[]"
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // csNameToken reduces a member-access name (identifier or generic_name) to
@@ -2482,6 +2540,34 @@ func csTypeLastName(n *sitter.Node, src []byte) string {
 		text = text[i+1:]
 	}
 	return strings.TrimSpace(text)
+}
+
+// csIndexerDecl emits `public JToken this[string key] { get; set; }` as a
+// field named "this[]" whose Signature carries the element type, so an
+// element-access receiver (`o["x"].Children()`) can be typed by the
+// receiver's indexer.
+func csIndexerDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	raw := n.Content(src)
+	sig := raw
+	if i := strings.IndexByte(sig, '{'); i >= 0 {
+		sig = sig[:i]
+	}
+	if i := strings.Index(sig, "=>"); i >= 0 {
+		sig = sig[:i]
+	}
+	modifiers := csModifiers(n, src)
+	*out = append(*out, astkit.Symbol{
+		Kind:          astkit.KindField,
+		Name:          "this[]",
+		QualifiedName: qualJoin(parentClass, "this[]"),
+		Signature:     strings.Join(strings.Fields(sig), " "),
+		Span:          internalast.NodeSpan(n),
+		Exported:      csIsExported(modifiers),
+		Body:          raw,
+		ParentName:    qualLast(parentClass),
+		Modifiers:     modifiers,
+		Annotations:   csAttributes(n, src),
+	})
 }
 
 func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, parentInterface bool, out *[]astkit.Symbol) {

@@ -188,7 +188,8 @@ func argToken(c *sitter.Node, src []byte) string {
 	switch c.Type() {
 	case "identifier", "simple_identifier":
 		return string(c.Content(src))
-	case "string_literal", "interpreted_string_literal", "raw_string_literal", "string":
+	case "string_literal", "interpreted_string_literal", "raw_string_literal", "string",
+		"verbatim_string_literal", "interpolated_string_expression":
 		return "#String"
 	case "character_literal", "rune_literal":
 		return "#char"

@@ -463,8 +463,12 @@ func (c *csharpStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit
 		return nil, nil
 	}
 	var imps []astkit.ImportStatement
-	internalast.WalkChildren(tree.RootNode(), func(n *sitter.Node) {
-		if n.Type() != "using_directive" {
+	// `using` directives sit under a file-level `#if` (newtonsoft wraps
+	// whole test files in `#if !(NET20 || ...)`) and inside namespace
+	// blocks; walk the tree, not just the root's children, or such a
+	// file reports no imports at all.
+	internalast.WalkTree(tree.RootNode(), func(n *sitter.Node) {
+		if n == nil || n.Type() != "using_directive" {
 			return
 		}
 		raw := strings.TrimSpace(internalast.NodeText(n, src))
