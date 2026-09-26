@@ -909,3 +909,28 @@ public class Outer {
 	}
 	t.Fatalf("get() not extracted: %+v", syms)
 }
+
+// TestExtract_GoStructFields: named struct fields are KindField symbols
+// parented to their struct (gin Context.Errors was unfindable by name,
+// 2026-09-25). Multi-name declarations yield one symbol each; embedded
+// fields and struct tags stay out.
+func TestExtract_GoStructFields(t *testing.T) {
+	src := "package p\n\ntype Context struct {\n\tsync.Mutex\n\t// Errors is a list of errors.\n\tErrors errorMsgs `json:\"errors\"`\n\tA, b int\n}\n\ntype Alias int\n"
+	syms, _ := extract(t, astkit.LangGo, src)
+	fields := map[string]astkit.Symbol{}
+	for _, s := range syms {
+		if s.Kind == astkit.KindField {
+			fields[s.Name] = s
+		}
+	}
+	if len(fields) != 3 {
+		t.Fatalf("want fields Errors, A, b; got %v", fields)
+	}
+	e := fields["Errors"]
+	if e.ParentName != "Context" || e.Signature != "Errors errorMsgs" || !e.Exported || e.Span.Start != 6 {
+		t.Errorf("Errors field = %+v", e)
+	}
+	if fields["A"].Signature != "A int" || fields["b"].Exported {
+		t.Errorf("multi-name fields = %+v %+v", fields["A"], fields["b"])
+	}
+}

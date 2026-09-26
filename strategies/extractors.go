@@ -164,6 +164,53 @@ func goTypeDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			Body:           raw,
 			TypeParameters: goTypeParameters(spec, src),
 		})
+		if kind == astkit.KindStruct {
+			out = append(out, goStructFields(typeNode, name, src)...)
+		}
+	}
+	return out
+}
+
+// goStructFields emits one KindField per named field of a struct type, parented
+// to the struct. Go was the only field-bearing language with none indexed, so
+// `lookup Context.Errors` (a gin field) fell through to errorMsgs.Errors, another
+// type's method (2026-09-25). One symbol per name in `A, B int`. Embedded fields
+// have no name of their own and are skipped: naming them after their type would
+// put a second symbol under every embedded type's name. The signature is
+// "Name Type" without the struct tag, so tag text never reaches type matching.
+func goStructFields(structType *sitter.Node, parent string, src []byte) []astkit.Symbol {
+	list := internalast.FindChildByType(structType, "field_declaration_list")
+	if list == nil {
+		return nil
+	}
+	var out []astkit.Symbol
+	for i := 0; i < int(list.NamedChildCount()); i++ {
+		fd := list.NamedChild(i)
+		if fd == nil || fd.Type() != "field_declaration" {
+			continue
+		}
+		typeNode := fd.ChildByFieldName("type")
+		if typeNode == nil {
+			continue
+		}
+		typ := typeNode.Content(src)
+		for j := 0; j < int(fd.NamedChildCount()); j++ {
+			nameNode := fd.NamedChild(j)
+			if nameNode == nil || nameNode.Type() != "field_identifier" {
+				continue
+			}
+			name := nameNode.Content(src)
+			out = append(out, astkit.Symbol{
+				Kind:          astkit.KindField,
+				Name:          name,
+				QualifiedName: name,
+				ParentName:    parent,
+				Signature:     name + " " + typ,
+				Span:          internalast.NodeSpan(fd),
+				Exported:      internalast.IsCapitalized(name),
+				Body:          fd.Content(src),
+			})
+		}
 	}
 	return out
 }
