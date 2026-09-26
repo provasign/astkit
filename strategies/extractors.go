@@ -129,13 +129,14 @@ func goReceiverNamedType(n *sitter.Node, src []byte) string {
 	return ""
 }
 
-// goTypeDecl handles `type X struct{}`, `type X interface{}`, `type X Y`
-// and grouped `type (X ...; Y ...)` declarations.
+// goTypeDecl handles `type X struct{}`, `type X interface{}`, `type X Y`,
+// aliases (`type ID = string`, a type_alias node rather than a type_spec) and
+// grouped `type (X ...; Y ...)` declarations.
 func goTypeDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
 	for i := 0; i < int(n.ChildCount()); i++ {
 		spec := n.Child(i)
-		if spec == nil || spec.Type() != "type_spec" {
+		if spec == nil || (spec.Type() != "type_spec" && spec.Type() != "type_alias") {
 			continue
 		}
 		nameNode := spec.ChildByFieldName("name")
@@ -167,6 +168,45 @@ func goTypeDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 		if kind == astkit.KindStruct {
 			out = append(out, goStructFields(typeNode, name, src)...)
 		}
+		if kind == astkit.KindInterface {
+			out = append(out, goInterfaceMethods(typeNode, name, goTypeParameters(spec, src), src)...)
+		}
+	}
+	return out
+}
+
+// goInterfaceMethods emits one KindMethod per method element of an interface
+// type, parented to the interface: `lookup Reader.Read` otherwise fell back to
+// the whole interface. Embedded interfaces and type-set elements (`io.Closer`,
+// `~int | string`) declare no method name of their own and are skipped.
+// Methods of a generic interface (`type Store[T any] interface`) carry the
+// interface's type parameters, as a Go method has none of its own: T in
+// `Get(k string) T` is then a wildcard, and consumers can tell the contract
+// is generic from the member alone.
+func goInterfaceMethods(ifaceType *sitter.Node, parent string, typeParams []string, src []byte) []astkit.Symbol {
+	var out []astkit.Symbol
+	for i := 0; i < int(ifaceType.NamedChildCount()); i++ {
+		elem := ifaceType.NamedChild(i)
+		if elem == nil || elem.Type() != "method_elem" {
+			continue
+		}
+		nameNode := elem.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		name := nameNode.Content(src)
+		raw := elem.Content(src)
+		out = append(out, astkit.Symbol{
+			Kind:           astkit.KindMethod,
+			Name:           name,
+			QualifiedName:  name,
+			ParentName:     parent,
+			Signature:      internalast.FirstLine(raw),
+			Span:           internalast.NodeSpan(elem),
+			Exported:       internalast.IsCapitalized(name),
+			Body:           raw,
+			TypeParameters: typeParams,
+		})
 	}
 	return out
 }
@@ -223,40 +263,40 @@ func goConstDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports [
 		if spec == nil || spec.Type() != "const_spec" {
 			continue
 		}
-		nameNode := spec.ChildByFieldName("name")
-		if nameNode == nil {
-			continue
-		}
-		name := nameNode.Content(src)
 		raw := goStandaloneDecl("const", spec.Content(src))
-		out = append(out, astkit.Symbol{
-			Kind:          astkit.KindConst,
-			Name:          name,
-			QualifiedName: name,
-			Signature:     strings.TrimSpace(raw),
-			Span:          internalast.NodeSpan(spec),
-			Exported:      internalast.IsCapitalized(name),
-			Body:          raw,
-		})
+		for _, name := range goSpecNames(spec, src) {
+			out = append(out, astkit.Symbol{
+				Kind:          astkit.KindConst,
+				Name:          name,
+				QualifiedName: name,
+				Signature:     strings.TrimSpace(raw),
+				Span:          internalast.NodeSpan(spec),
+				Exported:      internalast.IsCapitalized(name),
+				Body:          raw,
+			})
+		}
 	}
 	return out
 }
 
-// goVarDecl handles `var X = ...` and grouped `var (X = ...; Y = ...)`.
+// goVarDecl handles `var X = ...`, `var X, Y = 1, 2` and grouped
+// `var (X = ...; Y = ...)`. The grammar wraps a grouped block's specs in a
+// var_spec_list (unlike const_spec), so a grouped block was indexed as nothing
+// at all — gin's `var ( ErrX = errors.New(...) )` sentinels among them.
 // Only package-level var declarations reach this function (called from the root walk).
 func goVarDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
 	for i := 0; i < int(n.ChildCount()); i++ {
 		spec := n.Child(i)
+		if spec != nil && spec.Type() == "var_spec_list" {
+			out = append(out, goVarDecl(spec, filePath, blobSHA, src, imports)...)
+			continue
+		}
 		if spec == nil || spec.Type() != "var_spec" {
 			continue
 		}
-		nameNode := spec.ChildByFieldName("name")
-		if nameNode == nil {
-			continue
-		}
 		raw := goStandaloneDecl("var", spec.Content(src))
-		for _, name := range goIdentifierNames(nameNode, src) {
+		for _, name := range goSpecNames(spec, src) {
 			out = append(out, astkit.Symbol{
 				Kind:          astkit.KindVariable,
 				Name:          name,
@@ -277,6 +317,22 @@ func goStandaloneDecl(keyword, raw string) string {
 		return raw
 	}
 	return keyword + " " + raw
+}
+
+// goSpecNames returns every name a var_spec or const_spec declares. The
+// grammar repeats the "name" field once per identifier (`var C, D = 1, 2`),
+// so ChildByFieldName("name") alone kept only C.
+func goSpecNames(spec *sitter.Node, src []byte) []string {
+	var names []string
+	for i := 0; i < int(spec.ChildCount()); i++ {
+		if spec.FieldNameForChild(i) != "name" {
+			continue
+		}
+		if c := spec.Child(i); c != nil {
+			names = append(names, goIdentifierNames(c, src)...)
+		}
+	}
+	return names
 }
 
 // goIdentifierNames extracts one or more identifier names from a node that may
@@ -742,6 +798,7 @@ func jsIsRequire(v *sitter.Node, src []byte) bool {
 func extractPythonNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
 	pythonVisit(root, filePath, blobSHA, src, imports, "", "", false, &out)
+	out = append(out, pythonModuleAssignments(root, src, out)...)
 	if top := pythonTopLevelSymbol(root, src); top != nil {
 		out = append(out, *top)
 	}
@@ -830,7 +887,9 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 		body := n.ChildByFieldName("body")
 		if body != nil {
 			classQualified := qualJoin(qualifier, className)
+			start := len(*out)
 			pythonVisit(body, filePath, blobSHA, src, imports, classQualified, classQualified, false, out)
+			*out = append(*out, pythonInstanceAttributes(body, classQualified, src, (*out)[start:])...)
 		}
 	case "decorated_definition":
 		decos := pythonDecorators(n, src)
@@ -938,6 +997,277 @@ func pythonVisitBlocks(n *sitter.Node, filePath, blobSHA string, src []byte, imp
 			pythonVisitBlocks(c, filePath, blobSHA, src, imports, parentClass, qualifier, inFunction, out)
 		}
 	}
+}
+
+// pythonModuleAssignments indexes plain module-level assignments
+// (`MAX_RETRIES = 3`, `Alias = dict[str, int]`, `a, b = 1, 2`,
+// `_default_text_stdout = _make_cached_stream_func(...)`), including those
+// under module-level if/try/with/for/while/match blocks, as KindVariable; a
+// name bound to a lambda is a KindFunction. Only annotated globals were indexed
+// before, on the theory that plain `x = 5` is config noise at scale — but an
+// agent looking up a click module global got nothing (2026-09-26).
+//
+// It runs after the definition walk and appends, so it never shifts the ID of
+// an existing symbol. The first binding of a name wins; a name also defined by
+// a module-level def/class/annotated assignment keeps that symbol alone
+// (`f = wraps(f)` rebinding is not a second declaration), and a name bound by
+// an import (`except ImportError: json = None`) is not a declaration here.
+// The symbols carry the "module-value" modifier: they add no uses-type edges.
+func pythonModuleAssignments(root *sitter.Node, src []byte, existing []astkit.Symbol) []astkit.Symbol {
+	taken := map[string]bool{}
+	for _, s := range existing {
+		if s.ParentName == "" {
+			taken[s.QualifiedName] = true
+		}
+	}
+	for name := range pythonImportBindings(root, src) {
+		taken[name] = true
+	}
+	var out []astkit.Symbol
+	var visit func(*sitter.Node)
+	visit = func(block *sitter.Node) {
+		for i := 0; i < int(block.ChildCount()); i++ {
+			n := block.Child(i)
+			if n == nil {
+				continue
+			}
+			switch n.Type() {
+			case "if_statement", "try_statement", "with_statement",
+				"while_statement", "for_statement", "match_statement":
+				pythonEachBlock(n, visit)
+			case "expression_statement":
+				for j := 0; j < int(n.ChildCount()); j++ {
+					a := n.Child(j)
+					if a == nil || a.Type() != "assignment" || a.ChildByFieldName("type") != nil {
+						continue
+					}
+					for _, bound := range pythonAssignedNames(a) {
+						if bound.name.Type() != "identifier" {
+							continue
+						}
+						name := bound.name.Content(src)
+						if taken[name] {
+							continue
+						}
+						taken[name] = true
+						kind := astkit.KindVariable
+						if bound.value != nil && bound.value.Type() == "lambda" {
+							kind = astkit.KindFunction
+						}
+						raw := n.Content(src)
+						out = append(out, astkit.Symbol{
+							Kind:          kind,
+							Name:          name,
+							QualifiedName: name,
+							Signature:     internalast.FirstLine(raw),
+							Span:          internalast.NodeSpan(n),
+							Exported:      !strings.HasPrefix(name, "_"),
+							Body:          raw,
+							Modifiers:     append(pythonModifiers(name), "module-value"),
+						})
+					}
+				}
+			}
+		}
+	}
+	visit(root)
+	return out
+}
+
+// pythonEachBlock calls fn on every block of a compound statement, including
+// the blocks of its elif/else/except/finally/case clauses.
+func pythonEachBlock(n *sitter.Node, fn func(*sitter.Node)) {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil {
+			continue
+		}
+		switch {
+		case c.Type() == "block":
+			fn(c)
+		case strings.HasSuffix(c.Type(), "_clause"):
+			pythonEachBlock(c, fn)
+		}
+	}
+}
+
+type pythonBinding struct {
+	name  *sitter.Node // identifier, or attribute for self.x targets
+	value *sitter.Node // the right-hand side when the target is a lone name
+}
+
+// pythonAssignedNames returns the targets an assignment binds: `a = 1`,
+// `a, b = 1, 2`, `[a, b] = ...`, and each link of `a = b = 1`. Subscript and
+// starred targets bind no new name and are skipped; attribute targets are
+// returned as attribute nodes for the caller to filter.
+func pythonAssignedNames(a *sitter.Node) []pythonBinding {
+	var out []pythonBinding
+	for a != nil && a.Type() == "assignment" {
+		left, right := a.ChildByFieldName("left"), a.ChildByFieldName("right")
+		if left == nil {
+			break
+		}
+		switch left.Type() {
+		case "identifier", "attribute":
+			value := right
+			if value != nil && value.Type() == "assignment" {
+				value = nil
+			}
+			out = append(out, pythonBinding{name: left, value: value})
+		case "pattern_list", "tuple_pattern", "list_pattern":
+			for k := 0; k < int(left.NamedChildCount()); k++ {
+				if el := left.NamedChild(k); el != nil && (el.Type() == "identifier" || el.Type() == "attribute") {
+					out = append(out, pythonBinding{name: el})
+				}
+			}
+		}
+		a = right
+	}
+	return out
+}
+
+// pythonImportBindings returns the module-scope names bound by import
+// statements, including imports nested in module-level try/if blocks.
+func pythonImportBindings(root *sitter.Node, src []byte) map[string]bool {
+	out := map[string]bool{}
+	var visit func(*sitter.Node)
+	visit = func(block *sitter.Node) {
+		for i := 0; i < int(block.ChildCount()); i++ {
+			n := block.Child(i)
+			if n == nil {
+				continue
+			}
+			switch n.Type() {
+			case "if_statement", "try_statement", "with_statement",
+				"while_statement", "for_statement", "match_statement":
+				pythonEachBlock(n, visit)
+			case "import_statement", "import_from_statement":
+				for j := 0; j < int(n.ChildCount()); j++ {
+					if n.FieldNameForChild(j) != "name" {
+						continue
+					}
+					c := n.Child(j)
+					if c == nil {
+						continue
+					}
+					if c.Type() == "aliased_import" {
+						if alias := c.ChildByFieldName("alias"); alias != nil {
+							out[alias.Content(src)] = true
+						}
+						continue
+					}
+					// `import os.path` binds os; `from m import a` binds a.
+					name := c.Content(src)
+					if n.Type() == "import_statement" {
+						name, _, _ = strings.Cut(name, ".")
+					}
+					out[strings.TrimSpace(name)] = true
+				}
+			}
+		}
+	}
+	visit(root)
+	return out
+}
+
+// pythonInstanceAttributes indexes the instance attributes a class's
+// __init__ assigns through its receiver (`self.db = db`, `self.a, self.b =
+// ...`, `self.x: int = 0`, including under if/try/with blocks) as KindField
+// parented to the class. Only __init__ is read: it is where Python classes
+// declare their instance state, and other methods' assignments are mostly
+// updates of it. The first assignment wins, and a name the class body already
+// declares (a class attribute, dataclass field or method) keeps that symbol.
+// Nested defs, lambdas and classes are not descended: their `self` is not
+// this instance. The fields carry the "instance-attr" modifier and add no
+// uses-type edges.
+func pythonInstanceAttributes(classBody *sitter.Node, classQualified string, src []byte, members []astkit.Symbol) []astkit.Symbol {
+	var init *sitter.Node
+	for i := 0; i < int(classBody.ChildCount()) && init == nil; i++ {
+		c := classBody.Child(i)
+		if c != nil && c.Type() == "decorated_definition" {
+			c = c.ChildByFieldName("definition")
+		}
+		if c == nil || c.Type() != "function_definition" {
+			continue
+		}
+		if nm := c.ChildByFieldName("name"); nm != nil && nm.Content(src) == "__init__" {
+			init = c
+		}
+	}
+	if init == nil {
+		return nil
+	}
+	params := init.ChildByFieldName("parameters")
+	body := init.ChildByFieldName("body")
+	if params == nil || body == nil || params.NamedChildCount() == 0 {
+		return nil
+	}
+	self := params.NamedChild(0)
+	if self == nil || self.Type() != "identifier" {
+		return nil
+	}
+	receiver := self.Content(src)
+	taken := map[string]bool{}
+	for _, m := range members {
+		taken[m.QualifiedName] = true
+	}
+	parent := qualLast(classQualified)
+	var out []astkit.Symbol
+	var visit func(*sitter.Node)
+	visit = func(block *sitter.Node) {
+		for i := 0; i < int(block.ChildCount()); i++ {
+			n := block.Child(i)
+			if n == nil {
+				continue
+			}
+			switch n.Type() {
+			case "if_statement", "try_statement", "with_statement",
+				"while_statement", "for_statement", "match_statement":
+				pythonEachBlock(n, visit)
+			case "expression_statement":
+				for j := 0; j < int(n.ChildCount()); j++ {
+					a := n.Child(j)
+					if a == nil || a.Type() != "assignment" {
+						continue
+					}
+					for _, bound := range pythonAssignedNames(a) {
+						target := bound.name
+						if target.Type() != "attribute" {
+							continue
+						}
+						obj, attr := target.ChildByFieldName("object"), target.ChildByFieldName("attribute")
+						if obj == nil || attr == nil || obj.Type() != "identifier" || obj.Content(src) != receiver {
+							continue
+						}
+						name := attr.Content(src)
+						qn := qualJoin(classQualified, name)
+						if taken[qn] {
+							continue
+						}
+						taken[qn] = true
+						raw := n.Content(src)
+						sig := name
+						if typeNode := a.ChildByFieldName("type"); typeNode != nil && target == a.ChildByFieldName("left") {
+							sig = name + ": " + typeNode.Content(src)
+						}
+						out = append(out, astkit.Symbol{
+							Kind:          astkit.KindField,
+							Name:          name,
+							QualifiedName: qn,
+							Signature:     sig,
+							Span:          internalast.NodeSpan(n),
+							Exported:      !strings.HasPrefix(name, "_"),
+							Body:          raw,
+							ParentName:    parent,
+							Modifiers:     append(pythonModifiers(name), "instance-attr"),
+						})
+					}
+				}
+			}
+		}
+	}
+	visit(body)
+	return out
 }
 
 func pythonTopLevelSymbol(root *sitter.Node, src []byte) *astkit.Symbol {
@@ -1470,21 +1800,41 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 				rustVisit(body, filePath, blobSHA, src, imports, "", nil, "", out)
 				for j := start; j < len(*out); j++ {
 					sym := &(*out)[j]
-					sym.QualifiedName = qualJoin(scope, sym.QualifiedName)
+					sym.QualifiedName = rustScopeQualify(scope, sym)
 					if sym.ParentName == "" {
 						sym.ParentName = name
 					}
 				}
 			}
-		case "struct_item":
+		case "struct_item", "union_item":
+			// A union is a struct whose fields share storage; like C's
+			// union_specifier it is indexed as a struct with its fields.
 			rustNamedItem(n, astkit.KindStruct, filePath, blobSHA, src, imports, out)
 			rustStructFields(n, filePath, blobSHA, src, imports, out)
 		case "enum_item":
 			rustNamedItem(n, astkit.KindEnum, filePath, blobSHA, src, imports, out)
+			rustEnumVariants(n, src, out)
+		case "macro_definition":
+			// macro_rules! name { ... }: a named item callers invoke as name!.
+			rustNamedItem(n, astkit.KindMacro, filePath, blobSHA, src, imports, out)
 		case "const_item", "static_item":
 			// `const FLAGS: &[&dyn Flag] = &[...]`: the declared type is
-			// what types `for flag in FLAGS.iter()` downstream.
-			rustNamedItem(n, astkit.KindVariable, filePath, blobSHA, src, imports, out)
+			// what types `for flag in FLAGS.iter()` downstream. A const is
+			// KindConst; a static is a variable. Inside an impl or trait
+			// (`impl X { const UNIT: u8 = 1; }`, `trait T { const N: usize; }`)
+			// it is an associated item of that type: X.UNIT, T.N.
+			kind := astkit.KindVariable
+			if n.Type() == "const_item" {
+				kind = astkit.KindConst
+			}
+			rustNamedItem(n, kind, filePath, blobSHA, src, imports, out)
+			rustParentLast(n, implType, out)
+		case "associated_type":
+			// `trait T { type Key; }`: the trait's associated type, T.Key.
+			if implType != "" {
+				rustNamedItem(n, astkit.KindType, filePath, blobSHA, src, imports, out)
+				rustParentLast(n, implType, out)
+			}
 		case "trait_item":
 			rustNamedItem(n, astkit.KindTrait, filePath, blobSHA, src, imports, out)
 			// Trait bodies declare the methods dynamic dispatch goes
@@ -1517,6 +1867,8 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 			})
 		case "type_item":
 			rustNamedItem(n, astkit.KindType, filePath, blobSHA, src, imports, out)
+			// `impl Storage for Mem { type Key = String; }`: Mem.Key.
+			rustParentLast(n, implType, out)
 		case "impl_item":
 			rustImplItem(n, filePath, blobSHA, src, imports, out)
 		case "mod_item":
@@ -1536,13 +1888,73 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 				rustVisit(body, filePath, blobSHA, src, imports, implType, implBounds, implTrait, out)
 				for j := start; j < len(*out); j++ {
 					sym := &(*out)[j]
-					sym.QualifiedName = qualJoin(moduleName, sym.QualifiedName)
+					sym.QualifiedName = rustScopeQualify(moduleName, sym)
 					if sym.ParentName == "" && (sym.Kind == astkit.KindFunction || sym.Kind == astkit.KindModule) {
 						sym.ParentName = moduleName
 					}
 				}
 			}
 		}
+	}
+}
+
+// rustScopeQualify prefixes a symbol found inside a module or function body
+// with that scope. A member (field, method, associated item) whose qualified
+// name is still its bare name keeps its owner type in the path: `mod net {
+// struct Conn { addr: String } impl Conn { fn open() {} } }` gives
+// net.Conn.addr and net.Conn.open, where prefixing the bare name alone gave
+// net.addr and net.open and lost Conn.
+func rustScopeQualify(scope string, sym *astkit.Symbol) string {
+	if sym.ParentName != "" && sym.QualifiedName == sym.Name {
+		return qualJoin(scope, qualJoin(rustImplBaseName(sym.ParentName), sym.Name))
+	}
+	return qualJoin(scope, sym.QualifiedName)
+}
+
+// rustParentLast parents the symbol rustNamedItem just appended for n to the
+// enclosing impl or trait type, when there is one.
+func rustParentLast(n *sitter.Node, implType string, out *[]astkit.Symbol) {
+	if implType == "" || len(*out) == 0 || n.ChildByFieldName("name") == nil {
+		return
+	}
+	(*out)[len(*out)-1].ParentName = implType
+}
+
+// rustEnumVariants emits one KindField per enum variant, parented to the
+// enum, so Mode::Fast is findable as Mode.Fast (variants are the enum's
+// members, as enum constants are for Java and Python). The "enum-variant"
+// modifier keeps them out of uses-type edges and struct-field typing.
+func rustEnumVariants(n *sitter.Node, src []byte, out *[]astkit.Symbol) {
+	nameNode := n.ChildByFieldName("name")
+	body := n.ChildByFieldName("body")
+	if nameNode == nil || body == nil {
+		return
+	}
+	enumName := nameNode.Content(src)
+	exported := strings.HasPrefix(strings.TrimSpace(n.Content(src)), "pub")
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		v := body.NamedChild(i)
+		if v == nil || v.Type() != "enum_variant" {
+			continue
+		}
+		vn := v.ChildByFieldName("name")
+		if vn == nil {
+			continue
+		}
+		name := vn.Content(src)
+		raw := v.Content(src)
+		*out = append(*out, astkit.Symbol{
+			Kind:          astkit.KindField,
+			Name:          name,
+			QualifiedName: name,
+			Signature:     internalast.FirstLine(raw),
+			Span:          internalast.NodeSpan(v),
+			Exported:      exported,
+			Body:          raw,
+			ParentName:    enumName,
+			Modifiers:     []string{"enum-variant"},
+			Annotations:   rustAttributes(v, src),
+		})
 	}
 }
 

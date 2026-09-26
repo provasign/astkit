@@ -836,12 +836,13 @@ plain_global = 3
 	if byQN["User._private"].Exported {
 		t.Error("_private should not be exported")
 	}
-	// Module contract preserved: annotated global indexed, plain global not.
+	// Module globals: annotated and plain are both indexed (plain ones since
+	// 2026-09-26, see pythonModuleAssignments).
 	if _, ok := byQN["g"]; !ok {
 		t.Error("annotated module global lost")
 	}
-	if _, ok := byQN["plain_global"]; ok {
-		t.Error("plain module global should stay unindexed")
+	if _, ok := byQN["plain_global"]; !ok {
+		t.Error("plain module global not indexed")
 	}
 }
 
