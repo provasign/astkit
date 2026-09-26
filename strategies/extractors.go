@@ -1854,7 +1854,14 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 				out = append(out, cStructFields(n, sym.Name, src)...)
 			}
 		case "enum_specifier":
+			parent := ""
 			if sym := cTaggedTypeSym(n, astkit.KindEnum, filePath, blobSHA, language, src, imports); sym != nil {
+				out = append(out, *sym)
+				parent = sym.Name
+			}
+			out = append(out, cEnumMembers(n, parent, src)...)
+		case "alias_declaration":
+			if sym := cppAliasSym(n, "", src); sym != nil {
 				out = append(out, *sym)
 			}
 		case "type_definition":
@@ -1888,7 +1895,13 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 			// another #ifdef). Everything Unity's unity.h and jansson.h
 			// declare lives inside one; not descending hid all of it.
 			if body := n.ChildByFieldName("body"); body != nil {
-				out = append(out, extractCNodes(body, filePath, blobSHA, language, src, imports)...)
+				if body.Type() == "declaration_list" {
+					out = append(out, extractCNodes(body, filePath, blobSHA, language, src, imports)...)
+				} else {
+					// `extern "C" int LLVMFuzzerTestOneInput(...) { ... }`:
+					// the body is the one definition or declaration itself.
+					out = append(out, extractCNodes(n, filePath, blobSHA, language, src, imports)...)
+				}
 			}
 		}
 	}
@@ -2144,7 +2157,7 @@ func cDeclaratorName(n *sitter.Node, src []byte) string {
 	switch n.Type() {
 	case "identifier", "field_identifier":
 		return n.Content(src)
-	case "pointer_declarator", "function_declarator",
+	case "pointer_declarator", "function_declarator", "reference_declarator",
 		"abstract_pointer_declarator", "qualified_identifier":
 		for i := 0; i < int(n.ChildCount()); i++ {
 			if name := cDeclaratorName(n.Child(i), src); name != "" {
@@ -2155,6 +2168,10 @@ func cDeclaratorName(n *sitter.Node, src []byte) string {
 		return n.Content(src)
 	case "operator_name": // C++ operator overload
 		return n.Content(src)
+	case "operator_cast": // C++ conversion operator: `operator bool() const`
+		if t := n.ChildByFieldName("type"); t != nil {
+			return "operator " + strings.Join(strings.Fields(t.Content(src)), " ")
+		}
 	}
 	return ""
 }
@@ -2167,7 +2184,7 @@ func cDeclarationSyms(n *sitter.Node, filePath, blobSHA, language string, src []
 		if child == nil {
 			continue
 		}
-		if child.Type() == "function_declarator" {
+		if child.Type() == "function_declarator" || child.Type() == "operator_cast" {
 			name := cDeclaratorName(child, src)
 			if name == "" {
 				continue
@@ -2197,30 +2214,26 @@ func cTypedefSyms(n *sitter.Node, filePath, blobSHA, language string, src []byte
 	if declaratorNode == nil {
 		return nil
 	}
-	name := ""
-	switch declaratorNode.Type() {
-	case "type_identifier":
-		name = declaratorNode.Content(src)
-	default:
-		// Pointer typedef: typedef struct {...} *PName — find type_identifier child.
-		for i := 0; i < int(declaratorNode.ChildCount()); i++ {
-			if c := declaratorNode.Child(i); c != nil && c.Type() == "type_identifier" {
-				name = c.Content(src)
-				break
-			}
-		}
-	}
+	name := cTypedefName(declaratorNode, src)
 	if name == "" {
 		return nil
 	}
 	kind := astkit.KindType
-	if typeNode := n.ChildByFieldName("type"); typeNode != nil {
+	var modifiers []string
+	typeNode := n.ChildByFieldName("type")
+	if typeNode != nil {
 		switch typeNode.Type() {
 		case "struct_specifier", "union_specifier":
 			kind = astkit.KindStruct
 		case "enum_specifier":
 			kind = astkit.KindEnum
 		}
+	}
+	if kind == astkit.KindType && !cTypedefNameIsDirect(declaratorNode) {
+		// `typedef int (*compare_fn)(const void *, const void *);` and array
+		// typedefs were never indexed: the name sits below a function or
+		// array declarator. New alias symbols are declaration-only.
+		modifiers = []string{"type-alias"}
 	}
 	raw := n.Content(src)
 	out := []astkit.Symbol{{
@@ -2231,11 +2244,127 @@ func cTypedefSyms(n *sitter.Node, filePath, blobSHA, language string, src []byte
 		Span:          internalast.NodeSpan(n),
 		Exported:      true,
 		Body:          raw,
+		Modifiers:     modifiers,
 	}}
-	if kind == astkit.KindStruct && language == "c" {
-		out = append(out, cStructFields(n.ChildByFieldName("type"), name, src)...)
+	// `typedef struct list { ... } list_t;` declares two names for one
+	// type: code writes `struct list` as often as `list_t`, so the tag is a
+	// symbol of its own with the members parented to it too.
+	tag := ""
+	if typeNode != nil && kind != astkit.KindType {
+		if tn := typeNode.ChildByFieldName("name"); tn != nil && typeNode.ChildByFieldName("body") != nil {
+			tag = tn.Content(src)
+		}
+	}
+	if tag != "" && tag != name {
+		out = append(out, astkit.Symbol{
+			Kind: kind, Name: tag, QualifiedName: tag,
+			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(n),
+			Exported: true, Body: raw,
+		})
+	}
+	switch {
+	case kind == astkit.KindStruct && language == "c":
+		out = append(out, cStructFields(typeNode, name, src)...)
+		if tag != "" && tag != name {
+			out = append(out, cStructFields(typeNode, tag, src)...)
+		}
+	case kind == astkit.KindEnum:
+		parent := name
+		if tag != "" {
+			parent = tag
+		}
+		out = append(out, cEnumMembers(typeNode, parent, src)...)
 	}
 	return out
+}
+
+// cTypedefNameIsDirect reports the typedef shapes indexed before 2026-09-26
+// (`T`, `*T`): the alias name is the declarator or its direct child.
+func cTypedefNameIsDirect(d *sitter.Node) bool {
+	if d.Type() == "type_identifier" {
+		return true
+	}
+	for i := 0; i < int(d.ChildCount()); i++ {
+		if c := d.Child(i); c != nil && c.Type() == "type_identifier" {
+			return true
+		}
+	}
+	return false
+}
+
+// cTypedefName unwraps the declarator of a typedef down to the alias name:
+// `T`, `*PT`, `(*fn)(int)`, `arr[4]`.
+func cTypedefName(d *sitter.Node, src []byte) string {
+	for d != nil {
+		switch d.Type() {
+		case "type_identifier", "primitive_type":
+			return d.Content(src)
+		case "pointer_declarator", "array_declarator", "parenthesized_declarator",
+			"function_declarator", "attributed_declarator", "reference_declarator":
+			next := d.ChildByFieldName("declarator")
+			if next == nil {
+				for i := 0; i < int(d.NamedChildCount()); i++ {
+					if c := d.NamedChild(i); c != nil && (strings.HasSuffix(c.Type(), "declarator") || c.Type() == "type_identifier") {
+						next = c
+						break
+					}
+				}
+			}
+			d = next
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+// cEnumMembers emits each enumerator of an enum_specifier as a KindConst
+// parented to the enum (C `color.RED`, C++ `Color::Red` once Grove applies
+// its separator). An anonymous enum's constants are parentless: in C they
+// are file-scope names, found by their bare name either way.
+func cEnumMembers(spec *sitter.Node, parent string, src []byte) []astkit.Symbol {
+	if spec == nil {
+		return nil
+	}
+	body := spec.ChildByFieldName("body")
+	if body == nil {
+		return nil
+	}
+	var out []astkit.Symbol
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		e := body.NamedChild(i)
+		if e == nil || e.Type() != "enumerator" {
+			continue
+		}
+		nameNode := e.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		name := nameNode.Content(src)
+		raw := e.Content(src)
+		out = append(out, astkit.Symbol{
+			Kind: astkit.KindConst, Name: name, QualifiedName: name, ParentName: parent,
+			Signature: strings.TrimSpace(raw), Span: internalast.NodeSpan(e),
+			Exported: true, Body: raw, Modifiers: []string{"enum-constant"},
+		})
+	}
+	return out
+}
+
+// cppAliasSym indexes `using X = T;` as a KindType alias, parented to its
+// class when declared in one.
+func cppAliasSym(n *sitter.Node, parent string, src []byte) *astkit.Symbol {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return nil
+	}
+	name := nameNode.Content(src)
+	raw := n.Content(src)
+	return &astkit.Symbol{
+		Kind: astkit.KindType, Name: name, QualifiedName: name, ParentName: parent,
+		Signature: strings.TrimSpace(raw), Span: internalast.NodeSpan(n),
+		Exported: true, Body: raw, Modifiers: []string{"type-alias"},
+	}
 }
 
 // cFieldDeclSyms emits one KindField per declarator of a C/C++ struct, union
@@ -2380,6 +2509,9 @@ func cFileVarSyms(n *sitter.Node, src []byte) []astkit.Symbol {
 
 // cStructFields emits the members of a struct/union body parented to parent.
 func cStructFields(specifier *sitter.Node, parent string, src []byte) []astkit.Symbol {
+	if specifier == nil {
+		return nil
+	}
 	body := specifier.ChildByFieldName("body")
 	if body == nil || parent == "" {
 		return nil
@@ -2388,6 +2520,62 @@ func cStructFields(specifier *sitter.Node, parent string, src []byte) []astkit.S
 	for i := 0; i < int(body.NamedChildCount()); i++ {
 		if fd := body.NamedChild(i); fd != nil && fd.Type() == "field_declaration" {
 			out = append(out, cFieldDeclSyms(fd, parent, src)...)
+			out = append(out, cNestedRecordSyms(fd, parent, ".", src)...)
+		}
+	}
+	return out
+}
+
+// cNestedRecordSyms indexes the members of a struct/union/enum written
+// inline in a member declaration. An anonymous record with no declarator
+// (C11 `union { int i; float f; };`) contributes its members to the
+// enclosing record; `struct { int a; } inner;` parents them to
+// parent+sep+"inner". A named C record (`struct pos { int x; } at;`) is a
+// file-scope tag: it becomes a struct of its own. Enumerators are file-scope
+// in C and parented to their enum. C++ class bodies handle nested types in
+// cppClassSym; this covers the C shapes.
+func cNestedRecordSyms(fd *sitter.Node, parent, sep string, src []byte) []astkit.Symbol {
+	spec := fd.ChildByFieldName("type")
+	if spec == nil || spec.ChildByFieldName("body") == nil {
+		return nil
+	}
+	switch spec.Type() {
+	case "struct_specifier", "union_specifier":
+	case "enum_specifier":
+		enumParent := ""
+		if nameNode := spec.ChildByFieldName("name"); nameNode != nil {
+			enumParent = nameNode.Content(src)
+		}
+		return cEnumMembers(spec, enumParent, src)
+	default:
+		return nil
+	}
+	if nameNode := spec.ChildByFieldName("name"); nameNode != nil {
+		tag := nameNode.Content(src)
+		raw := spec.Content(src)
+		out := []astkit.Symbol{{
+			Kind: astkit.KindStruct, Name: tag, QualifiedName: tag,
+			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(spec),
+			Exported: true, Body: raw,
+		}}
+		return append(out, cStructFields(spec, tag, src)...)
+	}
+	var names []string
+	for i := 0; i < int(fd.ChildCount()); i++ {
+		if fd.FieldNameForChild(i) != "declarator" {
+			continue
+		}
+		if name := cFieldName(fd.Child(i), src); name != "" {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return cStructFields(spec, parent, src)
+	}
+	var out []astkit.Symbol
+	for _, name := range names {
+		for _, sym := range cStructFields(spec, parent+sep+name, src) {
+			out = append(out, sym)
 		}
 	}
 	return out
@@ -2412,20 +2600,45 @@ func cTaggedTypeSym(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA, l
 }
 
 func cppClassSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []astkit.Symbol {
+	return cppClassSymIn(n, "", filePath, blobSHA, language, src, imports)
+}
+
+// cppClassSymIn extracts a class and its members; owner is the enclosing
+// class path ("Outer" or "Outer::Mid") for a nested type, "" otherwise.
+// Members are parented to the full path so `Box::Node::val` stays distinct
+// from a top-level `Node::val`.
+func cppClassSymIn(n *sitter.Node, owner, filePath, blobSHA, language string, src []byte, imports []string) []astkit.Symbol {
 	nameNode := n.ChildByFieldName("name")
 	if nameNode == nil {
 		return nil
 	}
-	className := nameNode.Content(src)
+	simpleName := nameNode.Content(src)
+	if nameNode.Type() == "template_type" {
+		// `template<> struct hash<Foo>` / partial specializations: the
+		// template's own name. The argument list (often multi-line
+		// enable_if_t<...>) made names no lookup could spell and leaked
+		// into every member's owner path.
+		if inner := nameNode.ChildByFieldName("name"); inner != nil {
+			simpleName = inner.Content(src)
+		}
+	}
+	className := simpleName
+	if owner != "" {
+		className = owner + "::" + simpleName
+	}
 	raw := n.Content(src)
 	kind := astkit.KindClass
-	if n.Type() == "struct_specifier" {
+	switch n.Type() {
+	case "struct_specifier":
+		kind = astkit.KindStruct
+	case "union_specifier":
 		kind = astkit.KindStruct
 	}
 	out := []astkit.Symbol{{
 		Kind:          kind,
-		Name:          className,
-		QualifiedName: className,
+		Name:          simpleName,
+		QualifiedName: simpleName,
+		ParentName:    owner,
 		Signature:     internalast.SignatureBeforeBody(n, src),
 		Span:          internalast.NodeSpan(n),
 		Exported:      true,
@@ -2458,27 +2671,223 @@ func cppClassSym(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 			}
 			continue
 		}
+		if child.Type() == "template_declaration" {
+			// `template <typename U> U convert() const { ... }` and member
+			// class templates.
+			for j := 0; j < int(child.NamedChildCount()); j++ {
+				inner := child.NamedChild(j)
+				if inner == nil {
+					continue
+				}
+				switch inner.Type() {
+				case "function_definition":
+					if sym := cFuncSym(inner, filePath, blobSHA, language, src, imports, className); sym != nil {
+						cppSetMemberAccess(sym, access)
+						out = append(out, *sym)
+					}
+				case "class_specifier", "struct_specifier", "union_specifier":
+					for _, sym := range cppClassSymIn(inner, className, filePath, blobSHA, language, src, imports) {
+						if sym.ParentName == className {
+							cppSetMemberAccess(&sym, access)
+						}
+						out = append(out, sym)
+					}
+				case "alias_declaration":
+					if sym := cppAliasSym(inner, className, src); sym != nil {
+						cppSetMemberAccess(sym, access)
+						out = append(out, *sym)
+					}
+				case "friend_declaration":
+					out = append(out, cppFriendFuncs(inner, filePath, blobSHA, language, src, imports)...)
+				case "declaration", "field_declaration":
+					for _, sym := range cppMemberPrototypes(inner, className, src) {
+						cppSetMemberAccess(&sym, access)
+						out = append(out, sym)
+					}
+				}
+			}
+			continue
+		}
+		if child.Type() == "friend_declaration" {
+			out = append(out, cppFriendFuncs(child, filePath, blobSHA, language, src, imports)...)
+			continue
+		}
+		if child.Type() == "alias_declaration" {
+			if sym := cppAliasSym(child, className, src); sym != nil {
+				cppSetMemberAccess(sym, access)
+				out = append(out, *sym)
+			}
+			continue
+		}
+		if child.Type() == "type_definition" {
+			for _, sym := range cTypedefSyms(child, filePath, blobSHA, language, src, imports) {
+				if sym.ParentName == "" {
+					sym.ParentName = className
+				}
+				if sym.Kind == astkit.KindType && !cHasModifier(sym.Modifiers, "type-alias") {
+					sym.Modifiers = append(sym.Modifiers, "type-alias")
+				}
+				cppSetMemberAccess(&sym, access)
+				out = append(out, sym)
+			}
+			continue
+		}
 		if child.Type() == "field_declaration" {
 			for _, sym := range cFieldDeclSyms(child, className, src) {
 				sym.QualifiedName = className + "." + sym.Name
 				cppSetMemberAccess(&sym, access)
 				out = append(out, sym)
 			}
+			out = append(out, cppNestedTypeSyms(child, className, access, filePath, blobSHA, language, src, imports)...)
 		}
 		if child.Type() == "field_declaration" || child.Type() == "declaration" {
-			for _, sym := range cDeclarationSyms(child, filePath, blobSHA, language, src, imports) {
-				if sym.Kind != astkit.KindFunction {
-					continue
-				}
-				sym.Kind = astkit.KindMethod
-				if sym.Name == className {
-					sym.Kind = astkit.KindConstructor
-				}
-				sym.ParentName = className
-				sym.QualifiedName = className + "." + sym.Name
+			for _, sym := range cppMemberPrototypes(child, className, src) {
 				cppSetMemberAccess(&sym, access)
 				out = append(out, sym)
 			}
+		}
+	}
+	return out
+}
+
+// cppFriendFuncs emits a function defined inline in a friend declaration
+// (`friend bool operator==(const A&, const A&) { ... }`) as the free
+// function it is. Friend prototypes and `friend class B;` declare nothing
+// of the class's own.
+func cppFriendFuncs(fd *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []astkit.Symbol {
+	var out []astkit.Symbol
+	for i := 0; i < int(fd.NamedChildCount()); i++ {
+		def := fd.NamedChild(i)
+		if def == nil || def.Type() != "function_definition" {
+			continue
+		}
+		if sym := cFuncSym(def, filePath, blobSHA, language, src, imports, ""); sym != nil {
+			sym.Modifiers = append(sym.Modifiers, "friend")
+			out = append(out, *sym)
+		}
+	}
+	return out
+}
+
+// cppMemberPrototypes emits a method (or constructor) per function
+// declarator of a member declaration, including ones returning a pointer
+// or reference (`static Impl& instance();`, `T* data();`) and conversion
+// operators. Inside a class body these are always members; the C
+// file-scope rule that skips pointer-returning prototypes does not apply.
+func cppMemberPrototypes(decl *sitter.Node, className string, src []byte) []astkit.Symbol {
+	ownerName := className
+	if i := strings.LastIndex(ownerName, "::"); i >= 0 {
+		ownerName = ownerName[i+2:]
+	}
+	var out []astkit.Symbol
+	for i := 0; i < int(decl.ChildCount()); i++ {
+		child := decl.Child(i)
+		if child == nil {
+			continue
+		}
+		if decl.FieldNameForChild(i) != "declarator" && child.Type() != "function_declarator" && child.Type() != "operator_cast" {
+			continue
+		}
+		if child.Type() != "operator_cast" && !cDeclaresFunction(child) {
+			continue
+		}
+		name := cDeclaratorName(child, src)
+		if name == "" {
+			continue
+		}
+		raw := decl.Content(src)
+		kind := astkit.KindMethod
+		if name == ownerName {
+			kind = astkit.KindConstructor
+		}
+		out = append(out, astkit.Symbol{
+			Kind:          kind,
+			Name:          name,
+			QualifiedName: className + "." + name,
+			ParentName:    className,
+			Signature:     strings.TrimSpace(raw),
+			Span:          internalast.NodeSpan(decl),
+			Exported:      !strings.HasPrefix(name, "_"),
+			Body:          raw,
+			Modifiers:     cStorageModifiers(decl, src),
+			Annotations:   []string{"declaration"},
+		})
+	}
+	return out
+}
+
+// cppNestedTypeSyms indexes a type defined inside a class body
+// (`struct Node { int val; };`, `enum class Kind { A };`) with its members,
+// parented to the enclosing class path. An anonymous union/struct member
+// (`union { int i; float f; };`) contributes its fields to the class; with a
+// declarator (`struct { int a; } inner;`) they are parented to Class::inner.
+func cppNestedTypeSyms(fd *sitter.Node, className, access, filePath, blobSHA, language string, src []byte, imports []string) []astkit.Symbol {
+	spec := fd.ChildByFieldName("type")
+	if spec == nil || spec.ChildByFieldName("body") == nil {
+		return nil
+	}
+	var out []astkit.Symbol
+	switch spec.Type() {
+	case "class_specifier", "struct_specifier", "union_specifier":
+		if spec.ChildByFieldName("name") != nil {
+			for _, sym := range cppClassSymIn(spec, className, filePath, blobSHA, language, src, imports) {
+				if sym.ParentName == className {
+					cppSetMemberAccess(&sym, access)
+				}
+				out = append(out, sym)
+			}
+			return out
+		}
+		var names []string
+		for i := 0; i < int(fd.ChildCount()); i++ {
+			if fd.FieldNameForChild(i) == "declarator" {
+				if name := cFieldName(fd.Child(i), src); name != "" {
+					names = append(names, name)
+				}
+			}
+		}
+		parents := []string{className}
+		if len(names) > 0 {
+			parents = parents[:0]
+			for _, name := range names {
+				parents = append(parents, className+"::"+name)
+			}
+		}
+		body := spec.ChildByFieldName("body")
+		for _, parent := range parents {
+			for i := 0; i < int(body.NamedChildCount()); i++ {
+				inner := body.NamedChild(i)
+				if inner == nil || inner.Type() != "field_declaration" {
+					continue
+				}
+				for _, sym := range cFieldDeclSyms(inner, parent, src) {
+					cppSetMemberAccess(&sym, access)
+					out = append(out, sym)
+				}
+				out = append(out, cppNestedTypeSyms(inner, parent, access, filePath, blobSHA, language, src, imports)...)
+			}
+		}
+	case "enum_specifier":
+		nameNode := spec.ChildByFieldName("name")
+		if nameNode == nil {
+			// An unscoped anonymous enum's constants are class members.
+			for _, sym := range cEnumMembers(spec, className, src) {
+				cppSetMemberAccess(&sym, access)
+				out = append(out, sym)
+			}
+			return out
+		}
+		raw := spec.Content(src)
+		enum := astkit.Symbol{
+			Kind: astkit.KindEnum, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
+			ParentName: className, Signature: internalast.FirstLine(raw),
+			Span: internalast.NodeSpan(spec), Exported: true, Body: raw,
+		}
+		cppSetMemberAccess(&enum, access)
+		out = append(out, enum)
+		for _, sym := range cEnumMembers(spec, className+"::"+enum.Name, src) {
+			cppSetMemberAccess(&sym, access)
+			out = append(out, sym)
 		}
 	}
 	return out
@@ -2553,6 +2962,10 @@ func cppTemplateDecl(n *sitter.Node, filePath, blobSHA, language string, src []b
 			}
 		case "class_specifier", "struct_specifier":
 			return cppClassSym(child, filePath, blobSHA, language, src, imports)
+		case "alias_declaration":
+			if sym := cppAliasSym(child, "", src); sym != nil {
+				return []astkit.Symbol{*sym}
+			}
 		}
 	}
 	return nil
