@@ -653,6 +653,13 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 				TypeParameters: jsTypeParameters(valueNode, src),
 				CallSites:      jsCallSites(body, src),
 			})
+		case "call_expression", "await_expression":
+			if jsIsRequire(valueNode, src) {
+				continue // an import, not a module value
+			}
+			jsValueSym(decl, nameNode, parentClass, exported, src, out)
+		default:
+			jsValueSym(decl, nameNode, parentClass, exported, src, out)
 		case "object":
 			objectName := nameNode.Content(src)
 			*out = append(*out, astkit.Symbol{
@@ -696,6 +703,38 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 			}
 		}
 	}
+}
+
+// jsValueSym indexes a module- or namespace-scope `const/let/var NAME = value`
+// whose value is not a function or object literal. JS/TS/TSX indexed none of
+// these (`export const LIMIT = 10` was unfindable; declaration-coverage test,
+// 2026-09-26). Destructuring patterns bind several names and are skipped.
+func jsValueSym(decl, nameNode *sitter.Node, parentClass string, exported bool, src []byte, out *[]astkit.Symbol) {
+	if nameNode.Type() != "identifier" {
+		return
+	}
+	name := nameNode.Content(src)
+	raw := decl.Content(src)
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindVariable, Name: name, QualifiedName: qualJoin(parentClass, name),
+		Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(decl),
+		Exported: exported, Body: raw, ParentName: qualLast(parentClass),
+		// Lets graph builders tell these apart from the object-literal
+		// variables indexed before 2026-09-26.
+		Modifiers: []string{"module-value"},
+	})
+}
+
+// jsIsRequire reports `require("x")` and `await import("x")` values.
+func jsIsRequire(v *sitter.Node, src []byte) bool {
+	if v.Type() == "await_expression" && v.NamedChildCount() > 0 {
+		v = v.NamedChild(0)
+	}
+	if v == nil || v.Type() != "call_expression" {
+		return false
+	}
+	fn := v.ChildByFieldName("function")
+	return fn != nil && (fn.Content(src) == "require" || fn.Type() == "import")
 }
 
 // ─── Python ──────────────────────────────────────────────────────────────────
@@ -1801,15 +1840,18 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 				}
 				out = append(out, sym)
 			}
+			out = append(out, cFileVarSyms(n, src)...)
 		case "struct_specifier":
 			if language == "cpp" {
 				out = append(out, cppClassSym(n, filePath, blobSHA, language, src, imports)...)
 			} else if sym := cTaggedTypeSym(n, astkit.KindStruct, filePath, blobSHA, language, src, imports); sym != nil {
 				out = append(out, *sym)
+				out = append(out, cStructFields(n, sym.Name, src)...)
 			}
 		case "union_specifier":
 			if sym := cTaggedTypeSym(n, astkit.KindStruct, filePath, blobSHA, language, src, imports); sym != nil {
 				out = append(out, *sym)
+				out = append(out, cStructFields(n, sym.Name, src)...)
 			}
 		case "enum_specifier":
 			if sym := cTaggedTypeSym(n, astkit.KindEnum, filePath, blobSHA, language, src, imports); sym != nil {
@@ -2181,7 +2223,7 @@ func cTypedefSyms(n *sitter.Node, filePath, blobSHA, language string, src []byte
 		}
 	}
 	raw := n.Content(src)
-	return []astkit.Symbol{{
+	out := []astkit.Symbol{{
 		Kind:          kind,
 		Name:          name,
 		QualifiedName: name,
@@ -2190,6 +2232,165 @@ func cTypedefSyms(n *sitter.Node, filePath, blobSHA, language string, src []byte
 		Exported:      true,
 		Body:          raw,
 	}}
+	if kind == astkit.KindStruct && language == "c" {
+		out = append(out, cStructFields(n.ChildByFieldName("type"), name, src)...)
+	}
+	return out
+}
+
+// cFieldDeclSyms emits one KindField per declarator of a C/C++ struct, union
+// or class member declaration. C and C++ were field-bearing languages with no
+// members indexed (declaration-coverage test, 2026-09-26). A member function
+// prototype (`int get() const;`) is a method, not a field, and is skipped; a
+// function-pointer member (`int (*cb)(int);`) is data and is kept.
+func cFieldDeclSyms(fd *sitter.Node, parent string, src []byte) []astkit.Symbol {
+	typeNode := fd.ChildByFieldName("type")
+	if typeNode == nil {
+		return nil
+	}
+	typ := typeNode.Content(src)
+	var out []astkit.Symbol
+	for i := 0; i < int(fd.ChildCount()); i++ {
+		if fd.FieldNameForChild(i) != "declarator" {
+			continue
+		}
+		d := fd.Child(i)
+		if d == nil {
+			continue
+		}
+		if cDeclaresFunction(d) {
+			continue
+		}
+		name := cFieldName(d, src)
+		if name == "" {
+			continue
+		}
+		out = append(out, astkit.Symbol{
+			Kind:          astkit.KindField,
+			Name:          name,
+			QualifiedName: name,
+			ParentName:    parent,
+			Signature:     strings.TrimSpace(typ + " " + d.Content(src)),
+			Span:          internalast.NodeSpan(fd),
+			Exported:      true,
+			Body:          fd.Content(src),
+		})
+	}
+	return out
+}
+
+// cInnerDeclarator steps one declarator layer in. reference_declarator has no
+// "declarator" field (tree-sitter-cpp), so fall back to its first named child.
+func cInnerDeclarator(d *sitter.Node) *sitter.Node {
+	if next := d.ChildByFieldName("declarator"); next != nil {
+		return next
+	}
+	for i := 0; i < int(d.NamedChildCount()); i++ {
+		if c := d.NamedChild(i); c != nil && (strings.HasSuffix(c.Type(), "declarator") || c.Type() == "field_identifier" || c.Type() == "identifier") {
+			return c
+		}
+	}
+	return nil
+}
+
+// cDeclaresFunction reports a declarator that names a function or method,
+// including ones returning pointers or references (`json_t *json_null(void)`,
+// `int *get();`). A function POINTER (`int (*cb)(int)`) is data: its
+// function_declarator wraps a parenthesized declarator, not the name.
+func cDeclaresFunction(d *sitter.Node) bool {
+	for d != nil {
+		switch d.Type() {
+		case "pointer_declarator", "reference_declarator", "attributed_declarator":
+			d = cInnerDeclarator(d)
+		case "function_declarator":
+			inner := d.ChildByFieldName("declarator")
+			return inner == nil || inner.Type() != "parenthesized_declarator"
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// cFieldName unwraps pointer, array, reference, parenthesized and
+// function-pointer declarators down to the member's own name.
+func cFieldName(n *sitter.Node, src []byte) string {
+	for n != nil {
+		switch n.Type() {
+		case "field_identifier", "identifier":
+			return n.Content(src)
+		case "pointer_declarator", "array_declarator", "parenthesized_declarator",
+			"reference_declarator", "function_declarator", "attributed_declarator":
+			next := n.ChildByFieldName("declarator")
+			if next == nil {
+				for i := 0; i < int(n.NamedChildCount()); i++ {
+					if c := n.NamedChild(i); c != nil && strings.HasSuffix(c.Type(), "declarator") || c != nil && c.Type() == "field_identifier" {
+						next = c
+						break
+					}
+				}
+			}
+			n = next
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+// cFileVarSyms indexes file- and namespace-scope variables (`static int
+// count = 0;`, `const char *name;`), which C and C++ never indexed while Go's
+// package-level vars were (declaration-coverage test, 2026-09-26). `extern`
+// declarations are skipped: the definition elsewhere is the symbol, and
+// indexing both would split its identity the way prototypes once did.
+func cFileVarSyms(n *sitter.Node, src []byte) []astkit.Symbol {
+	modifiers := cStorageModifiers(n, src)
+	if cHasModifier(modifiers, "extern") {
+		return nil
+	}
+	typeNode := n.ChildByFieldName("type")
+	if typeNode == nil {
+		return nil
+	}
+	var out []astkit.Symbol
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if n.FieldNameForChild(i) != "declarator" {
+			continue
+		}
+		d := n.Child(i)
+		if d != nil && d.Type() == "init_declarator" {
+			d = d.ChildByFieldName("declarator")
+		}
+		if d == nil || cDeclaresFunction(d) {
+			continue
+		}
+		name := cFieldName(d, src)
+		if name == "" {
+			continue
+		}
+		raw := n.Content(src)
+		out = append(out, astkit.Symbol{
+			Kind: astkit.KindVariable, Name: name, QualifiedName: name,
+			Signature: strings.TrimSpace(raw), Span: internalast.NodeSpan(n),
+			Exported: !cHasModifier(modifiers, "static"), Body: raw, Modifiers: modifiers,
+		})
+	}
+	return out
+}
+
+// cStructFields emits the members of a struct/union body parented to parent.
+func cStructFields(specifier *sitter.Node, parent string, src []byte) []astkit.Symbol {
+	body := specifier.ChildByFieldName("body")
+	if body == nil || parent == "" {
+		return nil
+	}
+	var out []astkit.Symbol
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		if fd := body.NamedChild(i); fd != nil && fd.Type() == "field_declaration" {
+			out = append(out, cFieldDeclSyms(fd, parent, src)...)
+		}
+	}
+	return out
 }
 
 func cTaggedTypeSym(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA, language string, src []byte, imports []string) *astkit.Symbol {
@@ -2256,6 +2457,13 @@ func cppClassSym(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 				out = append(out, *sym)
 			}
 			continue
+		}
+		if child.Type() == "field_declaration" {
+			for _, sym := range cFieldDeclSyms(child, className, src) {
+				sym.QualifiedName = className + "." + sym.Name
+				cppSetMemberAccess(&sym, access)
+				out = append(out, sym)
+			}
 		}
 		if child.Type() == "field_declaration" || child.Type() == "declaration" {
 			for _, sym := range cDeclarationSyms(child, filePath, blobSHA, language, src, imports) {
@@ -2880,6 +3088,10 @@ func phpVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports [
 			if sym := phpFuncSym(n, filePath, blobSHA, src, imports, parentClass); sym != nil {
 				*out = append(*out, *sym)
 			}
+		case "property_declaration":
+			*out = append(*out, phpPropertySyms(n, parentClass, src)...)
+		case "const_declaration":
+			*out = append(*out, phpConstSyms(n, parentClass, src)...)
 		case "object_creation_expression":
 			if body := internalast.FindChildByType(n, "declaration_list"); body != nil {
 				phpAnonymousClassDecl(n, body, filePath, blobSHA, src, imports, out)
@@ -3040,6 +3252,56 @@ func phpLastNamePart(s string) string {
 		s = s[i+1:]
 	}
 	return s
+}
+
+// phpPropertySyms emits one KindField per property in `public int $a, $b;`.
+// PHP class properties were not indexed at all (declaration-coverage test,
+// 2026-09-26); the name drops the `$`, matching `$this->size` usage.
+func phpPropertySyms(n *sitter.Node, parentClass string, src []byte) []astkit.Symbol {
+	if parentClass == "" {
+		return nil
+	}
+	var out []astkit.Symbol
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		el := n.NamedChild(i)
+		if el == nil || el.Type() != "property_element" {
+			continue
+		}
+		v := internalast.FindChildByType(el, "variable_name")
+		if v == nil {
+			continue
+		}
+		name := strings.TrimPrefix(v.Content(src), "$")
+		out = append(out, astkit.Symbol{
+			Kind: astkit.KindField, Name: name, QualifiedName: name, ParentName: parentClass,
+			Signature: strings.TrimSpace(n.Content(src)), Span: internalast.NodeSpan(n),
+			Exported: phpIsExported(n, src), Body: n.Content(src), Modifiers: phpModifiers(n, src),
+		})
+	}
+	return out
+}
+
+// phpConstSyms emits class constants (parented) and namespace-level
+// `const X = ...;` declarations, neither of which was indexed.
+func phpConstSyms(n *sitter.Node, parentClass string, src []byte) []astkit.Symbol {
+	var out []astkit.Symbol
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		el := n.NamedChild(i)
+		if el == nil || el.Type() != "const_element" {
+			continue
+		}
+		nameNode := internalast.FindChildByType(el, "name")
+		if nameNode == nil {
+			continue
+		}
+		name := nameNode.Content(src)
+		out = append(out, astkit.Symbol{
+			Kind: astkit.KindConst, Name: name, QualifiedName: name, ParentName: parentClass,
+			Signature: strings.TrimSpace(n.Content(src)), Span: internalast.NodeSpan(n),
+			Exported: true, Body: n.Content(src),
+		})
+	}
+	return out
 }
 
 func phpClassDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA string, src []byte, imports []string, out *[]astkit.Symbol) {

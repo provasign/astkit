@@ -934,3 +934,79 @@ func TestExtract_GoStructFields(t *testing.T) {
 		t.Errorf("multi-name fields = %+v %+v", fields["A"], fields["b"])
 	}
 }
+
+// TestExtract_CMembersAndFileVars: C/C++ struct members and file-scope
+// variables are indexed; functions returning pointers stay functions, and a
+// function-pointer member is a field (declaration-coverage gaps, 2026-09-26).
+func TestExtract_CMembersAndFileVars(t *testing.T) {
+	src := "static int count = 0;\nextern int elsewhere;\njson_t *json_null(void);\n" +
+		"struct s { int a, *b; char name[8]; int (*cb)(int); };\n" +
+		"typedef struct { double x; } pt;\n"
+	syms, _ := extract(t, astkit.LangC, src)
+	kinds := map[string]astkit.SymbolKind{}
+	for _, s := range syms {
+		kinds[s.ParentName+"."+s.Name] = s.Kind
+	}
+	want := map[string]astkit.SymbolKind{
+		".count": astkit.KindVariable,
+		"s.a": astkit.KindField, "s.b": astkit.KindField, "s.name": astkit.KindField,
+		"s.cb": astkit.KindField, "pt.x": astkit.KindField,
+	}
+	for k, v := range want {
+		if kinds[k] != v {
+			t.Errorf("%s: got %q want %q (all %v)", k, kinds[k], v, kinds)
+		}
+	}
+	// A prototype returning a pointer is not a variable. (It is not indexed as a
+	// function either -- a separate, pre-existing gap whose fix moves call
+	// resolution between header prototypes and definitions; left for its own
+	// change.)
+	if kinds[".json_null"] == astkit.KindVariable {
+		t.Errorf("pointer-returning prototype indexed as a variable: %v", kinds)
+	}
+	if _, ok := kinds[".elsewhere"]; ok {
+		t.Errorf("extern declaration indexed as a variable: %v", kinds)
+	}
+
+	cpp := "class C {\npublic:\n  int *get();\n  int &ref();\n  int size_;\n  static const int kMax = 3;\n};\n"
+	syms, _ = extract(t, astkit.LangCPP, cpp)
+	kinds = map[string]astkit.SymbolKind{}
+	for _, s := range syms {
+		kinds[s.QualifiedName] = s.Kind
+	}
+	if kinds["C.get"] == astkit.KindField || kinds["C.ref"] == astkit.KindField {
+		t.Errorf("method prototype returning a pointer/reference indexed as a field: %v", kinds)
+	}
+	if kinds["C.size_"] != astkit.KindField || kinds["C.kMax"] != astkit.KindField {
+		t.Errorf("C++ members: %v", kinds)
+	}
+}
+
+// TestExtract_PHPPropertiesAndJSValues covers the other two gaps.
+func TestExtract_PHPPropertiesAndJSValues(t *testing.T) {
+	php := "<?php\nconst TOP = 1;\nclass S { public int $a = 1, $b; const K = 2; }\n"
+	syms, _ := extract(t, astkit.LangPHP, php)
+	kinds := map[string]astkit.SymbolKind{}
+	for _, s := range syms {
+		kinds[s.ParentName+"."+s.Name] = s.Kind
+	}
+	for k, v := range map[string]astkit.SymbolKind{".TOP": astkit.KindConst, "S.a": astkit.KindField, "S.b": astkit.KindField, "S.K": astkit.KindConst} {
+		if kinds[k] != v {
+			t.Errorf("php %s: got %q want %q (all %v)", k, kinds[k], v, kinds)
+		}
+	}
+	js := "const fs = require('fs');\nconst { a, b } = obj;\nexport const LIMIT = 10;\nlet ready = false;\nconst run = () => 1;\n"
+	syms, _ = extract(t, astkit.LangJavaScript, js)
+	kinds = map[string]astkit.SymbolKind{}
+	for _, s := range syms {
+		kinds[s.Name] = s.Kind
+	}
+	if kinds["LIMIT"] != astkit.KindVariable || kinds["ready"] != astkit.KindVariable || kinds["run"] != astkit.KindFunction {
+		t.Errorf("js values: %v", kinds)
+	}
+	for _, n := range []string{"fs", "a", "b"} {
+		if _, ok := kinds[n]; ok {
+			t.Errorf("js %s should not be indexed (require/destructuring): %v", n, kinds)
+		}
+	}
+}
