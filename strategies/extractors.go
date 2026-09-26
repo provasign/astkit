@@ -304,6 +304,7 @@ func goIdentifierNames(n *sitter.Node, src []byte) []string {
 func extractJSNodes(root *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
 	jsVisit(root, filePath, blobSHA, language, src, imports, "", false, &out)
+	out = jsDedupeThisFields(out)
 	for name := range jsNamedExports(root, src) {
 		for i := range out {
 			if out[i].ParentName == "" && out[i].Name == name {
@@ -366,6 +367,7 @@ func jsVisitChild(n *sitter.Node, filePath, blobSHA, language string, src []byte
 	case "interface_declaration": // TypeScript / TSX
 		if sym := jsNamedSym(n, "name", filePath, blobSHA, language, src, imports, astkit.KindInterface, parentClass, exported); sym != nil {
 			*out = append(*out, *sym)
+			jsInterfaceMembers(n, filePath, blobSHA, language, src, imports, sym.QualifiedName, out)
 		}
 	case "type_alias_declaration": // TypeScript / TSX
 		if sym := jsNamedSym(n, "name", filePath, blobSHA, language, src, imports, astkit.KindType, parentClass, exported); sym != nil {
@@ -374,6 +376,7 @@ func jsVisitChild(n *sitter.Node, filePath, blobSHA, language string, src []byte
 	case "enum_declaration": // TypeScript / TSX
 		if sym := jsNamedSym(n, "name", filePath, blobSHA, language, src, imports, astkit.KindEnum, parentClass, exported); sym != nil {
 			*out = append(*out, *sym)
+			jsEnumMembers(n, sym.QualifiedName, exported, src, out)
 		}
 	case "internal_module", "module": // TS `namespace Foo {}` / `module Foo {}`
 		if sym := jsNamedSym(n, "name", filePath, blobSHA, language, src, imports, astkit.KindNamespace, parentClass, exported); sym != nil {
@@ -397,10 +400,19 @@ func jsVisitChild(n *sitter.Node, filePath, blobSHA, language string, src []byte
 	case "lexical_declaration", "variable_declaration":
 		// const Foo = () => ... / const Foo = function() { ... }
 		jsArrowDecl(n, filePath, blobSHA, language, src, imports, parentClass, exported, out)
+	case "ambient_declaration": // TS `declare module "x" {}` / `declare global {}` / `declare function f()`
+		jsVisitAmbient(n, filePath, blobSHA, language, src, imports, parentClass, exported, out)
 	case "expression_statement":
+		// A non-exported top-level `namespace X {}` parses as an expression
+		// statement wrapping internal_module.
+		if inner := n.NamedChild(0); inner != nil && inner.Type() == "internal_module" {
+			jsVisitChild(inner, filePath, blobSHA, language, src, imports, parentClass, exported, out)
+			return
+		}
 		// app.listen = function listen() {} / exports.render = () => {} —
 		// the assignment-style declarations CommonJS codebases are built on.
 		jsAssignFunc(n, filePath, blobSHA, language, src, imports, parentClass, out)
+		jsDefinePropertyCall(n, src, out)
 	}
 }
 
@@ -408,52 +420,80 @@ func jsVisitChild(n *sitter.Node, filePath, blobSHA, language string, src []byte
 // assignments as function symbols named by the property. The receiver chain's
 // last identifier becomes ParentName ("app.listen = ..." → parent "app"),
 // except module-export forms (exports/module.exports/prototype chains keep
-// the prototype's class name).
+// the prototype's class name). Chained targets (`a.x = a.y = function(){}`)
+// each name the value; CommonJS exports also bind classes, object literals
+// and plain values (jsAssignTarget).
 func jsAssignFunc(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
 	for i := 0; i < int(n.ChildCount()); i++ {
 		assign := n.Child(i)
 		if assign == nil || assign.Type() != "assignment_expression" {
 			continue
 		}
-		left := assign.ChildByFieldName("left")
-		right := assign.ChildByFieldName("right")
-		if left == nil || right == nil || left.Type() != "member_expression" {
+		var targets []*sitter.Node
+		value := assign
+		for value != nil && value.Type() == "assignment_expression" {
+			if left := value.ChildByFieldName("left"); left != nil && left.Type() == "member_expression" {
+				targets = append(targets, left)
+			}
+			value = value.ChildByFieldName("right")
+		}
+		if value == nil {
 			continue
 		}
-		switch right.Type() {
-		case "arrow_function", "function", "function_expression":
-		default:
-			continue
+		for _, left := range targets {
+			jsAssignTarget(assign, left, value, filePath, blobSHA, language, src, imports, parentClass, out)
 		}
-		prop := left.ChildByFieldName("property")
-		if prop == nil {
-			continue
-		}
-		name := prop.Content(src)
-		parent := parentClass
-		if obj := left.ChildByFieldName("object"); obj != nil && parent == "" {
-			switch obj.Type() {
-			case "identifier":
-				if o := obj.Content(src); o != "exports" && o != "module" {
-					parent = o
-				}
-			case "member_expression":
-				// X.prototype.method = ... → parent X
-				if inner := obj.ChildByFieldName("property"); inner != nil && inner.Content(src) == "prototype" {
-					if base := obj.ChildByFieldName("object"); base != nil && base.Type() == "identifier" {
-						parent = base.Content(src)
-					}
+	}
+}
+
+// jsAssignParent is the owner a `<obj>.<prop> = ...` assignment declares a
+// member of: the receiver identifier, X for X.prototype.m, none for exports.
+func jsAssignParent(left *sitter.Node, parentClass string, src []byte) string {
+	parent := parentClass
+	if obj := left.ChildByFieldName("object"); obj != nil && parent == "" {
+		switch obj.Type() {
+		case "identifier":
+			if o := obj.Content(src); o != "exports" && o != "module" {
+				parent = o
+			}
+		case "member_expression":
+			// X.prototype.method = ... → parent X
+			if inner := obj.ChildByFieldName("property"); inner != nil && inner.Content(src) == "prototype" {
+				if base := obj.ChildByFieldName("object"); base != nil && base.Type() == "identifier" {
+					parent = base.Content(src)
 				}
 			}
 		}
-		raw := assign.Content(src)
-		target := left.Content(src)
-		exported := strings.HasPrefix(target, "exports.") || strings.HasPrefix(target, "module.exports.")
+	}
+	return parent
+}
+
+func jsAssignTarget(assign, left, value *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	prop := left.ChildByFieldName("property")
+	if prop == nil {
+		return
+	}
+	name := prop.Content(src)
+	parent := jsAssignParent(left, parentClass, src)
+	raw := assign.Content(src)
+	target := left.Content(src)
+	moduleExports := target == "module.exports"
+	exported := strings.HasPrefix(target, "exports.") || strings.HasPrefix(target, "module.exports.")
+	switch value.Type() {
+	case "arrow_function", "function", "function_expression":
+		if moduleExports {
+			// module.exports = function build() {} declares build; an
+			// anonymous one keeps the historical name "exports".
+			if fn := value.ChildByFieldName("name"); fn != nil {
+				name = fn.Content(src)
+			}
+			exported = true
+		}
 		k := astkit.KindFunction
 		if parent != "" {
 			k = astkit.KindMethod
 		}
-		body := right.ChildByFieldName("body")
+		body := value.ChildByFieldName("body")
 		*out = append(*out, astkit.Symbol{
 			Kind:          k,
 			Name:          name,
@@ -465,6 +505,474 @@ func jsAssignFunc(n *sitter.Node, filePath, blobSHA, language string, src []byte
 			ParentName:    parent,
 			CallSites:     jsCallSites(body, src),
 		})
+		if parent != "" && value.Type() != "arrow_function" {
+			// app.init = function () { this.settings = {} } — express-style
+			// prototype objects declare their state inside such methods.
+			jsThisFields(body, parent, src, out)
+		}
+	case "class":
+		if moduleExports {
+			fn := value.ChildByFieldName("name")
+			if fn == nil {
+				return // anonymous `module.exports = class {}` has no name to index
+			}
+			name = fn.Content(src)
+		}
+		if moduleExports || exported {
+			jsClassSym(value, name, filePath, blobSHA, language, src, imports, "", true, out)
+		} else {
+			jsClassSym(value, name, filePath, blobSHA, language, src, imports, parent, false, out)
+		}
+	case "object":
+		if moduleExports {
+			jsObjectMembers(value, "", true, true, 0, filePath, blobSHA, language, src, imports, out)
+		} else if exported {
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindVariable, Name: name, QualifiedName: name,
+				Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(assign),
+				Exported: true, Body: raw, Modifiers: []string{"module-value"},
+			})
+			jsObjectMembers(value, name, false, false, 1, filePath, blobSHA, language, src, imports, out)
+		}
+	default:
+		if exported && jsIsDeclaredValue(value, src) {
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindVariable, Name: name, QualifiedName: name,
+				Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(assign),
+				Exported: true, Body: raw, Modifiers: []string{"module-value"},
+			})
+		}
+	}
+}
+
+// jsIsDeclaredValue reports values that declare something of their own, as
+// opposed to aliases and re-exports (`exports.Router = Router`,
+// `exports.json = parser.json`, `exports.x = require('x')`), which would only
+// shadow the real declaration under a second symbol.
+func jsIsDeclaredValue(v *sitter.Node, src []byte) bool {
+	switch v.Type() {
+	case "identifier", "member_expression", "subscript_expression", "undefined", "null", "this":
+		return false
+	case "call_expression", "await_expression":
+		return !jsIsRequire(v, src)
+	}
+	return true
+}
+
+// jsObjectMembers indexes an object literal's function members as methods of
+// parent (functions when parent is ""), as `const api = { get() {} }` always
+// has. values also indexes non-function members (module.exports = { C: 5 }).
+// At depth 0 a nested object with function members (Vue's `methods: {...}`)
+// becomes a variable whose functions are indexed one level down.
+func jsObjectMembers(obj *sitter.Node, parent string, exported, values bool, depth int, filePath, blobSHA, language string, src []byte, imports []string, out *[]astkit.Symbol) {
+	for j := 0; j < int(obj.NamedChildCount()); j++ {
+		member := obj.NamedChild(j)
+		if member == nil {
+			continue
+		}
+		if member.Type() == "method_definition" {
+			if parent != "" {
+				jsMethodDef(member, filePath, blobSHA, language, src, imports, parent, out)
+			} else if sym := jsNamedSym(member, "name", filePath, blobSHA, language, src, imports, astkit.KindFunction, "", exported); sym != nil {
+				*out = append(*out, *sym)
+			}
+			continue
+		}
+		if member.Type() != "pair" {
+			continue
+		}
+		key, value := member.ChildByFieldName("key"), member.ChildByFieldName("value")
+		if key == nil || value == nil {
+			continue
+		}
+		memberName := strings.Trim(key.Content(src), `"'`)
+		switch value.Type() {
+		case "arrow_function", "function", "function_expression":
+			k := astkit.KindMethod
+			if parent == "" {
+				k = astkit.KindFunction
+			}
+			*out = append(*out, astkit.Symbol{
+				Kind: k, Name: memberName,
+				QualifiedName: qualJoin(parent, memberName),
+				Signature:     internalast.FirstLine(member.Content(src)),
+				Span:          internalast.NodeSpan(member), Body: member.Content(src),
+				Exported:   parent == "" && exported,
+				ParentName: qualLast(parent),
+				CallSites:  jsCallSites(value.ChildByFieldName("body"), src),
+			})
+		case "object":
+			if depth > 0 || !jsObjectHasFunctions(value) {
+				continue
+			}
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindVariable, Name: memberName, QualifiedName: qualJoin(parent, memberName),
+				Signature: internalast.FirstLine(member.Content(src)), Span: internalast.NodeSpan(member),
+				Body: member.Content(src), ParentName: qualLast(parent),
+				Modifiers: []string{"member-value"},
+			})
+			jsObjectMembers(value, qualJoin(parent, memberName), false, false, depth+1, filePath, blobSHA, language, src, imports, out)
+		default:
+			if !values || !jsIsDeclaredValue(value, src) {
+				continue
+			}
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindVariable, Name: memberName, QualifiedName: qualJoin(parent, memberName),
+				Signature: internalast.FirstLine(member.Content(src)), Span: internalast.NodeSpan(member),
+				Exported: parent == "" && exported, Body: member.Content(src), ParentName: qualLast(parent),
+				Modifiers: []string{"module-value"},
+			})
+		}
+	}
+}
+
+func jsObjectHasFunctions(obj *sitter.Node) bool {
+	for j := 0; j < int(obj.NamedChildCount()); j++ {
+		member := obj.NamedChild(j)
+		if member == nil {
+			continue
+		}
+		if member.Type() == "method_definition" {
+			return true
+		}
+		if member.Type() == "pair" {
+			if v := member.ChildByFieldName("value"); v != nil {
+				switch v.Type() {
+				case "arrow_function", "function", "function_expression":
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// jsDefinePropertyCall indexes accessor definitions made by call:
+// Object.defineProperty(obj, 'name', { get() {} }) and helpers named
+// define<Upper>... (express's defineGetter(req, 'protocol', function () {})),
+// as methods of obj. Other (obj, 'string', fn) calls — fs.readFile(path,
+// 'utf8', cb) — are not declarations and are left alone.
+func jsDefinePropertyCall(n *sitter.Node, src []byte, out *[]astkit.Symbol) {
+	call := n.NamedChild(0)
+	if call == nil || call.Type() != "call_expression" {
+		return
+	}
+	fn, args := call.ChildByFieldName("function"), call.ChildByFieldName("arguments")
+	if fn == nil || args == nil || args.NamedChildCount() < 3 {
+		return
+	}
+	callee := fn.Content(src)
+	if i := strings.LastIndexByte(callee, '.'); i >= 0 {
+		callee = callee[i+1:]
+	}
+	objArg, nameArg, valueArg := args.NamedChild(0), args.NamedChild(1), args.NamedChild(2)
+	if nameArg == nil || nameArg.Type() != "string" || valueArg == nil {
+		return
+	}
+	parent := ""
+	switch objArg.Type() {
+	case "identifier":
+		parent = objArg.Content(src)
+	case "member_expression":
+		if p := objArg.ChildByFieldName("property"); p != nil && p.Content(src) == "prototype" {
+			if base := objArg.ChildByFieldName("object"); base != nil && base.Type() == "identifier" {
+				parent = base.Content(src)
+			}
+		}
+	}
+	if parent == "" {
+		return
+	}
+	var accessor *sitter.Node // the function node whose body defines the member
+	switch {
+	case callee == "defineProperty":
+		if valueArg.Type() != "object" {
+			return
+		}
+		for j := 0; j < int(valueArg.NamedChildCount()) && accessor == nil; j++ {
+			m := valueArg.NamedChild(j)
+			if m == nil {
+				continue
+			}
+			var key, v *sitter.Node
+			if m.Type() == "method_definition" {
+				key, v = m.ChildByFieldName("name"), m
+			} else if m.Type() == "pair" {
+				key, v = m.ChildByFieldName("key"), m.ChildByFieldName("value")
+			}
+			if key == nil || v == nil {
+				continue
+			}
+			switch key.Content(src) {
+			case "get", "set", "value":
+			default:
+				continue
+			}
+			switch v.Type() {
+			case "method_definition", "arrow_function", "function", "function_expression":
+				accessor = v
+			}
+		}
+	case len(callee) > len("define") && strings.HasPrefix(callee, "define") && callee[len("define")] >= 'A' && callee[len("define")] <= 'Z':
+		switch valueArg.Type() {
+		case "arrow_function", "function", "function_expression":
+			accessor = valueArg
+		}
+	}
+	if accessor == nil {
+		return
+	}
+	name := strings.Trim(nameArg.Content(src), "\"'`")
+	raw := n.Content(src)
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindMethod, Name: name, QualifiedName: name, ParentName: parent,
+		Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(n), Body: raw,
+		CallSites: jsCallSites(accessor.ChildByFieldName("body"), src),
+	})
+}
+
+// jsThisFields indexes `this.x = ...` assignments in a constructor (or in a
+// function assigned to <obj>.<fn>) as fields of owner. Nested non-arrow
+// functions and classes rebind `this` and are skipped. Tagged "this-assigned"
+// so jsDedupeThisFields can drop the ones already declared some other way.
+func jsThisFields(body *sitter.Node, owner string, src []byte, out *[]astkit.Symbol) {
+	if body == nil || owner == "" {
+		return
+	}
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			c := n.NamedChild(i)
+			if c == nil {
+				continue
+			}
+			switch c.Type() {
+			case "function_expression", "function", "function_declaration", "generator_function",
+				"generator_function_declaration", "class", "class_declaration", "method_definition":
+				continue
+			case "assignment_expression":
+				if left := c.ChildByFieldName("left"); left != nil && left.Type() == "member_expression" {
+					obj, prop := left.ChildByFieldName("object"), left.ChildByFieldName("property")
+					if obj != nil && obj.Type() == "this" && prop != nil &&
+						(prop.Type() == "property_identifier" || prop.Type() == "private_property_identifier") {
+						name := prop.Content(src)
+						raw := c.Content(src)
+						*out = append(*out, astkit.Symbol{
+							Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(owner, name),
+							Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(c),
+							Body: raw, ParentName: qualLast(owner),
+							Modifiers: []string{"member-value", "this-assigned"},
+						})
+					}
+				}
+			}
+			walk(c)
+		}
+	}
+	walk(body)
+}
+
+// jsDedupeThisFields keeps the first `this.x` assignment per owner and drops
+// any whose owner already declares x (a class field, method, or accessor).
+func jsDedupeThisFields(syms []astkit.Symbol) []astkit.Symbol {
+	key := func(s astkit.Symbol) string {
+		if s.QualifiedName == s.Name && s.ParentName != "" {
+			return s.ParentName + "." + s.Name
+		}
+		return s.QualifiedName
+	}
+	declared := map[string]bool{}
+	for _, s := range syms {
+		if !jsHasModifier(s.Modifiers, "this-assigned") {
+			declared[key(s)] = true
+		}
+	}
+	seen := map[string]bool{}
+	out := syms[:0]
+	for _, s := range syms {
+		if jsHasModifier(s.Modifiers, "this-assigned") {
+			k := key(s)
+			if declared[k] || seen[k] {
+				continue
+			}
+			seen[k] = true
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func jsHasModifier(mods []string, want string) bool {
+	for _, m := range mods {
+		if m == want {
+			return true
+		}
+	}
+	return false
+}
+
+// jsParamProperties indexes TS constructor parameter properties
+// (`constructor(private readonly db: Db)`) as fields of the class.
+func jsParamProperties(ctor *sitter.Node, parentClass string, src []byte, out *[]astkit.Symbol) {
+	params := ctor.ChildByFieldName("parameters")
+	if params == nil {
+		return
+	}
+	for i := 0; i < int(params.NamedChildCount()); i++ {
+		p := params.NamedChild(i)
+		if p == nil || (p.Type() != "required_parameter" && p.Type() != "optional_parameter") {
+			continue
+		}
+		mods := jsModifiers(p, src)
+		isProperty := false
+		for _, m := range mods {
+			switch m {
+			case "public", "private", "protected", "readonly", "override":
+				isProperty = true
+			}
+		}
+		pattern := p.ChildByFieldName("pattern")
+		if !isProperty || pattern == nil || pattern.Type() != "identifier" {
+			continue
+		}
+		name := pattern.Content(src)
+		raw := p.Content(src)
+		*out = append(*out, astkit.Symbol{
+			Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(parentClass, name),
+			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(p), Body: raw,
+			ParentName: qualLast(parentClass), Modifiers: append(mods, "member-value"),
+			Annotations: jsDecorators(p, src),
+		})
+	}
+}
+
+// jsEnumMembers indexes TS enum members (`enum Mode { Fast, Slow = 2 }`) as
+// constants of the enum, like Java/Swift/Kotlin enum constants.
+func jsEnumMembers(n *sitter.Node, enumQual string, exported bool, src []byte, out *[]astkit.Symbol) {
+	body := n.ChildByFieldName("body")
+	if body == nil {
+		return
+	}
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		m := body.NamedChild(i)
+		if m == nil {
+			continue
+		}
+		nameNode := m
+		if m.Type() == "enum_assignment" {
+			nameNode = m.ChildByFieldName("name")
+		}
+		if nameNode == nil {
+			continue
+		}
+		switch nameNode.Type() {
+		case "property_identifier", "string":
+		default:
+			continue
+		}
+		name := strings.Trim(nameNode.Content(src), "\"'`")
+		raw := m.Content(src)
+		*out = append(*out, astkit.Symbol{
+			Kind: astkit.KindConst, Name: name, QualifiedName: qualJoin(enumQual, name),
+			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(m), Body: raw,
+			Exported: exported, ParentName: qualLast(enumQual), Modifiers: []string{"member-value"},
+		})
+	}
+}
+
+// jsInterfaceMembers indexes an interface's property signatures as fields
+// and its method signatures as methods (Options.timeout, Getter.get).
+func jsInterfaceMembers(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, ifaceQual string, out *[]astkit.Symbol) {
+	body := n.ChildByFieldName("body")
+	if body == nil {
+		return
+	}
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		m := body.NamedChild(i)
+		if m == nil {
+			continue
+		}
+		switch m.Type() {
+		case "method_signature":
+			if sym := jsNamedSym(m, "name", filePath, blobSHA, language, src, imports, astkit.KindMethod, ifaceQual, false); sym != nil {
+				// A signature is never a call target: calls through an
+				// interface-typed receiver keep dispatching to implementations.
+				sym.Annotations = append(sym.Annotations, "declaration")
+				*out = append(*out, *sym)
+			}
+		case "property_signature":
+			nameNode := m.ChildByFieldName("name")
+			if nameNode == nil {
+				continue
+			}
+			name := strings.Trim(nameNode.Content(src), "\"'`")
+			raw := m.Content(src)
+			*out = append(*out, astkit.Symbol{
+				Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(ifaceQual, name),
+				Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(m), Body: raw,
+				ParentName: qualLast(ifaceQual), Modifiers: append(jsModifiers(m, src), "member-value"),
+				// Like method signatures, a function-typed property
+				// (`onSave: (x) => void`) declares no body to call into.
+				Annotations: []string{"declaration"},
+			})
+		}
+	}
+}
+
+// jsVisitAmbient walks a TS ambient declaration: `declare module "x" {}`
+// (members stay unqualified: they augment module x), `declare global {}`,
+// `declare namespace N {}`, and body-less `declare function`/`declare const`.
+// Function signatures are indexed only here — outside ambient context they
+// are overload heads whose implementation is already the symbol.
+func jsVisitAmbient(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, parentClass string, exported bool, out *[]astkit.Symbol) {
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		c := n.NamedChild(i)
+		if c == nil {
+			continue
+		}
+		switch c.Type() {
+		case "function_signature":
+			if sym := jsNamedSym(c, "name", filePath, blobSHA, language, src, imports, astkit.KindFunction, parentClass, exported); sym != nil {
+				sym.Annotations = append(sym.Annotations, "declaration") // body-less: not a call target
+				*out = append(*out, *sym)
+			}
+		case "statement_block":
+			jsVisitAmbient(c, filePath, blobSHA, language, src, imports, parentClass, false, out)
+		case "module", "internal_module":
+			nameNode, body := c.ChildByFieldName("name"), c.ChildByFieldName("body")
+			if nameNode == nil {
+				continue
+			}
+			if nameNode.Type() == "string" {
+				if body != nil {
+					jsVisitAmbient(body, filePath, blobSHA, language, src, imports, parentClass, false, out)
+				}
+				continue
+			}
+			sym := jsNamedSym(c, "name", filePath, blobSHA, language, src, imports, astkit.KindNamespace, parentClass, exported)
+			*out = append(*out, *sym)
+			if body != nil {
+				jsVisitAmbient(body, filePath, blobSHA, language, src, imports, sym.QualifiedName, false, out)
+			}
+		case "export_statement":
+			if d := c.ChildByFieldName("declaration"); d != nil && (d.Type() == "function_signature" || d.Type() == "lexical_declaration" || d.Type() == "variable_declaration") {
+				jsVisitAmbient(c, filePath, blobSHA, language, src, imports, parentClass, true, out)
+				continue
+			}
+			jsVisitChild(c, filePath, blobSHA, language, src, imports, parentClass, exported, out)
+		case "lexical_declaration", "variable_declaration":
+			jsArrowDecl(c, filePath, blobSHA, language, src, imports, parentClass, exported, out)
+			for j := 0; j < int(c.NamedChildCount()); j++ {
+				d := c.NamedChild(j)
+				if d != nil && d.Type() == "variable_declarator" && d.ChildByFieldName("value") == nil {
+					if nameNode := d.ChildByFieldName("name"); nameNode != nil {
+						jsValueSym(d, nameNode, parentClass, exported, src, out)
+					}
+				}
+			}
+		default:
+			jsVisitChild(c, filePath, blobSHA, language, src, imports, parentClass, exported, out)
+		}
 	}
 }
 
@@ -473,7 +981,12 @@ func jsClassDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 	if nameNode == nil {
 		return
 	}
-	className := nameNode.Content(src)
+	jsClassSym(n, nameNode.Content(src), filePath, blobSHA, language, src, imports, parentClass, exported, out)
+}
+
+// jsClassSym indexes a class declaration or class expression under className
+// (a class expression takes the name it is bound to: const Anon = class {}).
+func jsClassSym(n *sitter.Node, className, filePath, blobSHA, language string, src []byte, imports []string, parentClass string, exported bool, out *[]astkit.Symbol) {
 	raw := n.Content(src)
 	var decoratorCalls []astkit.CallSite
 	for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -529,6 +1042,10 @@ func jsMethodDef(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 		Annotations:    jsDecorators(n, src),
 		CallSites:      jsCallSites(body, src),
 	})
+	if kind == astkit.KindConstructor && parentClass != "" {
+		jsParamProperties(n, parentClass, src, out)
+		jsThisFields(body, parentClass, src, out)
+	}
 }
 
 // jsFieldDef emits a Field symbol for a TypeScript/JS class field.
@@ -604,6 +1121,12 @@ func jsUnwrapExport(n *sitter.Node, filePath, blobSHA, language string, src []by
 		jsVisitChild(decl, filePath, blobSHA, language, src, imports, parentClass, true, out)
 		return
 	}
+	// export default { data() {}, methods: {...} } — a Vue-style component
+	// object; its functions are the module's declarations.
+	if v := n.ChildByFieldName("value"); v != nil && v.Type() == "object" {
+		jsObjectMembers(v, parentClass, true, false, 0, filePath, blobSHA, language, src, imports, out)
+		return
+	}
 	// export default <expr> — iterate direct children for known declaration types
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)
@@ -660,6 +1183,8 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 			jsValueSym(decl, nameNode, parentClass, exported, src, out)
 		default:
 			jsValueSym(decl, nameNode, parentClass, exported, src, out)
+		case "class":
+			jsClassSym(valueNode, nameNode.Content(src), filePath, blobSHA, language, src, imports, parentClass, exported, out)
 		case "object":
 			objectName := nameNode.Content(src)
 			*out = append(*out, astkit.Symbol{
@@ -669,38 +1194,7 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 				Span:          internalast.NodeSpan(decl), Exported: exported,
 				Body: decl.Content(src), ParentName: qualLast(parentClass),
 			})
-			objectParent := qualJoin(parentClass, objectName)
-			for j := 0; j < int(valueNode.NamedChildCount()); j++ {
-				member := valueNode.NamedChild(j)
-				if member == nil {
-					continue
-				}
-				if member.Type() == "method_definition" {
-					jsMethodDef(member, filePath, blobSHA, language, src, imports, objectParent, out)
-					continue
-				}
-				if member.Type() != "pair" {
-					continue
-				}
-				key, value := member.ChildByFieldName("key"), member.ChildByFieldName("value")
-				if key == nil || value == nil {
-					continue
-				}
-				switch value.Type() {
-				case "arrow_function", "function", "function_expression":
-				default:
-					continue
-				}
-				memberName := strings.Trim(key.Content(src), `"'`)
-				*out = append(*out, astkit.Symbol{
-					Kind: astkit.KindMethod, Name: memberName,
-					QualifiedName: qualJoin(objectParent, memberName),
-					Signature:     internalast.FirstLine(member.Content(src)),
-					Span:          internalast.NodeSpan(member), Body: member.Content(src),
-					ParentName: qualLast(objectParent),
-					CallSites:  jsCallSites(value.ChildByFieldName("body"), src),
-				})
-			}
+			jsObjectMembers(valueNode, qualJoin(parentClass, objectName), false, false, 1, filePath, blobSHA, language, src, imports, out)
 		}
 	}
 }
@@ -3066,42 +3560,213 @@ func extractPHPNodes(root *sitter.Node, filePath, blobSHA string, src []byte, im
 }
 
 func phpVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	// spillEnum names an enum whose body the grammar closed early: the
+	// vendored PHP grammar predates constants in enums, so `const X = ...;`
+	// inside an enum ends the enum_declaration_list and every later member
+	// parses as a sibling (bare `function label()`, `case A;` as an
+	// expression statement) up to an ERROR holding the real closing brace.
+	spillEnum := ""
 	for i := 0; i < int(node.ChildCount()); i++ {
 		n := node.Child(i)
 		if n == nil {
 			continue
 		}
-		switch n.Type() {
-		case "function_definition":
-			if sym := phpFuncSym(n, filePath, blobSHA, src, imports, parentClass); sym != nil {
-				*out = append(*out, *sym)
+		if spillEnum != "" {
+			if n.Type() == "ERROR" && strings.Contains(n.Content(src), "}") {
+				spillEnum = ""
+				continue
 			}
-		case "class_declaration":
-			phpClassDecl(n, astkit.KindClass, filePath, blobSHA, src, imports, out)
-		case "interface_declaration":
-			phpClassDecl(n, astkit.KindInterface, filePath, blobSHA, src, imports, out)
-		case "trait_declaration":
-			phpClassDecl(n, astkit.KindTrait, filePath, blobSHA, src, imports, out)
-		case "enum_declaration":
-			phpClassDecl(n, astkit.KindEnum, filePath, blobSHA, src, imports, out)
-		case "method_declaration":
-			if sym := phpFuncSym(n, filePath, blobSHA, src, imports, parentClass); sym != nil {
-				*out = append(*out, *sym)
+			phpVisitEnumSpill(n, node.Child(i-1), filePath, blobSHA, src, imports, spillEnum, out)
+			continue
+		}
+		phpVisitNode(n, filePath, blobSHA, src, imports, parentClass, out)
+		if n.Type() == "enum_declaration" && phpEnumBodyUnclosed(n) {
+			if name := n.ChildByFieldName("name"); name != nil {
+				spillEnum = name.Content(src)
 			}
-		case "property_declaration":
-			*out = append(*out, phpPropertySyms(n, parentClass, src)...)
-		case "const_declaration":
-			*out = append(*out, phpConstSyms(n, parentClass, src)...)
-		case "object_creation_expression":
-			if body := internalast.FindChildByType(n, "declaration_list"); body != nil {
-				phpAnonymousClassDecl(n, body, filePath, blobSHA, src, imports, out)
-			} else {
-				phpVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+		}
+	}
+}
+
+func phpVisitNode(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	switch n.Type() {
+	case "function_definition":
+		if sym := phpFuncSym(n, filePath, blobSHA, src, imports, parentClass); sym != nil {
+			*out = append(*out, *sym)
+		}
+	case "class_declaration":
+		phpClassDecl(n, astkit.KindClass, filePath, blobSHA, src, imports, out)
+	case "interface_declaration":
+		phpClassDecl(n, astkit.KindInterface, filePath, blobSHA, src, imports, out)
+	case "trait_declaration":
+		phpClassDecl(n, astkit.KindTrait, filePath, blobSHA, src, imports, out)
+	case "enum_declaration":
+		phpClassDecl(n, astkit.KindEnum, filePath, blobSHA, src, imports, out)
+	case "method_declaration":
+		if sym := phpFuncSym(n, filePath, blobSHA, src, imports, parentClass); sym != nil {
+			*out = append(*out, *sym)
+			if sym.Kind == astkit.KindConstructor {
+				*out = append(*out, phpPromotedProperties(n, parentClass, src)...)
 			}
-		default:
-			// Recurse into program, namespace_definition, compound_statement, etc.
+		}
+	case "property_declaration":
+		*out = append(*out, phpPropertySyms(n, parentClass, src)...)
+	case "const_declaration":
+		*out = append(*out, phpConstSyms(n, parentClass, src)...)
+	case "enum_case":
+		if parentClass != "" {
+			if name := n.ChildByFieldName("name"); name != nil {
+				*out = append(*out, phpEnumCaseSym(n, name.Content(src), parentClass, src))
+			}
+		}
+	case "object_creation_expression":
+		if body := internalast.FindChildByType(n, "declaration_list"); body != nil {
+			phpAnonymousClassDecl(n, body, filePath, blobSHA, src, imports, out)
+		} else {
 			phpVisit(n, filePath, blobSHA, src, imports, parentClass, out)
 		}
+	case "expression_statement":
+		if sym := phpDefineConst(n, src); sym != nil {
+			*out = append(*out, *sym)
+		}
+		phpVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+	default:
+		// Recurse into program, namespace_definition, compound_statement, etc.
+		phpVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+	}
+}
+
+// phpEnumBodyUnclosed reports an enum_declaration_list that lacks its "}"
+// (see spillEnum in phpVisit).
+func phpEnumBodyUnclosed(n *sitter.Node) bool {
+	body := n.ChildByFieldName("body")
+	if body == nil || body.ChildCount() == 0 {
+		return false
+	}
+	last := body.Child(int(body.ChildCount()) - 1)
+	// Error recovery closes the list with a zero-width MISSING "}".
+	return last == nil || last.Type() != "}" || last.IsMissing()
+}
+
+// phpVisitEnumSpill indexes one member of an enum body the grammar spilled
+// into the enclosing statement list, parented to the enum.
+func phpVisitEnumSpill(n, prev *sitter.Node, filePath, blobSHA string, src []byte, imports []string, enumName string, out *[]astkit.Symbol) {
+	switch n.Type() {
+	case "ERROR":
+		// `case B = 'b';` spills as ERROR(name "case", name "B") followed
+		// by the value as an expression statement.
+		if n.NamedChildCount() >= 2 {
+			kw, name := n.NamedChild(0), n.NamedChild(1)
+			if kw.Type() == "name" && kw.Content(src) == "case" && name.Type() == "name" {
+				*out = append(*out, phpEnumCaseSym(n, name.Content(src), enumName, src))
+			}
+		}
+		return
+	case "comment":
+		return
+	case "function_definition":
+		sym := phpFuncSym(n, filePath, blobSHA, src, imports, enumName)
+		if sym == nil {
+			return
+		}
+		// `public static function` spills as ERROR(modifiers) + function_definition.
+		if prev != nil && prev.Type() == "ERROR" {
+			sym.Modifiers = phpModifiers(prev, src)
+		}
+		*out = append(*out, *sym)
+	case "expression_statement":
+		// `case Active;` spills as expression_statement(name "case", ERROR(name)).
+		if first := n.NamedChild(0); first != nil && first.Type() == "name" && first.Content(src) == "case" {
+			if e := internalast.FindChildByType(n, "ERROR"); e != nil {
+				if name := internalast.FindChildByType(e, "name"); name != nil {
+					*out = append(*out, phpEnumCaseSym(n, name.Content(src), enumName, src))
+				}
+			}
+			return
+		}
+		phpVisitNode(n, filePath, blobSHA, src, imports, enumName, out)
+	default:
+		phpVisitNode(n, filePath, blobSHA, src, imports, enumName, out)
+	}
+}
+
+// phpEnumCaseSym indexes a PHP 8.1 enum case (Suit::Hearts) as a constant of
+// the enum, the way Java/Swift/Kotlin enum constants are indexed.
+func phpEnumCaseSym(n *sitter.Node, name, enumName string, src []byte) astkit.Symbol {
+	return astkit.Symbol{
+		Kind: astkit.KindConst, Name: name, QualifiedName: name, ParentName: enumName,
+		Signature: strings.TrimSpace(n.Content(src)), Span: internalast.NodeSpan(n),
+		Exported: true, Body: n.Content(src),
+	}
+}
+
+// phpPromotedProperties indexes constructor-promoted properties
+// (`__construct(private int $x)`) as fields of the class.
+func phpPromotedProperties(ctor *sitter.Node, parentClass string, src []byte) []astkit.Symbol {
+	params := ctor.ChildByFieldName("parameters")
+	if params == nil || parentClass == "" {
+		return nil
+	}
+	var out []astkit.Symbol
+	for i := 0; i < int(params.NamedChildCount()); i++ {
+		p := params.NamedChild(i)
+		if p == nil || p.Type() != "property_promotion_parameter" {
+			continue
+		}
+		v := p.ChildByFieldName("name")
+		if v == nil {
+			continue
+		}
+		var mods []string
+		for _, field := range []string{"visibility", "readonly"} {
+			if m := p.ChildByFieldName(field); m != nil {
+				mods = append(mods, m.Content(src))
+			}
+		}
+		out = append(out, astkit.Symbol{
+			Kind: astkit.KindField, Name: strings.TrimPrefix(v.Content(src), "$"), ParentName: parentClass,
+			QualifiedName: strings.TrimPrefix(v.Content(src), "$"),
+			Signature:     strings.TrimSpace(p.Content(src)), Span: internalast.NodeSpan(p),
+			Exported: true, Body: p.Content(src), Modifiers: mods,
+		})
+	}
+	return out
+}
+
+// phpDefineConst indexes `define('NAME', value);` as a global constant. A
+// computed name (define($name, ...), interpolated strings) is skipped.
+func phpDefineConst(n *sitter.Node, src []byte) *astkit.Symbol {
+	call := n.NamedChild(0)
+	if call == nil || call.Type() != "function_call_expression" {
+		return nil
+	}
+	fn, args := call.ChildByFieldName("function"), call.ChildByFieldName("arguments")
+	if fn == nil || args == nil || !strings.EqualFold(phpLastNamePart(fn.Content(src)), "define") {
+		return nil
+	}
+	arg := args.NamedChild(0)
+	if arg == nil || arg.Type() != "argument" || arg.NamedChildCount() != 1 {
+		return nil
+	}
+	str := arg.NamedChild(0)
+	if str == nil || (str.Type() != "string" && str.Type() != "encapsed_string") {
+		return nil
+	}
+	name := ""
+	for i := 0; i < int(str.NamedChildCount()); i++ {
+		c := str.NamedChild(i)
+		if c == nil || c.Type() != "string_content" {
+			return nil // interpolation or escapes: not a literal name
+		}
+		name += c.Content(src)
+	}
+	if name == "" {
+		return nil
+	}
+	return &astkit.Symbol{
+		Kind: astkit.KindConst, Name: name, QualifiedName: name,
+		Signature: strings.TrimSpace(n.Content(src)), Span: internalast.NodeSpan(n),
+		Exported: true, Body: n.Content(src),
 	}
 }
 
