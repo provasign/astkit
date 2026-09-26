@@ -950,7 +950,7 @@ func TestExtract_CMembersAndFileVars(t *testing.T) {
 	}
 	want := map[string]astkit.SymbolKind{
 		".count": astkit.KindVariable,
-		"s.a": astkit.KindField, "s.b": astkit.KindField, "s.name": astkit.KindField,
+		"s.a":    astkit.KindField, "s.b": astkit.KindField, "s.name": astkit.KindField,
 		"s.cb": astkit.KindField, "pt.x": astkit.KindField,
 	}
 	for k, v := range want {

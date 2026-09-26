@@ -207,6 +207,12 @@ func goInterfaceMethods(ifaceType *sitter.Node, parent string, typeParams []stri
 			Exported:       internalast.IsCapitalized(name),
 			Body:           raw,
 			TypeParameters: typeParams,
+			// A contract, not an implementation: "declaration" keeps it out of
+			// call-target resolution, the same as TS interface members. As a
+			// callable target it drew calls away from the concrete methods
+			// the go-ssa-vta oracle records (gin recall 0.9452 -> 0.9346 in
+			// grove's Edge accuracy CI, v0.59.0).
+			Annotations: []string{"declaration"},
 		})
 	}
 	return out
