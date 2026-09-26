@@ -93,7 +93,7 @@ func TestRustConstItemIsExtracted(t *testing.T) {
 		got[s.Name] = s
 	}
 	flags, ok := got["FLAGS"]
-	if !ok || flags.Kind != astkit.KindVariable || !strings.HasPrefix(flags.Signature, "pub(super) const FLAGS: &[&dyn Flag]") {
+	if !ok || flags.Kind != astkit.KindConst || !strings.HasPrefix(flags.Signature, "pub(super) const FLAGS: &[&dyn Flag]") {
 		t.Fatalf("FLAGS = %+v", flags)
 	}
 	if c, ok := got["COUNT"]; !ok || c.Kind != astkit.KindVariable {
