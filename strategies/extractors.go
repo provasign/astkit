@@ -1,6 +1,7 @@
 package strategies
 
 import (
+	"context"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1033,11 +1034,25 @@ func javaVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 				continue
 			}
 			javaMethodDecl(n, astkit.KindConstructor, filePath, blobSHA, src, imports, parentClass, out)
-		case "field_declaration":
+		case "compact_constructor_declaration":
+			if parentClass == "" {
+				continue
+			}
+			javaMethodDecl(n, astkit.KindConstructor, filePath, blobSHA, src, imports, parentClass, out)
+		case "field_declaration", "constant_declaration":
+			// constant_declaration: an interface or @interface constant
+			// (`double PI_APPROX = 3.14;`), implicitly public static final.
 			if parentClass == "" {
 				continue
 			}
 			javaFieldDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "annotation_type_element_declaration":
+			// `String value();` / `int level() default 1;` in an @interface:
+			// an element is read as a method (`audited.value()`).
+			if parentClass == "" {
+				continue
+			}
+			javaMethodDecl(n, astkit.KindMethod, filePath, blobSHA, src, imports, parentClass, out)
 		case "enum_body_declarations":
 			javaVisit(n, filePath, blobSHA, src, imports, parentClass, out)
 		case "enum_constant":
@@ -1229,8 +1244,13 @@ func javaMethodDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA st
 	// Full header (not FirstLine): multi-line parameter lists must survive so
 	// overloads can be discriminated by parameter types downstream.
 	sig := internalast.SignatureBeforeBody(n, src)
+	if n.Type() == "compact_constructor_declaration" {
+		// `Point { ... }` is the canonical constructor: its parameters are
+		// the record header's, so arity matching sees Point(int x, int y).
+		sig += javaCompactConstructorParams(n, src)
+	}
 	modifiers := javaModifiers(n, src)
-	exports := strings.Contains(sig, "public")
+	exports := strings.Contains(sig, "public") || n.Type() == "annotation_type_element_declaration"
 	for _, m := range modifiers {
 		if m == "public" {
 			exports = true
@@ -1252,6 +1272,27 @@ func javaMethodDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA st
 		CallSites:      javaCallSites(body, src),
 	})
 	javaNestedExecutables(body, filePath, blobSHA, src, imports, parentClass, out)
+}
+
+// javaCompactConstructorParams returns the enclosing record header's
+// parameter list text ("(int x, int y)") for a compact constructor, or "".
+func javaCompactConstructorParams(n *sitter.Node, src []byte) string {
+	body := n.Parent()
+	if body == nil {
+		return ""
+	}
+	record := body.Parent()
+	if record == nil || record.Type() != "record_declaration" {
+		return ""
+	}
+	params := record.ChildByFieldName("parameters")
+	if params == nil {
+		params = findChildByType(record, "formal_parameters")
+	}
+	if params == nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(params.Content(src)), " ")
 }
 
 func javaNestedExecutables(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
@@ -1336,7 +1377,7 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 	// field made FirstLine return just "@Deprecated" as the signature.
 	sig := internalast.SignatureBeforeBody(n, src)
 	modifiers := javaModifiers(n, src)
-	exports := strings.Contains(sig, "public")
+	exports := strings.Contains(sig, "public") || n.Type() == "constant_declaration"
 	for _, m := range modifiers {
 		if m == "public" {
 			exports = true
@@ -2633,8 +2674,17 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			csTypeDecl(n, astkit.KindInterface, filePath, blobSHA, src, imports, parentClass, out)
 		case "enum_declaration":
 			csTypeDecl(n, astkit.KindEnum, filePath, blobSHA, src, imports, parentClass, out)
-		case "method_declaration", "constructor_declaration", "destructor_declaration":
+		case "method_declaration", "constructor_declaration", "destructor_declaration",
+			"operator_declaration", "conversion_operator_declaration":
 			csMethodDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "delegate_declaration":
+			csDelegateDecl(n, src, parentClass, out)
+		case "enum_member_declaration":
+			csEnumMemberDecl(n, src, parentClass, out)
+		case "event_field_declaration":
+			csFieldDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "event_declaration":
+			csEventDecl(n, src, parentClass, out)
 		case "global_statement":
 			csVisit(n, filePath, blobSHA, src, imports, parentClass, parentInterface, out)
 		case "local_function_statement":
@@ -2682,17 +2732,134 @@ func csTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA string
 		TypeParameters: csTypeParams(n, src),
 		Annotations:    csAttributes(n, src),
 	})
+	if n.Type() == "record_declaration" {
+		csRecordParameters(n, src, qualJoin(parentClass, name), out)
+	}
 	if body := n.ChildByFieldName("body"); body != nil {
 		csVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, name), kind == astkit.KindInterface, out)
 	}
 }
 
-func csMethodDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+// csRecordParameters emits a positional record's parameters
+// (`record Person(string First, string Last)`) as the properties the
+// compiler generates for them: fields Person.First and Person.Last.
+func csRecordParameters(n *sitter.Node, src []byte, recordName string, out *[]astkit.Symbol) {
+	params := internalast.FindChildByType(n, "parameter_list")
+	if params == nil {
+		return
+	}
+	for i := 0; i < int(params.NamedChildCount()); i++ {
+		p := params.NamedChild(i)
+		if p == nil || p.Type() != "parameter" {
+			continue
+		}
+		nameNode := p.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		name := nameNode.Content(src)
+		raw := p.Content(src)
+		*out = append(*out, astkit.Symbol{
+			Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(recordName, name),
+			Signature: strings.Join(strings.Fields(raw), " "), Span: internalast.NodeSpan(p),
+			Exported: true, Body: raw, ParentName: qualLast(recordName), Annotations: csAttributes(p, src),
+		})
+	}
+}
+
+// csEnumMemberDecl emits an enum member (`Fast` / `Slow = 2`) as a const
+// under its enum: Mode.Fast.
+func csEnumMemberDecl(n *sitter.Node, src []byte, parentClass string, out *[]astkit.Symbol) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil || parentClass == "" {
+		return
+	}
+	name := nameNode.Content(src)
+	raw := n.Content(src)
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindConst, Name: name, QualifiedName: qualJoin(parentClass, name),
+		Signature: strings.Join(strings.Fields(raw), " "), Span: internalast.NodeSpan(n),
+		Exported: true, Body: raw, ParentName: qualLast(parentClass), Annotations: csAttributes(n, src),
+	})
+}
+
+// csDelegateDecl emits `delegate void Notify(string msg);` as a type: a
+// delegate declares a named function type, used like any other type name.
+func csDelegateDecl(n *sitter.Node, src []byte, parentClass string, out *[]astkit.Symbol) {
 	nameNode := n.ChildByFieldName("name")
 	if nameNode == nil {
 		return
 	}
 	name := nameNode.Content(src)
+	raw := n.Content(src)
+	modifiers := csModifiers(n, src)
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindType, Name: name, QualifiedName: qualJoin(parentClass, name),
+		Signature: strings.TrimSuffix(strings.Join(strings.Fields(raw), " "), ";"), Span: internalast.NodeSpan(n),
+		Exported: csIsExported(modifiers), Body: raw, ParentName: qualLast(parentClass), Modifiers: modifiers,
+		TypeParameters: csTypeParams(n, src), Annotations: csAttributes(n, src),
+	})
+}
+
+// csEventDecl emits an accessor-bodied event
+// (`event EventHandler Changed { add {..} remove {..} }`) as a field with an
+// "event" modifier, the same shape as a field-like event.
+func csEventDecl(n *sitter.Node, src []byte, parentClass string, out *[]astkit.Symbol) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	raw := n.Content(src)
+	modifiers := append(csModifiers(n, src), "event")
+	sig := raw
+	if i := strings.IndexByte(sig, '{'); i >= 0 {
+		sig = sig[:i]
+	}
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(parentClass, name),
+		Signature: strings.Join(strings.Fields(sig), " "), Span: internalast.NodeSpan(n),
+		Exported: csIsExported(modifiers), Body: raw, ParentName: qualLast(parentClass),
+		Modifiers: modifiers, Annotations: csAttributes(n, src), CallSites: csCallSites(n, src),
+	})
+}
+
+// csOperatorName names an operator overload the way it is written:
+// `operator +`, `implicit operator int`, `explicit operator Store`.
+func csOperatorName(n *sitter.Node, src []byte) string {
+	switch n.Type() {
+	case "operator_declaration":
+		if op := n.ChildByFieldName("operator"); op != nil {
+			return "operator " + op.Content(src)
+		}
+	case "conversion_operator_declaration":
+		direction := ""
+		for i := 0; i < int(n.ChildCount()); i++ {
+			if c := n.Child(i); c != nil && (c.Type() == "implicit" || c.Type() == "explicit") {
+				direction = c.Type() + " "
+			}
+		}
+		if t := n.ChildByFieldName("type"); t != nil {
+			return direction + "operator " + strings.Join(strings.Fields(t.Content(src)), " ")
+		}
+	}
+	return ""
+}
+
+func csMethodDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	name := csOperatorName(n, src)
+	if name == "" {
+		nameNode := n.ChildByFieldName("name")
+		if nameNode == nil {
+			return
+		}
+		name = nameNode.Content(src)
+	}
+	if n.Type() == "destructor_declaration" {
+		// The finalizer ~Store is not the constructor Store: a distinct name
+		// keeps `lookup Store.Store` from returning the finalizer's body.
+		name = "~" + name
+	}
 	raw := n.Content(src)
 	modifiers := csModifiers(n, src)
 	kind := astkit.KindMethod
@@ -2985,6 +3152,10 @@ func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, import
 
 func csFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
 	modifiers := csModifiers(n, src)
+	if n.Type() == "event_field_declaration" {
+		// `event EventHandler Changed;` is a field of delegate type.
+		modifiers = append(modifiers, "event")
+	}
 	for i := 0; i < int(n.ChildCount()); i++ {
 		child := n.Child(i)
 		if child == nil || child.Type() != "variable_declaration" {
@@ -3594,6 +3765,17 @@ func swiftProtocolDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imp
 			})
 		case "protocol_property_declaration":
 			swiftPropertyDecl(m, filePath, blobSHA, src, imports, name, out)
+		case "associatedtype_declaration":
+			// `associatedtype Item: Equatable`: a type member of the
+			// protocol, Repository.Item.
+			if itemName := m.ChildByFieldName("name"); itemName != nil {
+				item := itemName.Content(src)
+				*out = append(*out, astkit.Symbol{
+					Kind: astkit.KindType, Name: item, QualifiedName: qualJoin(name, item),
+					Signature: strings.Join(strings.Fields(m.Content(src)), " "), Span: internalast.NodeSpan(m),
+					Exported: true, Body: m.Content(src), ParentName: name,
+				})
+			}
 		}
 	}
 }
@@ -3636,12 +3818,23 @@ func swiftPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imp
 	}
 	modifiers := swiftModifiers(n, src)
 	raw := n.Content(src)
+	kind := astkit.KindField
+	if implType == "" && n.Type() == "property_declaration" {
+		// A top-level binding is a global, not a member: `let` is a
+		// constant, `var` a variable.
+		kind = astkit.KindVariable
+		if vb := internalast.FindChildByType(n, "value_binding_pattern"); vb != nil {
+			if m := vb.ChildByFieldName("mutability"); m != nil && m.Content(src) == "let" {
+				kind = astkit.KindConst
+			}
+		}
+	}
 	for _, name := range names {
 		if name == "" {
 			continue
 		}
 		*out = append(*out, astkit.Symbol{
-			Kind: astkit.KindField, Name: name, QualifiedName: name,
+			Kind: kind, Name: name, QualifiedName: name,
 			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(n),
 			Exported: swiftIsExported(modifiers), Body: raw, ParentName: qualLast(implType),
 			Modifiers: modifiers, Annotations: swiftAttributes(n, src),
@@ -3692,8 +3885,11 @@ func swiftInitDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 	modifiers := swiftModifiers(n, src)
 	body := n.ChildByFieldName("body")
 	name := qualLast(implType)
+	// The qualified name is the one written in source, Type.init, so
+	// `lookup Cache.init` finds the initializer (not Cache.deinit, which
+	// it fell back to while every init was stored as Cache.Cache).
 	*out = append(*out, astkit.Symbol{
-		Kind: astkit.KindConstructor, Name: name, QualifiedName: name,
+		Kind: astkit.KindConstructor, Name: name, QualifiedName: qualJoin(name, "init"),
 		Signature: funcSig(n, src), Span: internalast.NodeSpan(n),
 		Exported: swiftIsExported(modifiers), Body: n.Content(src), ParentName: name,
 		Modifiers: modifiers, Annotations: swiftAttributes(n, src),
@@ -3800,8 +3996,41 @@ func swiftTypeParameters(n *sitter.Node, src []byte) []string {
 
 func extractKotlinNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
+	if kotlinFunInterfaceRe.Match(src) {
+		// The grammar predates `fun interface` (Kotlin 1.4) and recovers
+		// from it unpredictably — the interface vanishes and its method can
+		// surface as a bogus top-level function. Re-parse with each `fun`
+		// of `fun interface` blanked (same length, so every byte offset and
+		// line is unchanged) and read node text from the original source.
+		if tree, err := astkit.NewEngine().Parse(context.Background(), astkit.LangKotlin, kotlinBlankFunInterface(src)); err == nil && tree != nil {
+			defer tree.Close()
+			root = tree.RootNode()
+		}
+	}
 	kotlinVisit(root, filePath, blobSHA, src, imports, "", &out)
 	return out
+}
+
+var kotlinFunInterfaceRe = regexp.MustCompile(`\bfun\s+interface\b`)
+
+func kotlinBlankFunInterface(src []byte) []byte {
+	patched := append([]byte(nil), src...)
+	for _, loc := range kotlinFunInterfaceRe.FindAllIndex(src, -1) {
+		copy(patched[loc[0]:loc[0]+3], "   ")
+	}
+	return patched
+}
+
+// kotlinIsFunInterface reports whether the interface keyword of class
+// declaration n is preceded by `fun` in the original source.
+func kotlinIsFunInterface(n *sitter.Node, src []byte) bool {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c != nil && !c.IsNamed() && c.Type() == "interface" {
+			return strings.HasSuffix(strings.TrimRight(string(src[:c.StartByte()]), " \t\r\n"), "fun")
+		}
+	}
+	return false
 }
 
 // kotlinTypeName returns a class/interface/object declaration's name: the
@@ -3852,8 +4081,34 @@ func kotlinVisit(node *sitter.Node, filePath, blobSHA string, src []byte, import
 			kotlinPropertyDecl(n, filePath, blobSHA, src, imports, implType, out)
 		case "secondary_constructor":
 			kotlinSecondaryConstructor(n, src, implType, out)
+		case "type_alias":
+			kotlinTypeAlias(n, src, implType, out)
+		case "ERROR":
+			// A one-line body (`class A { val s = 1 }`) parses its member
+			// inside an ERROR node; the declarations in it are still real.
+			// Only inside a class body: a top-level ERROR spans arbitrary
+			// recovered text.
+			if implType != "" {
+				kotlinVisit(n, filePath, blobSHA, src, imports, implType, out)
+			}
 		}
 	}
+}
+
+// kotlinTypeAlias emits `typealias Callback = (String) -> Unit` as a type.
+func kotlinTypeAlias(n *sitter.Node, src []byte, implType string, out *[]astkit.Symbol) {
+	nameNode := internalast.FindChildByType(n, "type_identifier")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	modifiers := kotlinModifiers(n, src)
+	*out = append(*out, astkit.Symbol{
+		Kind: astkit.KindType, Name: name, QualifiedName: qualJoin(implType, name),
+		Signature: strings.Join(strings.Fields(n.Content(src)), " "), Span: internalast.NodeSpan(n),
+		Exported: kotlinIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType),
+		Modifiers: modifiers, TypeParameters: kotlinTypeParameters(n, src), Annotations: kotlinAnnotations(n, src),
+	})
 }
 
 // kotlinConstructorSymbol emits a constructor named after its class (the
@@ -3918,6 +4173,9 @@ func kotlinClassDecl(n *sitter.Node, filePath, blobSHA string, src []byte, impor
 		kind = astkit.KindEnum
 	}
 	modifiers := kotlinModifiers(n, src)
+	if kind == astkit.KindInterface && kotlinIsFunInterface(n, src) {
+		modifiers = append(modifiers, "fun")
+	}
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
 		Name:           name,
@@ -4042,8 +4300,17 @@ func kotlinPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, im
 		return
 	}
 	modifiers := kotlinModifiers(n, src)
+	kind := astkit.KindField
+	if implType == "" {
+		// A top-level property is a package-level variable, not a member;
+		// `const val` is a compile-time constant.
+		kind = astkit.KindVariable
+		if internalast.HasModifier(modifiers, "const") {
+			kind = astkit.KindConst
+		}
+	}
 	*out = append(*out, astkit.Symbol{
-		Kind: astkit.KindField, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
+		Kind: kind, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
 		Signature: internalast.FirstLine(n.Content(src)), Span: internalast.NodeSpan(n),
 		Exported: kotlinIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType),
 		Modifiers: modifiers, Annotations: kotlinAnnotations(n, src),
@@ -4209,7 +4476,179 @@ func extractObjCNodes(root *sitter.Node, filePath, blobSHA string, src []byte, i
 			objcImplementationDecl(n, src, &out)
 		}
 	}
+	out = objcBlockTypedefs(root, src, out)
+	return objcMacroEnums(src, out)
+}
+
+// objcBlockTypedefs emits `typedef void (^Handler)(int);` as a type named
+// Handler. The C typedef path finds no plain type_identifier under the
+// block declarator and emits nothing. A name already emitted on the same
+// line is left alone.
+func objcBlockTypedefs(root *sitter.Node, src []byte, out []astkit.Symbol) []astkit.Symbol {
+	internalast.WalkTree(root, func(n *sitter.Node) {
+		if n == nil || n.Type() != "type_definition" {
+			return
+		}
+		decl := n.ChildByFieldName("declarator")
+		if decl == nil || decl.Type() != "function_declarator" {
+			return
+		}
+		var name string
+		internalast.WalkTree(decl, func(x *sitter.Node) {
+			if name != "" || x == nil || x.Type() != "block_pointer_declarator" {
+				return
+			}
+			if id := x.ChildByFieldName("declarator"); id != nil && id.Type() == "type_identifier" {
+				name = id.Content(src)
+			}
+		})
+		if name == "" {
+			return
+		}
+		span := internalast.NodeSpan(n)
+		for _, s := range out {
+			if s.Name == name && s.Span.Start == span.Start {
+				return
+			}
+		}
+		raw := n.Content(src)
+		out = append(out, astkit.Symbol{
+			Kind: astkit.KindType, Name: name, QualifiedName: name,
+			Signature: strings.TrimSuffix(strings.Join(strings.Fields(raw), " "), ";"),
+			Span:      span, Exported: true, Body: raw,
+		})
+	})
 	return out
+}
+
+// objcMacroEnumRe matches `typedef NS_ENUM(NSInteger, Mode) { ... }` and its
+// NS_OPTIONS / NS_CLOSED_ENUM / NS_ERROR_ENUM / CF_* siblings in
+// comment-blanked source. Group 2 is the enum name, group 3 the members.
+var objcMacroEnumRe = regexp.MustCompile(`\btypedef\s+((?:NS|CF)_(?:ENUM|OPTIONS|CLOSED_ENUM|ERROR_ENUM))\s*\(\s*[^,(){};]+?\s*,\s*([A-Za-z_]\w*)\s*\)\s*\{([^{}]*)\}`)
+
+var objcEnumMemberRe = regexp.MustCompile(`^\s*([A-Za-z_]\w*)`)
+
+// objcMacroEnums emits `typedef NS_ENUM(NSInteger, Mode) { ModeFast, ModeSlow };`
+// as enum Mode with const members Mode.ModeFast and Mode.ModeSlow. The C
+// grammar does not know the macro: it parses the members as the typedef's
+// declarators, so the C path emitted a type named ModeFast and no Mode —
+// those misnamed types are dropped. Matching runs on the source text
+// because the grammar's error recovery around the macro is unstable (one
+// NS_OPTIONS with an attribute can swallow the rest of a header).
+func objcMacroEnums(src []byte, out []astkit.Symbol) []astkit.Symbol {
+	if !strings.Contains(string(src), "_ENUM") && !strings.Contains(string(src), "_OPTIONS") {
+		return out
+	}
+	text := blankCComments(src)
+	type memberAt struct {
+		name string
+		line int
+	}
+	misparsed := map[string]astkit.LineRange{}
+	var added []astkit.Symbol
+	for _, m := range objcMacroEnumRe.FindAllStringSubmatchIndex(text, -1) {
+		name := text[m[4]:m[5]]
+		startLine := 1 + strings.Count(text[:m[0]], "\n")
+		end := m[1]
+		if rest := text[end:]; strings.HasPrefix(strings.TrimLeft(rest, " \t"), ";") {
+			end += strings.Index(rest, ";") + 1
+		}
+		endLine := 1 + strings.Count(text[:end], "\n")
+		raw := string(src[m[0]:end])
+		span := astkit.LineRange{Start: startLine, End: endLine}
+		added = append(added, astkit.Symbol{
+			Kind: astkit.KindEnum, Name: name, QualifiedName: name,
+			Signature: strings.Join(strings.Fields(string(src[m[0]:m[6]-1])), " "),
+			Span:      span, Exported: true, Body: raw,
+		})
+		var members []memberAt
+		bodyStart := m[6]
+		depth, itemStart := 0, bodyStart
+		flush := func(itemEnd int) {
+			item := text[itemStart:itemEnd]
+			if mm := objcEnumMemberRe.FindStringSubmatchIndex(item); mm != nil {
+				members = append(members, memberAt{
+					name: item[mm[2]:mm[3]],
+					line: 1 + strings.Count(text[:itemStart+mm[2]], "\n"),
+				})
+			}
+		}
+		for i := bodyStart; i < m[7]; i++ {
+			switch text[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+			case ',':
+				if depth == 0 {
+					flush(i)
+					itemStart = i + 1
+				}
+			}
+		}
+		flush(m[7])
+		for _, mem := range members {
+			misparsed[mem.name] = span
+			itemSpan := astkit.LineRange{Start: mem.line, End: mem.line}
+			added = append(added, astkit.Symbol{
+				Kind: astkit.KindConst, Name: mem.name, QualifiedName: mem.name,
+				Signature: mem.name, Span: itemSpan, Exported: true,
+				Body: objcLine(src, mem.line), ParentName: name,
+			})
+		}
+	}
+	if len(added) == 0 {
+		return out
+	}
+	kept := out[:0]
+	for _, s := range out {
+		if span, ok := misparsed[s.Name]; ok && s.Kind == astkit.KindType && s.Span.Start >= span.Start && s.Span.Start <= span.End {
+			continue
+		}
+		kept = append(kept, s)
+	}
+	return append(kept, added...)
+}
+
+// blankCComments returns src as a string with // and /* */ comments
+// replaced by spaces (newlines kept), so offsets and line numbers match src.
+func blankCComments(src []byte) string {
+	b := []byte(string(src))
+	for i := 0; i < len(b); i++ {
+		switch {
+		case b[i] == '"':
+			for i++; i < len(b) && b[i] != '"' && b[i] != '\n'; i++ {
+				if b[i] == '\\' {
+					i++
+				}
+			}
+		case b[i] == '/' && i+1 < len(b) && b[i+1] == '/':
+			for ; i < len(b) && b[i] != '\n'; i++ {
+				b[i] = ' '
+			}
+		case b[i] == '/' && i+1 < len(b) && b[i+1] == '*':
+			j := i
+			for ; j < len(b) && !(b[j] == '*' && j+1 < len(b) && b[j+1] == '/' && j > i+1); j++ {
+				if b[j] != '\n' {
+					b[j] = ' '
+				}
+			}
+			if j+1 < len(b) {
+				b[j], b[j+1] = ' ', ' '
+			}
+			i = j + 1
+		}
+	}
+	return string(b)
+}
+
+// objcLine returns the 1-based line of src, trimmed.
+func objcLine(src []byte, line int) string {
+	lines := strings.SplitN(string(src), "\n", line+1)
+	if line-1 < len(lines) {
+		return strings.TrimSpace(lines[line-1])
+	}
+	return ""
 }
 
 var objcMemberNodeTypes = map[string]bool{
@@ -4311,6 +4750,10 @@ func objcMembers(n *sitter.Node, parentName string, src []byte, out *[]astkit.Sy
 			objcMethodDeclSym(c, parentName, src, out)
 		case "instance_variables":
 			objcInstanceVariables(c, parentName, src, out)
+		case "qualified_protocol_interface_declaration":
+			// @protocol members after @required / @optional are nested
+			// one level down.
+			objcMembers(c, parentName, src, out)
 		}
 	}
 }
