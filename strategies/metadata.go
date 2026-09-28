@@ -529,6 +529,14 @@ func pythonQualifierName(n *sitter.Node, src []byte) string {
 		if fn := pythonQualifierName(n.ChildByFieldName("function"), src); fn != "" {
 			return fn + "()"
 		}
+	case "subscript":
+		// self._converters[name].to_url(): an element of a container. Without
+		// this the receiver vanished and the call read as a bare to_url(),
+		// which can never bind a method. "[]" marks "element of", as "()"
+		// marks "result of".
+		if base := pythonQualifierName(n.ChildByFieldName("value"), src); base != "" {
+			return base + "[]"
+		}
 	}
 	return ""
 }
