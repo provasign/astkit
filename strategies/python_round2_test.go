@@ -106,3 +106,25 @@ func TestPythonCallSitePreservesFullModuleQualifier(t *testing.T) {
 	}
 	t.Fatal("missing make symbol")
 }
+
+// A call on a container element keeps its receiver: without the "[]" marker
+// self._converters[k].to_url() read as a bare to_url() and bound no method.
+func TestPythonSubscriptReceiverKeepsQualifier(t *testing.T) {
+	source := `class Rule:
+    def build(self, k, v):
+        return self._converters[k].to_url(v)
+`
+	syms, _ := extract(t, astkit.LangPython, source)
+	for _, sym := range syms {
+		if sym.Name != "build" {
+			continue
+		}
+		for _, cs := range sym.CallSites {
+			if cs.Callee == "self._converters[].to_url" {
+				return
+			}
+		}
+		t.Fatalf("call sites = %+v", sym.CallSites)
+	}
+	t.Fatal("build not extracted")
+}
