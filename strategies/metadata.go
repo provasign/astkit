@@ -464,7 +464,15 @@ func pythonCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	var out []astkit.CallSite
 	var walk func(*sitter.Node)
 	walk = func(n *sitter.Node) {
-		if n == nil || (n != body && pythonNestedScope(n.Type())) {
+		if n == nil {
+			return
+		}
+		if n != body && pythonNestedScope(n.Type()) {
+			// A nested definition's body is its own scope, but its decorators
+			// run here, when the definition is evaluated.
+			if n.Type() == "decorated_definition" {
+				out = append(out, pythonDecoratorCallSites(n, src)...)
+			}
 			return
 		}
 		if n.Type() == "call" {
@@ -1709,11 +1717,12 @@ func pythonDecorators(decoratedDef *sitter.Node, src []byte) []string {
 }
 
 // pythonDecoratorCallSites returns the calls a decorator list makes when the
-// definition is evaluated. `@click.argument("name")` calls click.argument (and
-// whatever its arguments call); a bare `@click.command` calls click.command with
-// the decorated object as its one argument. Without these, decorator-driven
-// APIs (click options, Flask routes, pytest fixtures) had no call edges at all:
-// click's `argument` showed 2 callers against 143 `@click.argument(` uses.
+// definition is evaluated, which belong to the ENCLOSING scope (module, class
+// body or function), not to the decorated symbol: `@click.argument("name")`
+// calls click.argument (and whatever its arguments call); a bare
+// `@click.command` calls click.command with the decorated object as its one
+// argument. Without these, decorator-driven APIs had no call edges: click's
+// `argument` showed 2 callers against 143 `@click.argument(` uses.
 func pythonDecoratorCallSites(decoratedDef *sitter.Node, src []byte) []astkit.CallSite {
 	if decoratedDef == nil {
 		return nil

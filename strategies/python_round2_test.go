@@ -129,9 +129,12 @@ func TestPythonSubscriptReceiverKeepsQualifier(t *testing.T) {
 	t.Fatal("build not extracted")
 }
 
-// Decorators run when the definition is evaluated, so they are calls: click's
-// `argument` showed 2 callers against 143 `@click.argument(` uses before this.
-func TestPythonDecoratorsAreCallSites(t *testing.T) {
+// Decorators run when the definition is evaluated, so they are calls made by
+// the ENCLOSING scope: the module, the class body, or the function that holds
+// the definition (a dynamic trace attributes `@setupmethod` on a method to the
+// class). click's `argument` showed 2 callers against 143 `@click.argument(`
+// uses before decorators were call sites at all.
+func TestPythonDecoratorsAreCallsOfTheEnclosingScope(t *testing.T) {
 	source := `import click
 
 @click.command()
@@ -147,7 +150,13 @@ class Repo:
 
 @dataclass
 class Point:
-    x: int
+    x: int = field(default=0)
+
+def factory(f):
+    @functools.wraps(f)
+    def inner():
+        return f()
+    return inner
 `
 	syms, _ := extract(t, astkit.LangPython, source)
 	got := map[string]map[string]astkit.CallSite{}
@@ -161,13 +170,16 @@ class Point:
 		sym, callee string
 		line, argc  int
 	}{
-		{"cli", "click.command", 3, 0},
-		{"cli", "click.argument", 4, 2},
-		{"cli", "click.Path", 4, 0}, // a call inside decorator arguments
-		{"cli", "click.version_option", 5, 1},
-		{"cli", "click.echo", 7, 1},   // body calls are kept
-		{"path", "property", 10, 1},   // bare decorator: called with the method
-		{"Point", "dataclass", 14, 1}, // class decorators too
+		{"<top-level>", "click.command", 3, 0},
+		{"<top-level>", "click.argument", 4, 2},
+		{"<top-level>", "click.Path", 4, 0}, // a call inside decorator arguments
+		{"<top-level>", "click.version_option", 5, 1},
+		{"<top-level>", "dataclass", 14, 1}, // bare class decorator: called with the class
+		{"cli", "click.echo", 7, 1},
+		{"Repo", "property", 10, 1}, // method decorators run in the class body
+		{"Point", "field", 16, 1},   // so do other class-body statements
+		{"factory", "functools.wraps", 19, 1},
+		{"inner", "f", 21, 0},
 	} {
 		cs, ok := got[want.sym][want.callee]
 		if !ok || cs.Line != want.line || cs.Argc != want.argc {
@@ -175,7 +187,10 @@ class Point:
 				want.sym, want.callee, cs, ok, want.line, want.argc, got[want.sym])
 		}
 	}
-	if syms := got["cli"]; len(syms) != 5 {
-		t.Errorf("cli call sites = %d, want 5: %+v", len(syms), syms)
+	// The decorated symbols do not make their decorators' calls.
+	for sym, callee := range map[string]string{"cli": "click.argument", "path": "property", "inner": "functools.wraps", "Point": "dataclass"} {
+		if _, ok := got[sym][callee]; ok {
+			t.Errorf("%s must not own its decorator call %q: %+v", sym, callee, got[sym])
+		}
 	}
 }
