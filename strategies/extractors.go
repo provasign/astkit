@@ -1384,6 +1384,11 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 			ParentName:    qualLast(qualifier),
 			Modifiers:     pythonModifiers(className),
 			Annotations:   decorators,
+			// The class body runs once, when the class is created: its own
+			// statements and its methods' decorators are calls the class
+			// makes (a dynamic trace attributes `@setupmethod` on a method
+			// to the class). Method bodies stay with their methods.
+			CallSites: pythonCallSites(n.ChildByFieldName("body"), src),
 		})
 		body := n.ChildByFieldName("body")
 		if body != nil {
@@ -1397,15 +1402,7 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 		for j := 0; j < int(n.ChildCount()); j++ {
 			inner := n.Child(j)
 			if inner != nil && (inner.Type() == "function_definition" || inner.Type() == "class_definition") {
-				start := len(*out)
 				pythonVisitDefinition(inner, filePath, blobSHA, src, imports, parentClass, qualifier, inFunction, decos, out)
-				// The decorated symbol is the first one appended; decorator
-				// calls precede its body calls in source order.
-				if len(*out) > start {
-					if deco := pythonDecoratorCallSites(n, src); len(deco) > 0 {
-						(*out)[start].CallSites = append(deco, (*out)[start].CallSites...)
-					}
-				}
 				return
 			}
 		}
