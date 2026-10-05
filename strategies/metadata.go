@@ -488,7 +488,11 @@ func pythonNestedScope(nodeType string) bool {
 }
 
 func pythonCallCallee(call *sitter.Node, src []byte) string {
-	fn := call.ChildByFieldName("function")
+	return pythonCalleeName(call.ChildByFieldName("function"), src)
+}
+
+// pythonCalleeName names the callable expression fn: `f` or `qualifier.attr`.
+func pythonCalleeName(fn *sitter.Node, src []byte) string {
 	if fn == nil {
 		return ""
 	}
@@ -1699,6 +1703,37 @@ func pythonDecorators(decoratedDef *sitter.Node, src []byte) []string {
 		text = strings.TrimPrefix(text, "@")
 		if text != "" {
 			out = append(out, text)
+		}
+	}
+	return out
+}
+
+// pythonDecoratorCallSites returns the calls a decorator list makes when the
+// definition is evaluated. `@click.argument("name")` calls click.argument (and
+// whatever its arguments call); a bare `@click.command` calls click.command with
+// the decorated object as its one argument. Without these, decorator-driven
+// APIs (click options, Flask routes, pytest fixtures) had no call edges at all:
+// click's `argument` showed 2 callers against 143 `@click.argument(` uses.
+func pythonDecoratorCallSites(decoratedDef *sitter.Node, src []byte) []astkit.CallSite {
+	if decoratedDef == nil {
+		return nil
+	}
+	var out []astkit.CallSite
+	for i := 0; i < int(decoratedDef.ChildCount()); i++ {
+		d := decoratedDef.Child(i)
+		if d == nil || d.Type() != "decorator" {
+			continue
+		}
+		expr := d.NamedChild(0)
+		if expr == nil {
+			continue
+		}
+		if expr.Type() == "call" {
+			out = append(out, pythonCallSites(expr, src)...)
+			continue
+		}
+		if callee := pythonCalleeName(expr, src); callee != "" {
+			out = append(out, astkit.CallSite{Callee: callee, Line: int(expr.StartPoint().Row) + 1, Argc: 1})
 		}
 	}
 	return out

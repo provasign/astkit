@@ -128,3 +128,54 @@ func TestPythonSubscriptReceiverKeepsQualifier(t *testing.T) {
 	}
 	t.Fatal("build not extracted")
 }
+
+// Decorators run when the definition is evaluated, so they are calls: click's
+// `argument` showed 2 callers against 143 `@click.argument(` uses before this.
+func TestPythonDecoratorsAreCallSites(t *testing.T) {
+	source := `import click
+
+@click.command()
+@click.argument("name", type=click.Path())
+@click.version_option(version="1.0")
+def cli(name):
+    click.echo(name)
+
+class Repo:
+    @property
+    def path(self):
+        return self._p
+
+@dataclass
+class Point:
+    x: int
+`
+	syms, _ := extract(t, astkit.LangPython, source)
+	got := map[string]map[string]astkit.CallSite{}
+	for _, sym := range syms {
+		got[sym.Name] = map[string]astkit.CallSite{}
+		for _, cs := range sym.CallSites {
+			got[sym.Name][cs.Callee] = cs
+		}
+	}
+	for _, want := range []struct {
+		sym, callee string
+		line, argc  int
+	}{
+		{"cli", "click.command", 3, 0},
+		{"cli", "click.argument", 4, 2},
+		{"cli", "click.Path", 4, 0}, // a call inside decorator arguments
+		{"cli", "click.version_option", 5, 1},
+		{"cli", "click.echo", 7, 1},   // body calls are kept
+		{"path", "property", 10, 1},   // bare decorator: called with the method
+		{"Point", "dataclass", 14, 1}, // class decorators too
+	} {
+		cs, ok := got[want.sym][want.callee]
+		if !ok || cs.Line != want.line || cs.Argc != want.argc {
+			t.Errorf("%s: call %q = %+v (found %v), want line %d argc %d; all = %+v",
+				want.sym, want.callee, cs, ok, want.line, want.argc, got[want.sym])
+		}
+	}
+	if syms := got["cli"]; len(syms) != 5 {
+		t.Errorf("cli call sites = %d, want 5: %+v", len(syms), syms)
+	}
+}
