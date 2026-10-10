@@ -63,7 +63,13 @@ func (e *Engine) Parse(ctx context.Context, lang LanguageKey, src []byte) (*sitt
 	p.SetLanguage(tsLang)
 	cctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
-	tree, err := p.ParseCtx(cctx, nil, src)
+	var tree *sitter.Tree
+	var err error
+	if lang == LangKotlin {
+		tree, err = parseKotlinWithoutComments(cctx, p, src)
+	} else {
+		tree, err = p.ParseCtx(cctx, nil, src)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("astkit: parse %s: %w", lang, err)
 	}
