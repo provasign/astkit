@@ -9,6 +9,7 @@ import (
 
 	"github.com/provasign/astkit"
 	"github.com/provasign/astkit/internalast"
+	"github.com/provasign/astkit/textmask"
 )
 
 var _ = internalast.NodeSpan // imported by extractors.go callers
@@ -815,10 +816,6 @@ func rustCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	return out
 }
 
-// rustMacroStringRe strips string literals from macro token trees so format
-// strings can't fabricate call sites.
-var rustMacroStringRe = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
-
 // rustMacroCallRe finds call-shaped token runs inside a macro's token tree:
 // "unescape(", "m.start(", "SearcherTester::new(".
 var rustMacroCallRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*)\s*\(`)
@@ -846,7 +843,9 @@ func rustMacroCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 		}
 		if n.Type() == "macro_invocation" {
 			if tt := internalast.FindChildByType(n, "token_tree"); tt != nil {
-				text := rustMacroStringRe.ReplaceAllString(tt.Content(src), `""`)
+				// Comments and string/char literals in the token tree
+				// are prose, not calls: `assert!(ok, "see bar(1)")`.
+				text := textmask.Mask("rust", tt.Content(src))
 				line := int(n.StartPoint().Row) + 1
 				for _, m := range rustMacroCallRe.FindAllStringSubmatchIndex(text, -1) {
 					path := text[m[2]:m[3]]

@@ -10,6 +10,7 @@ import (
 
 	"github.com/provasign/astkit"
 	"github.com/provasign/astkit/internalast"
+	"github.com/provasign/astkit/textmask"
 )
 
 // ─── Go ───────────────────────────────────────────────────────────────────────
@@ -2707,41 +2708,87 @@ func cMacroSym(n *sitter.Node, filePath, blobSHA, language string, src []byte) *
 	if nameNode == nil {
 		return nil
 	}
-	name := nameNode.Content(src)
+	body := ""
+	if v := n.ChildByFieldName("value"); v != nil {
+		body = v.Content(src)
+	}
+	return cMacroSymbol(nameNode.Content(src), n.ChildByFieldName("parameters"), body,
+		n.Content(src), internalast.NodeSpan(n), language, src)
+}
+
+// cMacroFromError recovers a `#define` the C grammar could not parse. A
+// block comment in the middle of a continued macro body
+// (`do { \ f(); /* note */ \ } while (0)`) turns the whole directive into
+// an ERROR node that still starts with `#define NAME(params)`; without this
+// the macro vanished. The body is the rest of the logical line: physical
+// lines joined by a trailing backslash.
+func cMacroFromError(n *sitter.Node, language string, src []byte) *astkit.Symbol {
+	if n.ChildCount() < 2 || n.Child(0).Type() != "#define" || n.Child(1).Type() != "identifier" {
+		return nil
+	}
+	nameNode := n.Child(1)
+	var params *sitter.Node
+	bodyStart := nameNode.EndByte()
+	if c := n.Child(2); c != nil && c.Type() == "preproc_params" {
+		params = c
+		bodyStart = c.EndByte()
+	}
+	end := int(bodyStart)
+	for end < len(src) {
+		nl := strings.IndexByte(string(src[end:]), '\n')
+		if nl < 0 {
+			end = len(src)
+			break
+		}
+		line := strings.TrimRight(string(src[end:end+nl]), "\r")
+		end += nl
+		if !strings.HasSuffix(line, "\\") {
+			break
+		}
+		end++
+	}
+	start := n.StartPoint()
+	span := astkit.LineRange{Start: int(start.Row) + 1, End: int(start.Row) + 1 + strings.Count(string(src[n.StartByte():end]), "\n")}
+	return cMacroSymbol(nameNode.Content(src), params, string(src[bodyStart:end]),
+		string(src[n.StartByte():end]), span, language, src)
+}
+
+func cMacroSymbol(name string, paramsNode *sitter.Node, body, raw string, span astkit.LineRange, language string, src []byte) *astkit.Symbol {
 	params := ""
 	var paramNames []string
-	if p := n.ChildByFieldName("parameters"); p != nil {
-		params = strings.Join(strings.Fields(p.Content(src)), "")
+	if paramsNode != nil {
+		params = strings.Join(strings.Fields(paramsNode.Content(src)), "")
 		for _, x := range strings.Split(strings.Trim(params, "()"), ",") {
 			if x = strings.TrimSpace(x); x != "" {
 				paramNames = append(paramNames, x)
 			}
 		}
 	}
-	body := ""
-	if v := n.ChildByFieldName("value"); v != nil {
-		body = v.Content(src)
-	}
 	isParam := map[string]bool{}
 	for _, p := range paramNames {
 		isParam[p] = true
 	}
+	// Calls are read from the body with comments and string literals
+	// blanked: `printf("value(%d)", x)` calls printf, not value, and a
+	// comment on a continued line is not code. Argument text is still
+	// classified from the original body (a string argument is "#String").
+	code := textmask.Mask(language, body)
 	var sites []astkit.CallSite
-	for _, m := range cMacroCallRe.FindAllStringSubmatchIndex(body, -1) {
-		callee := body[m[2]:m[3]]
+	for _, m := range cMacroCallRe.FindAllStringSubmatchIndex(code, -1) {
+		callee := code[m[2]:m[3]]
 		if cMacroKeywords[callee] {
 			continue
 		}
 		open := m[1] - 1 // index of '('
-		args, argc := cMacroArgs(body, open)
+		args, argc := cMacroArgs(body, code, open)
 		sites = append(sites, astkit.CallSite{
-			Callee: callee, Line: int(n.StartPoint().Row) + 1, Argc: argc, Args: args,
+			Callee: callee, Line: span.Start, Argc: argc, Args: args,
 		})
 	}
 	sig := "#define " + name + params
 	return &astkit.Symbol{
 		Kind: astkit.KindMacro, Name: name, QualifiedName: name, Signature: sig,
-		Span: internalast.NodeSpan(n), Exported: true, Body: n.Content(src),
+		Span: span, Exported: true, Body: raw,
 		CallSites: sites,
 	}
 }
@@ -2749,20 +2796,22 @@ func cMacroSym(n *sitter.Node, filePath, blobSHA, language string, src []byte) *
 // cMacroArgs tokenizes the argument list opening at body[open]: an
 // identifier stays (a macro parameter name is substituted downstream, a
 // function name becomes a reference), a string or stringized `#param`
-// argument is "#String", a number "#int", anything else "".
-func cMacroArgs(body string, open int) ([]string, int) {
+// argument is "#String", a number "#int", anything else "". Parentheses and
+// commas are read from code (body with comments and literals masked), so a
+// comma inside a string does not split an argument.
+func cMacroArgs(body, code string, open int) ([]string, int) {
 	depth := 0
 	start := open + 1
 	var raw []string
-	for i := open; i < len(body); i++ {
-		switch body[i] {
+	for i := open; i < len(code); i++ {
+		switch code[i] {
 		case '(':
 			depth++
 		case ')':
 			depth--
 			if depth == 0 {
 				raw = append(raw, body[start:i])
-				i = len(body)
+				i = len(code)
 			}
 		case ',':
 			if depth == 1 {
@@ -2858,9 +2907,25 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 			// Declarations in conditional branches are ordinary source symbols.
 			// Tree-sitter nests them below the preprocessor node rather than the
 			// translation unit, so explicitly descend into each guarded region.
+			// An `#if 0` branch is disabled code (often a commented-out
+			// block): only its `#elif`/`#else` alternative is descended.
+			if cPreprocDisabled(n, src) {
+				alt := n.ChildByFieldName("alternative")
+				for alt != nil && cPreprocDisabled(alt, src) {
+					alt = alt.ChildByFieldName("alternative")
+				}
+				if alt != nil {
+					out = append(out, extractCNodes(alt, filePath, blobSHA, language, src, imports)...)
+				}
+				continue
+			}
 			out = append(out, extractCNodes(n, filePath, blobSHA, language, src, imports)...)
 		case "preproc_function_def", "preproc_def":
 			if sym := cMacroSym(n, filePath, blobSHA, language, src); sym != nil {
+				out = append(out, *sym)
+			}
+		case "ERROR":
+			if sym := cMacroFromError(n, language, src); sym != nil {
 				out = append(out, *sym)
 			}
 		case "linkage_specification":
@@ -2900,6 +2965,23 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 	}
 
 	return out
+}
+
+// cPreprocDisabled reports whether n is an `#if 0` / `#elif 0` conditional,
+// the same literal-false test textmask.MaskInactivePreprocessor applies.
+func cPreprocDisabled(n *sitter.Node, src []byte) bool {
+	if n.Type() != "preproc_if" && n.Type() != "preproc_elif" {
+		return false
+	}
+	c := n.ChildByFieldName("condition")
+	if c == nil {
+		return false
+	}
+	switch strings.Join(strings.Fields(c.Content(src)), "") {
+	case "0", "(0)":
+		return true
+	}
+	return false
 }
 
 func cFuncSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, parentClass string) *astkit.Symbol {
@@ -6058,7 +6140,9 @@ func objcMacroEnums(src []byte, out []astkit.Symbol) []astkit.Symbol {
 	if !strings.Contains(string(src), "_ENUM") && !strings.Contains(string(src), "_OPTIONS") {
 		return out
 	}
-	text := blankCComments(src)
+	// A typedef inside a string literal, a comment or an `#if 0` branch
+	// declares nothing.
+	text := textmask.Mask("objc", textmask.MaskInactivePreprocessor("objc", string(src)))
 	type memberAt struct {
 		name string
 		line int
@@ -6077,14 +6161,16 @@ func objcMacroEnums(src []byte, out []astkit.Symbol) []astkit.Symbol {
 		span := astkit.LineRange{Start: startLine, End: endLine}
 		added = append(added, astkit.Symbol{
 			Kind: astkit.KindEnum, Name: name, QualifiedName: name,
-			Signature: strings.Join(strings.Fields(string(src[m[0]:m[6]-1])), " "),
+			Signature: strings.Join(strings.Fields(text[m[0]:m[6]-1]), " "),
 			Span:      span, Exported: true, Body: raw,
 		})
 		var members []memberAt
 		bodyStart := m[6]
 		depth, itemStart := 0, bodyStart
 		flush := func(itemEnd int) {
-			item := text[itemStart:itemEnd]
+			// A conditional around a member (`#if X\n  ModeB,\n#endif`)
+			// puts directive lines in the item; they are not members.
+			item := objcBlankDirectiveLines(text[itemStart:itemEnd])
 			if mm := objcEnumMemberRe.FindStringSubmatchIndex(item); mm != nil {
 				members = append(members, memberAt{
 					name: item[mm[2]:mm[3]],
@@ -6129,34 +6215,28 @@ func objcMacroEnums(src []byte, out []astkit.Symbol) []astkit.Symbol {
 	return append(kept, added...)
 }
 
-// blankCComments returns src as a string with // and /* */ comments
-// replaced by spaces (newlines kept), so offsets and line numbers match src.
-func blankCComments(src []byte) string {
-	b := []byte(string(src))
-	for i := 0; i < len(b); i++ {
-		switch {
-		case b[i] == '"':
-			for i++; i < len(b) && b[i] != '"' && b[i] != '\n'; i++ {
-				if b[i] == '\\' {
-					i++
-				}
-			}
-		case b[i] == '/' && i+1 < len(b) && b[i+1] == '/':
-			for ; i < len(b) && b[i] != '\n'; i++ {
-				b[i] = ' '
-			}
-		case b[i] == '/' && i+1 < len(b) && b[i+1] == '*':
-			j := i
-			for ; j < len(b) && !(b[j] == '*' && j+1 < len(b) && b[j+1] == '/' && j > i+1); j++ {
-				if b[j] != '\n' {
-					b[j] = ' '
-				}
-			}
-			if j+1 < len(b) {
-				b[j], b[j+1] = ' ', ' '
-			}
-			i = j + 1
+// objcBlankDirectiveLines blanks every line of s whose first non-blank
+// character is '#' (a preprocessor directive), keeping offsets.
+func objcBlankDirectiveLines(s string) string {
+	if !strings.Contains(s, "#") {
+		return s
+	}
+	b := []byte(s)
+	for ls := 0; ls < len(b); {
+		le := strings.IndexByte(s[ls:], '\n')
+		if le < 0 {
+			le = len(b)
+		} else {
+			le += ls
 		}
+		if strings.HasPrefix(strings.TrimLeft(s[ls:le], " \t"), "#") {
+			for k := ls; k < le; k++ {
+				if b[k] != '\r' {
+					b[k] = ' '
+				}
+			}
+		}
+		ls = le + 1
 	}
 	return string(b)
 }
