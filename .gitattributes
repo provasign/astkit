@@ -1,0 +1,3 @@
+# Oracle snippets must keep LF: the vendored grammars reject a backslash-CRLF
+# continuation, and the oracle test skips nothing.
+textmask/testdata/** text eol=lf

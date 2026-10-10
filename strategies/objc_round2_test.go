@@ -180,3 +180,49 @@ func TestObjCPlainCFunctionStillExtracted(t *testing.T) {
 		t.Fatalf("plain C function 'add' not extracted; symbols: %+v", syms)
 	}
 }
+
+func TestObjCContainersInsideConditionals(t *testing.T) {
+	// AFNetworking's UIKit headers wrap the @interface in `#if
+	// TARGET_OS_IOS`; the grammar nests it under preproc_if.
+	src := `#if TARGET_OS_IOS
+@interface Indicator : NSObject
+@property (nonatomic, assign) BOOL enabled;
+- (void)increment;
+@end
+#else
+@protocol Fallback
+- (void)noop;
+@end
+#endif
+#if 0
+@interface Dead : NSObject
+@end
+#endif
+#ifdef __cplusplus
+extern "C" {
+#endif
+@implementation Indicator
+- (void)increment {
+}
+@end
+#ifdef __cplusplus
+}
+#endif
+`
+	syms, _ := extract(t, astkit.LangObjC, src)
+	names := map[string]bool{}
+	for _, s := range syms {
+		names[s.QualifiedName] = true
+		if s.ParentName != "" {
+			names[s.ParentName+"."+s.Name] = true
+		}
+	}
+	for _, want := range []string{"Indicator", "Indicator.enabled", "Indicator.increment", "Fallback", "Fallback.noop"} {
+		if !names[want] {
+			t.Errorf("%s missing; symbols: %v", want, names)
+		}
+	}
+	if names["Dead"] {
+		t.Errorf("#if 0 interface extracted: %v", names)
+	}
+}
