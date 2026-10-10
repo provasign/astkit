@@ -1541,8 +1541,8 @@ func javaModifiers(n *sitter.Node, src []byte) []string {
 		if c == nil {
 			continue
 		}
-		switch c.Type() {
-		case "marker_annotation", "annotation":
+		switch {
+		case c.Type() == "marker_annotation" || c.Type() == "annotation", internalast.IsComment(c):
 			continue
 		default:
 			text := strings.TrimSpace(c.Content(src))
