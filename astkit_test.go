@@ -54,6 +54,20 @@ func TestDetectLanguageSniffsAmbiguousHeader(t *testing.T) {
 	if got := astkit.DetectLanguage("point.h", "struct Point { int x; };"); got != astkit.LangC {
 		t.Errorf("plain C header language = %q, want c", got)
 	}
+	// Comments, `#if 0` branches and the C++-only branch of a __cplusplus
+	// guard do not make a C header C++; an unguarded extern "C" does.
+	for src, want := range map[string]astkit.LanguageKey{
+		"/*\n class handling for the C API\n */\nint real(void);\n":                                    astkit.LangC,
+		"#if 0\nclass Old {};\n#endif\nint real(void);\n":                                              astkit.LangC,
+		"#ifdef __cplusplus\nextern \"C\" {\n#endif\nint real(void);\n#ifdef __cplusplus\n}\n#endif\n": astkit.LangC,
+		"#ifndef __cplusplus\nint c_only;\n#else\nnamespace n {}\n#endif\n":                            astkit.LangC,
+		"extern \"C\" {\nint real(void);\n}\n":                                                         astkit.LangCPP,
+		"#if defined(X)\nclass Shape {};\n#endif\n":                                                    astkit.LangCPP,
+	} {
+		if got := astkit.DetectLanguage("x.h", src); got != want {
+			t.Errorf("DetectLanguage(x.h, %q) = %q, want %q", src, got, want)
+		}
+	}
 }
 
 func TestIsAST_IsConfigData(t *testing.T) {
