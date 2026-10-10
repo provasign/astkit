@@ -246,6 +246,13 @@ func blankRanges(src []byte, start, end uint32, cuts [][2]uint32) string {
 // trimmed from each line and lines left empty are dropped, so
 // `f(a, // note` reads `f(a,` and `f(app /* T */, b)` reads `f(app, b)`.
 func HeaderText(n *sitter.Node, src []byte, start, end uint32, drop func(*sitter.Node) bool) string {
+	return HeaderTextCut(n, src, start, end, drop, nil)
+}
+
+// HeaderTextCut is HeaderText with extra byte ranges of src removed as
+// comments are: for a tree parsed without its comments (astkit parses
+// Kotlin that way), the caller finds them in the text.
+func HeaderTextCut(n *sitter.Node, src []byte, start, end uint32, drop func(*sitter.Node) bool, extra [][2]uint32) string {
 	if int(end) > len(src) {
 		end = uint32(len(src))
 	}
@@ -253,6 +260,11 @@ func HeaderText(n *sitter.Node, src []byte, start, end uint32, drop func(*sitter
 		return ""
 	}
 	cuts := headerCuts(n, start, end, drop)
+	for _, c := range extra {
+		if c[1] > start && c[0] < end {
+			cuts = append(cuts, [2]uint32{max(c[0], start), min(c[1], end)})
+		}
+	}
 	if len(cuts) == 0 {
 		return string(src[start:end])
 	}
@@ -317,6 +329,12 @@ func tidyLines(s string) string {
 // first line that still has code once they are removed. With nothing to
 // remove it equals FirstLine(n.Content(src)).
 func FirstLineSig(n *sitter.Node, src []byte, drop func(*sitter.Node) bool) string {
+	return FirstLineSigCut(n, src, drop, nil)
+}
+
+// FirstLineSigCut is FirstLineSig with extra byte ranges of src removed as
+// comments are (see HeaderTextCut).
+func FirstLineSigCut(n *sitter.Node, src []byte, drop func(*sitter.Node) bool, extra [][2]uint32) string {
 	if n == nil {
 		return ""
 	}
@@ -332,7 +350,7 @@ func FirstLineSig(n *sitter.Node, src []byte, drop func(*sitter.Node) bool) stri
 		if lineEnd == n.StartByte() {
 			return "" // the node starts with a line break, as FirstLine reads it
 		}
-		if line := HeaderText(n, src, start, lineEnd, drop); line != "" {
+		if line := HeaderTextCut(n, src, start, lineEnd, drop, extra); line != "" {
 			if start != n.StartByte() {
 				line = strings.TrimSpace(line) // a later line's indentation
 			}

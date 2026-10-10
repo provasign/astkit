@@ -5671,7 +5671,9 @@ func kotlinIsFunInterface(n *sitter.Node, src []byte) bool {
 		if gapStart > c.StartByte() {
 			return false
 		}
-		gap := strings.Fields(string(src[gapStart:c.StartByte()]))
+		// The tree has no comment nodes (see kotlinCommentCuts); the gap
+		// starts in code, so masking it alone is exact.
+		gap := strings.Fields(textmask.MaskComments(string(astkit.LangKotlin), string(src[gapStart:c.StartByte()])))
 		return len(gap) > 0 && gap[len(gap)-1] == "fun"
 	}
 	return false
@@ -5749,7 +5751,7 @@ func kotlinTypeAlias(n *sitter.Node, src []byte, implType string, out *[]astkit.
 	modifiers := kotlinModifiers(n, src)
 	*out = append(*out, astkit.Symbol{
 		Kind: astkit.KindType, Name: name, QualifiedName: qualJoin(implType, name),
-		Signature: strings.Join(strings.Fields(n.Content(src)), " "), Span: internalast.NodeSpan(n),
+		Signature: strings.Join(strings.Fields(kotlinHeaderText(n, src, n.StartByte(), n.EndByte())), " "), Span: internalast.NodeSpan(n),
 		Exported: kotlinIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType),
 		Modifiers: modifiers, TypeParameters: kotlinTypeParameters(n, src), Annotations: kotlinAnnotations(n, src),
 	})
@@ -5796,7 +5798,7 @@ func kotlinPrimaryConstructorSites(pc, body *sitter.Node, src []byte) []astkit.C
 func kotlinSecondaryConstructor(n *sitter.Node, src []byte, implType string, out *[]astkit.Symbol) {
 	params := "()"
 	if p := internalast.FindChildByType(n, "function_value_parameters"); p != nil {
-		params = internalast.HeaderText(p, src, p.StartByte(), p.EndByte(), nil)
+		params = kotlinHeaderText(p, src, p.StartByte(), p.EndByte())
 	}
 	kotlinConstructorSymbol(qualLast(implType), implType, params, internalast.NodeSpan(n), n.Content(src),
 		kotlinModifiers(n, src), sharedNavCallSites(n, src, false), out)
@@ -5855,7 +5857,7 @@ func kotlinClassDecl(n *sitter.Node, filePath, blobSHA string, src []byte, impor
 		sites := kotlinPrimaryConstructorSites(pc, body, src)
 		switch {
 		case pc != nil:
-			kotlinConstructorSymbol(name, qualJoin(parentChain, name), internalast.HeaderText(pc, src, pc.StartByte(), pc.EndByte(), nil), internalast.NodeSpan(pc), pc.Content(src), modifiers, sites, out)
+			kotlinConstructorSymbol(name, qualJoin(parentChain, name), kotlinHeaderText(pc, src, pc.StartByte(), pc.EndByte()), internalast.NodeSpan(pc), pc.Content(src), modifiers, sites, out)
 		case body == nil || internalast.FindChildByType(body, "secondary_constructor") == nil:
 			kotlinConstructorSymbol(name, qualJoin(parentChain, name), "()", internalast.NodeSpan(nameNode), name+"()", modifiers, sites, out)
 		}
@@ -5955,7 +5957,7 @@ func kotlinPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, im
 	}
 	*out = append(*out, astkit.Symbol{
 		Kind: kind, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
-		Signature: internalast.FirstLineSig(n, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(n),
+		Signature: kotlinFirstLineSig(n, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(n),
 		Exported: kotlinIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType),
 		Modifiers: modifiers, Annotations: kotlinAnnotations(n, src),
 	})
@@ -5996,14 +5998,14 @@ func kotlinFunctionDecl(n *sitter.Node, filePath, blobSHA string, src []byte, im
 func kotlinFuncSig(n *sitter.Node, src []byte) string {
 	body := internalast.FindChildByType(n, "function_body")
 	if body == nil {
-		return internalast.FirstLineSig(n, src, nil)
+		return kotlinFirstLineSig(n, src, nil)
 	}
 	start := n.StartByte()
 	bodyStart := body.StartByte()
 	if bodyStart <= start {
-		return internalast.FirstLineSig(n, src, nil)
+		return kotlinFirstLineSig(n, src, nil)
 	}
-	sig := strings.TrimSpace(internalast.HeaderText(n, src, start, bodyStart, nil))
+	sig := strings.TrimSpace(kotlinHeaderText(n, src, start, bodyStart))
 	sig = strings.TrimRight(sig, " \t\n{=")
 	return strings.TrimSpace(sig)
 }
@@ -6019,14 +6021,14 @@ func kotlinSignatureBeforeBody(n *sitter.Node, src []byte) string {
 		body = internalast.FindChildByType(n, "enum_class_body")
 	}
 	if body == nil {
-		return internalast.FirstLineSig(n, src, nil)
+		return kotlinFirstLineSig(n, src, nil)
 	}
 	start := n.StartByte()
 	bodyStart := body.StartByte()
 	if bodyStart <= start {
-		return internalast.FirstLineSig(n, src, nil)
+		return kotlinFirstLineSig(n, src, nil)
 	}
-	return strings.Join(strings.Fields(internalast.HeaderText(n, src, start, bodyStart, nil)), " ")
+	return strings.Join(strings.Fields(kotlinHeaderText(n, src, start, bodyStart)), " ")
 }
 
 func kotlinModifiers(n *sitter.Node, src []byte) []string {
@@ -6084,6 +6086,52 @@ func kotlinTypeParameters(n *sitter.Node, src []byte) []string {
 		}
 	}
 	return out
+}
+
+// kotlinCommentCuts returns the byte ranges of the comments in
+// src[start:end], which must start in code. astkit parses Kotlin without
+// its comments (astkit.Engine.Parse), so the tree has no comment nodes for
+// internalast.HeaderText to cut; the text is masked instead. Comments
+// separated only by whitespace form one range.
+func kotlinCommentCuts(src []byte, start, end uint32) [][2]uint32 {
+	if int(end) > len(src) {
+		end = uint32(len(src))
+	}
+	if start >= end {
+		return nil
+	}
+	seg := src[start:end]
+	masked := textmask.MaskComments(string(astkit.LangKotlin), string(seg))
+	var cuts [][2]uint32
+	for i := 0; i < len(seg); i++ {
+		if masked[i] == seg[i] {
+			continue
+		}
+		j := i + 1
+		for j < len(seg) && masked[j] != seg[j] {
+			j++
+		}
+		lo, hi := start+uint32(i), start+uint32(j)
+		if n := len(cuts); n > 0 && strings.TrimSpace(string(src[cuts[n-1][1]:lo])) == "" {
+			cuts[n-1][1] = hi
+		} else {
+			cuts = append(cuts, [2]uint32{lo, hi})
+		}
+		i = j - 1
+	}
+	return cuts
+}
+
+// kotlinHeaderText is internalast.HeaderText for the comment-free Kotlin
+// tree: src[start:end] without its comments.
+func kotlinHeaderText(n *sitter.Node, src []byte, start, end uint32) string {
+	return internalast.HeaderTextCut(n, src, start, end, nil, kotlinCommentCuts(src, start, end))
+}
+
+// kotlinFirstLineSig is internalast.FirstLineSig for the comment-free
+// Kotlin tree.
+func kotlinFirstLineSig(n *sitter.Node, src []byte, drop func(*sitter.Node) bool) string {
+	return internalast.FirstLineSigCut(n, src, drop, kotlinCommentCuts(src, n.StartByte(), n.EndByte()))
 }
 
 // ─── Objective-C ────────────────────────────────────────────────────────────
