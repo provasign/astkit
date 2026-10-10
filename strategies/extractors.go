@@ -6105,22 +6105,47 @@ func kotlinTypeParameters(n *sitter.Node, src []byte) []string {
 
 func extractObjCNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	out := extractCNodes(root, filePath, blobSHA, "objc", src, imports)
-	for i := 0; i < int(root.ChildCount()); i++ {
-		n := root.Child(i)
-		if n == nil {
-			continue
-		}
-		switch n.Type() {
-		case "protocol_declaration":
-			objcProtocolDecl(n, src, &out)
-		case "class_interface":
-			objcInterfaceDecl(n, src, &out)
-		case "class_implementation":
-			objcImplementationDecl(n, src, &out)
-		}
-	}
+	objcContainers(root, src, &out)
 	out = objcBlockTypedefs(root, src, out)
 	return objcMacroEnums(src, out)
+}
+
+// objcContainers emits the @interface/@protocol/@implementation blocks
+// among n's children, descending into conditional regions and `extern "C"`
+// blocks as extractCNodes does: AFNetworking's UIKit headers wrap their
+// whole @interface in `#if TARGET_OS_IOS`, and only a parse that broke
+// around the #if had let the class surface (as flat recovery junk).
+func objcContainers(n *sitter.Node, src []byte, out *[]astkit.Symbol) {
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil {
+			continue
+		}
+		switch c.Type() {
+		case "protocol_declaration":
+			objcProtocolDecl(c, src, out)
+		case "class_interface":
+			objcInterfaceDecl(c, src, out)
+		case "class_implementation":
+			objcImplementationDecl(c, src, out)
+		case "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else":
+			if cPreprocDisabled(c, src) {
+				alt := c.ChildByFieldName("alternative")
+				for alt != nil && cPreprocDisabled(alt, src) {
+					alt = alt.ChildByFieldName("alternative")
+				}
+				if alt != nil {
+					objcContainers(alt, src, out)
+				}
+				continue
+			}
+			objcContainers(c, src, out)
+		case "linkage_specification":
+			if body := c.ChildByFieldName("body"); body != nil && body.Type() == "declaration_list" {
+				objcContainers(body, src, out)
+			}
+		}
+	}
 }
 
 // objcBlockTypedefs emits `typedef void (^Handler)(int);` as a type named
