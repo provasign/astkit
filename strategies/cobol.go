@@ -7,6 +7,7 @@ import (
 	sitter "github.com/smacker/go-tree-sitter"
 
 	"github.com/provasign/astkit"
+	"github.com/provasign/astkit/textmask"
 )
 
 // COBOL symbol kinds. Consumers treat unknown kinds as "other", so these are
@@ -37,9 +38,15 @@ func (c *cobolStrategy) ExtractsFromText() bool { return true }
 
 // srcLine is one normalized line of code: the code-area text with its
 // original 1-based line number, so every symbol cites a real location.
+// COBOL lines also carry two masked views of text, byte-aligned with it:
+// code (comments and literals blanked: where verbs and names are read) and
+// lits (comments blanked, literals kept: where `CALL 'PROG'` targets are
+// read). JCL lines leave them empty.
 type srcLine struct {
 	text string
 	orig int
+	code string
+	lits string
 }
 
 // normalizeCOBOL applies the column model ahead of extraction. Fixed-format
@@ -94,7 +101,32 @@ func normalizeCOBOL(src []byte) []srcLine {
 		}
 		out = append(out, srcLine{text: code, orig: i + 1})
 	}
+	maskCOBOLLines(out)
 	return out
+}
+
+// maskCOBOLLines fills each line's code and lits views. The lines are
+// already column-normalized (sequence and indicator areas gone), so they
+// are masked as free-format source: a `*>` inline comment is blanked in
+// either source format, and `DISPLAY 'PLEASE PERFORM BACKUP'` hides its
+// PERFORM. A continued literal is joined with a space, so its tail after the
+// joint can read as code; that only loses precision on such lines.
+func maskCOBOLLines(lines []srcLine) {
+	if len(lines) == 0 {
+		return
+	}
+	var b strings.Builder
+	b.WriteString(">>SOURCE FORMAT FREE")
+	for _, ln := range lines {
+		b.WriteByte('\n')
+		b.WriteString(strings.ReplaceAll(ln.text, "\r", " "))
+	}
+	joined := b.String()
+	code := strings.Split(textmask.Mask("cobol", joined), "\n")[1:]
+	lits := strings.Split(textmask.MaskComments("cobol", joined), "\n")[1:]
+	for i := range lines {
+		lines[i].code, lines[i].lits = code[i], lits[i]
+	}
 }
 
 func detectFixedFormat(lines []string) bool {
@@ -136,8 +168,9 @@ var (
 	reFD        = regexp.MustCompile(`(?i)^\s*FD\s+([A-Za-z0-9-]+)`)
 	reSelect    = regexp.MustCompile(`(?i)\bSELECT\s+(?:OPTIONAL\s+)?([A-Za-z0-9-]+)\s+ASSIGN\s+TO\s+([A-Za-z0-9-]+)`)
 	rePerform   = regexp.MustCompile(`(?i)\bPERFORM\s+([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+(?:THRU|THROUGH)\s+([A-Za-z0-9-]+))?`)
-	reCallLit   = regexp.MustCompile(`(?i)\bCALL\s+['"]([^'"]+)['"]`)
-	reCallVar   = regexp.MustCompile(`(?i)\bCALL\s+([A-Za-z][A-Za-z0-9-]*)`)
+	reCallVerb  = regexp.MustCompile(`(?i)\bCALL\s`)
+	reCallLit   = regexp.MustCompile(`(?i)^CALL\s+['"]([^'"]+)['"]`)
+	reCallVar   = regexp.MustCompile(`(?i)^CALL\s+([A-Za-z][A-Za-z0-9-]*)`)
 	// Member names cannot start with a digit (PDS naming): a leading-digit
 	// match is a sequence number or numeric operand, not a member
 	// (field-reported: 68 numeric "members" like 053300).
@@ -188,16 +221,18 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 	}
 
 	for _, ln := range lines {
-		if m := reDivision.FindStringSubmatch(ln.text); m != nil {
+		// Structure and verbs are matched on ln.code (comments and literals
+		// blanked); signatures keep the line minus its comments (ln.lits).
+		if m := reDivision.FindStringSubmatch(ln.code); m != nil {
 			division = strings.ToUpper(m[1])
 			continue
 		}
-		if m := reProgramID.FindStringSubmatch(ln.text); m != nil {
+		if m := reProgramID.FindStringSubmatch(ln.lits); m != nil {
 			flushProc()
 			name := strings.TrimSuffix(m[1], ".")
 			s := astkit.Symbol{
 				Kind: kindProgram, Name: name, QualifiedName: name,
-				Signature: strings.TrimSpace(ln.text),
+				Signature: strings.TrimSpace(ln.lits),
 				Span:      astkit.LineRange{Start: ln.orig, End: ln.orig},
 				Exported:  true,
 			}
@@ -209,20 +244,20 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 
 		switch division {
 		case "ENVIRONMENT":
-			if m := reSelect.FindStringSubmatch(ln.text); m != nil {
+			if m := reSelect.FindStringSubmatch(ln.code); m != nil {
 				syms = append(syms, astkit.Symbol{
 					Kind: kindLogicalFile, Name: m[1],
 					QualifiedName: m[1], ParentName: programName,
-					Signature: strings.TrimSpace(ln.text),
+					Signature: strings.TrimSpace(ln.lits),
 					Span:      astkit.LineRange{Start: ln.orig, End: ln.orig},
 				})
 			}
 		case "DATA":
-			if m := reFD.FindStringSubmatch(ln.text); m != nil {
+			if m := reFD.FindStringSubmatch(ln.code); m != nil {
 				stack = stack[:0]
 				continue
 			}
-			if m := reDataItem.FindStringSubmatch(ln.text); m != nil {
+			if m := reDataItem.FindStringSubmatch(ln.code); m != nil {
 				level := parseLevel(m[1])
 				name := m[2]
 				rest := m[3]
@@ -260,7 +295,7 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 						qn = lastItem + "." + name
 					}
 				}
-				sig := strings.TrimSpace(strings.TrimSuffix(ln.text, "."))
+				sig := strings.TrimSpace(strings.TrimSuffix(ln.lits, "."))
 				sym := astkit.Symbol{
 					Kind: kind, Name: name, QualifiedName: qn, ParentName: parent,
 					Signature: sig,
@@ -286,26 +321,26 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 				continue
 			}
 		case "PROCEDURE":
-			if m := reSection.FindStringSubmatch(ln.text); m != nil {
+			if m := reSection.FindStringSubmatch(ln.code); m != nil {
 				flushProc()
 				name := m[1]
 				s := astkit.Symbol{
 					Kind: kindSection, Name: name, QualifiedName: name,
 					ParentName: programName,
-					Signature:  strings.TrimSpace(ln.text),
+					Signature:  strings.TrimSpace(ln.lits),
 					Span:       astkit.LineRange{Start: ln.orig, End: ln.orig},
 					Body:       strings.TrimSpace(ln.text),
 				}
 				currentProc = &s
 				continue
 			}
-			if m := reParagraph.FindStringSubmatch(ln.text); m != nil && !reReserved.MatchString(m[1]) {
+			if m := reParagraph.FindStringSubmatch(ln.code); m != nil && !reReserved.MatchString(m[1]) {
 				flushProc()
 				name := m[1]
 				s := astkit.Symbol{
 					Kind: kindParagraph, Name: name, QualifiedName: name,
 					ParentName: programName,
-					Signature:  strings.TrimSpace(ln.text),
+					Signature:  strings.TrimSpace(ln.lits),
 					Span:       astkit.LineRange{Start: ln.orig, End: ln.orig},
 					Body:       strings.TrimSpace(ln.text),
 				}
@@ -317,7 +352,7 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 				target = &syms[progIndex]
 			}
 			if target != nil {
-				for _, pm := range rePerform.FindAllStringSubmatch(ln.text, -1) {
+				for _, pm := range rePerform.FindAllStringSubmatch(ln.code, -1) {
 					if !reReserved.MatchString(pm[1]) {
 						target.CallSites = append(target.CallSites, astkit.CallSite{Callee: pm[1], Line: ln.orig})
 					}
@@ -326,14 +361,18 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 						performRanges = append(performRanges, performRange{target.QualifiedName, pm[1], pm[2], ln.orig})
 					}
 				}
-				if cm := reCallLit.FindStringSubmatch(ln.text); cm != nil {
-					target.CallSites = append(target.CallSites, astkit.CallSite{Callee: cm[1], Line: ln.orig})
-				} else if cm := reCallVar.FindStringSubmatch(ln.text); cm != nil && !strings.EqualFold(cm[1], "FUNCTION") {
-					// Dynamic call through a variable: record the variable name
-					// so the edge exists as a known-unknown rather than vanishing.
-					target.CallSites = append(target.CallSites, astkit.CallSite{
-						Callee: cm[1], Line: ln.orig, Args: []string{"dynamic"},
-					})
+				// The CALL verb is found in code; its literal target is read
+				// at the same offset in lits, where the literal survives.
+				if loc := reCallVerb.FindStringIndex(ln.code); loc != nil {
+					if cm := reCallLit.FindStringSubmatch(ln.lits[loc[0]:]); cm != nil {
+						target.CallSites = append(target.CallSites, astkit.CallSite{Callee: cm[1], Line: ln.orig})
+					} else if cm := reCallVar.FindStringSubmatch(ln.code[loc[0]:]); cm != nil && !strings.EqualFold(cm[1], "FUNCTION") {
+						// Dynamic call through a variable: record the variable name
+						// so the edge exists as a known-unknown rather than vanishing.
+						target.CallSites = append(target.CallSites, astkit.CallSite{
+							Callee: cm[1], Line: ln.orig, Args: []string{"dynamic"},
+						})
+					}
 				}
 			}
 		}
@@ -383,6 +422,17 @@ func (c *cobolStrategy) Extract(tree *sitter.Tree, src []byte) ([]astkit.Symbol,
 	return syms, nil
 }
 
+// cobolTrimLike trims masked the way strings.TrimSpace trims text (both are
+// byte-aligned), so a joined line's views stay aligned with its text.
+func cobolTrimLike(text, masked string) string {
+	lead := len(text) - len(strings.TrimLeft(text, " \t\r\n"))
+	trail := len(strings.TrimRight(text, " \t\r\n"))
+	if trail < lead {
+		return ""
+	}
+	return masked[lead:trail]
+}
+
 func joinCOBOLDataClauses(lines []srcLine) []srcLine {
 	out := make([]srcLine, 0, len(lines))
 	division := "DATA"
@@ -403,6 +453,8 @@ func joinCOBOLDataClauses(lines []srcLine) []srcLine {
 				break
 			}
 			line.text += " " + strings.TrimSpace(next.text)
+			line.code += " " + cobolTrimLike(next.text, next.code)
+			line.lits += " " + cobolTrimLike(next.text, next.lits)
 			idx++
 			if strings.HasSuffix(strings.TrimSpace(next.text), ".") {
 				break
@@ -418,8 +470,8 @@ var (
 	// extraction: REPLACING arguments legally contain '&', '#' and even the
 	// word COPY, and a member name harvested from them is confidently wrong
 	// (observed on a real estate: 54 members extracted from REPLACING args).
+	// Literals and comments are already blanked in srcLine.code.
 	rePseudoText = regexp.MustCompile(`==[^=]*(?:=[^=]+)*==`)
-	reQuotedLit  = regexp.MustCompile(`'[^']*'|"[^"]*"`)
 	reCopyTail   = regexp.MustCompile(`(?i)\bCOPY\s*$`)
 	reMemberHead = regexp.MustCompile(`^\s*([A-Za-z@#$][A-Za-z0-9@#$-]*)`)
 )
@@ -440,8 +492,7 @@ func (c *cobolStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit.
 	}
 	pendingCopy := false // previous line ended at COPY; member starts this line
 	for _, ln := range normalizeCOBOL(src) {
-		clean := rePseudoText.ReplaceAllString(ln.text, " ")
-		clean = reQuotedLit.ReplaceAllString(clean, " ")
+		clean := rePseudoText.ReplaceAllString(ln.code, " ")
 		if pendingCopy {
 			if m := reMemberHead.FindStringSubmatch(clean); m != nil {
 				emit(m[1], ln.text, ln.orig)

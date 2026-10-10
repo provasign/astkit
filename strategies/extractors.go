@@ -10,6 +10,7 @@ import (
 
 	"github.com/provasign/astkit"
 	"github.com/provasign/astkit/internalast"
+	"github.com/provasign/astkit/textmask"
 )
 
 // ─── Go ───────────────────────────────────────────────────────────────────────
@@ -160,7 +161,7 @@ func goTypeDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			Kind:           kind,
 			Name:           name,
 			QualifiedName:  name,
-			Signature:      internalast.FirstLine(raw),
+			Signature:      goStandaloneDecl("type", internalast.FirstLineSig(spec, src, nil)),
 			Span:           internalast.NodeSpan(spec),
 			Exported:       internalast.IsCapitalized(name),
 			Body:           raw,
@@ -202,7 +203,7 @@ func goInterfaceMethods(ifaceType *sitter.Node, parent string, typeParams []stri
 			Name:           name,
 			QualifiedName:  name,
 			ParentName:     parent,
-			Signature:      internalast.FirstLine(raw),
+			Signature:      internalast.FirstLineSig(elem, src, internalast.IsAttributeSection),
 			Span:           internalast.NodeSpan(elem),
 			Exported:       internalast.IsCapitalized(name),
 			Body:           raw,
@@ -308,7 +309,7 @@ func goVarDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []s
 				Kind:          astkit.KindVariable,
 				Name:          name,
 				QualifiedName: name,
-				Signature:     internalast.FirstLine(raw),
+				Signature:     goStandaloneDecl("var", internalast.FirstLineSig(spec, src, nil)),
 				Span:          internalast.NodeSpan(spec),
 				Exported:      internalast.IsCapitalized(name),
 				Body:          raw,
@@ -561,7 +562,7 @@ func jsAssignTarget(assign, left, value *sitter.Node, filePath, blobSHA, languag
 			Kind:          k,
 			Name:          name,
 			QualifiedName: name,
-			Signature:     internalast.FirstLine(raw),
+			Signature:     internalast.FirstLineSig(assign, src, internalast.IsAttributeSection),
 			Span:          internalast.NodeSpan(assign),
 			Exported:      exported,
 			Body:          raw,
@@ -592,7 +593,7 @@ func jsAssignTarget(assign, left, value *sitter.Node, filePath, blobSHA, languag
 		} else if exported {
 			*out = append(*out, astkit.Symbol{
 				Kind: astkit.KindVariable, Name: name, QualifiedName: name,
-				Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(assign),
+				Signature: internalast.FirstLineSig(assign, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(assign),
 				Exported: true, Body: raw, Modifiers: []string{"module-value"},
 			})
 			jsObjectMembers(value, name, false, false, 1, filePath, blobSHA, language, src, imports, out)
@@ -601,7 +602,7 @@ func jsAssignTarget(assign, left, value *sitter.Node, filePath, blobSHA, languag
 		if exported && jsIsDeclaredValue(value, src) {
 			*out = append(*out, astkit.Symbol{
 				Kind: astkit.KindVariable, Name: name, QualifiedName: name,
-				Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(assign),
+				Signature: internalast.FirstLineSig(assign, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(assign),
 				Exported: true, Body: raw, Modifiers: []string{"module-value"},
 			})
 		}
@@ -658,7 +659,7 @@ func jsObjectMembers(obj *sitter.Node, parent string, exported, values bool, dep
 			*out = append(*out, astkit.Symbol{
 				Kind: k, Name: memberName,
 				QualifiedName: qualJoin(parent, memberName),
-				Signature:     internalast.FirstLine(member.Content(src)),
+				Signature:     internalast.FirstLineSig(member, src, internalast.IsAttributeSection),
 				Span:          internalast.NodeSpan(member), Body: member.Content(src),
 				Exported:   parent == "" && exported,
 				ParentName: qualLast(parent),
@@ -670,7 +671,7 @@ func jsObjectMembers(obj *sitter.Node, parent string, exported, values bool, dep
 			}
 			*out = append(*out, astkit.Symbol{
 				Kind: astkit.KindVariable, Name: memberName, QualifiedName: qualJoin(parent, memberName),
-				Signature: internalast.FirstLine(member.Content(src)), Span: internalast.NodeSpan(member),
+				Signature: internalast.FirstLineSig(member, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(member),
 				Body: member.Content(src), ParentName: qualLast(parent),
 				Modifiers: []string{"member-value"},
 			})
@@ -681,7 +682,7 @@ func jsObjectMembers(obj *sitter.Node, parent string, exported, values bool, dep
 			}
 			*out = append(*out, astkit.Symbol{
 				Kind: astkit.KindVariable, Name: memberName, QualifiedName: qualJoin(parent, memberName),
-				Signature: internalast.FirstLine(member.Content(src)), Span: internalast.NodeSpan(member),
+				Signature: internalast.FirstLineSig(member, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(member),
 				Exported: parent == "" && exported, Body: member.Content(src), ParentName: qualLast(parent),
 				Modifiers: []string{"module-value"},
 			})
@@ -789,7 +790,7 @@ func jsDefinePropertyCall(n *sitter.Node, src []byte, out *[]astkit.Symbol) {
 	raw := n.Content(src)
 	*out = append(*out, astkit.Symbol{
 		Kind: astkit.KindMethod, Name: name, QualifiedName: name, ParentName: parent,
-		Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(n), Body: raw,
+		Signature: internalast.FirstLineSig(n, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(n), Body: raw,
 		CallSites: jsCallSites(accessor.ChildByFieldName("body"), src),
 	})
 }
@@ -822,7 +823,7 @@ func jsThisFields(body *sitter.Node, owner string, src []byte, out *[]astkit.Sym
 						raw := c.Content(src)
 						*out = append(*out, astkit.Symbol{
 							Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(owner, name),
-							Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(c),
+							Signature: internalast.FirstLineSig(c, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(c),
 							Body: raw, ParentName: qualLast(owner),
 							Modifiers: []string{"member-value", "this-assigned"},
 						})
@@ -902,7 +903,7 @@ func jsParamProperties(ctor *sitter.Node, parentClass string, src []byte, out *[
 		raw := p.Content(src)
 		*out = append(*out, astkit.Symbol{
 			Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(parentClass, name),
-			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(p), Body: raw,
+			Signature: internalast.FirstLineSig(p, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(p), Body: raw,
 			ParentName: qualLast(parentClass), Modifiers: append(mods, "member-value"),
 			Annotations: jsDecorators(p, src),
 		})
@@ -937,7 +938,7 @@ func jsEnumMembers(n *sitter.Node, enumQual string, exported bool, src []byte, o
 		raw := m.Content(src)
 		*out = append(*out, astkit.Symbol{
 			Kind: astkit.KindConst, Name: name, QualifiedName: qualJoin(enumQual, name),
-			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(m), Body: raw,
+			Signature: internalast.FirstLineSig(m, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(m), Body: raw,
 			Exported: exported, ParentName: qualLast(enumQual), Modifiers: []string{"member-value"},
 		})
 	}
@@ -972,7 +973,7 @@ func jsInterfaceMembers(n *sitter.Node, filePath, blobSHA, language string, src 
 			raw := m.Content(src)
 			*out = append(*out, astkit.Symbol{
 				Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(ifaceQual, name),
-				Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(m), Body: raw,
+				Signature: internalast.FirstLineSig(m, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(m), Body: raw,
 				ParentName: qualLast(ifaceQual), Modifiers: append(jsModifiers(m, src), "member-value"),
 				// Like method signatures, a function-typed property
 				// (`onSave: (x) => void`) declares no body to call into.
@@ -1133,7 +1134,7 @@ func jsFieldDef(n *sitter.Node, filePath, blobSHA, language string, src []byte, 
 		Kind:          astkit.KindField,
 		Name:          name,
 		QualifiedName: qualJoin(parentClass, name),
-		Signature:     internalast.FirstLine(raw),
+		Signature:     internalast.FirstLineSig(n, src, internalast.IsAttributeSection),
 		Span:          internalast.NodeSpan(n),
 		Exported:      false,
 		Body:          raw,
@@ -1231,7 +1232,7 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 				Kind:           k,
 				Name:           name,
 				QualifiedName:  qualJoin(parentClass, name),
-				Signature:      internalast.FirstLine(raw),
+				Signature:      internalast.FirstLineSig(decl, src, internalast.IsAttributeSection),
 				Span:           internalast.NodeSpan(decl),
 				Exported:       exported,
 				Body:           raw,
@@ -1253,7 +1254,7 @@ func jsArrowDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte,
 			*out = append(*out, astkit.Symbol{
 				Kind: astkit.KindVariable, Name: objectName,
 				QualifiedName: qualJoin(parentClass, objectName),
-				Signature:     internalast.FirstLine(decl.Content(src)),
+				Signature:     internalast.FirstLineSig(decl, src, internalast.IsAttributeSection),
 				Span:          internalast.NodeSpan(decl), Exported: exported,
 				Body: decl.Content(src), ParentName: qualLast(parentClass),
 			})
@@ -1274,7 +1275,7 @@ func jsValueSym(decl, nameNode *sitter.Node, parentClass string, exported bool, 
 	raw := decl.Content(src)
 	*out = append(*out, astkit.Symbol{
 		Kind: astkit.KindVariable, Name: name, QualifiedName: qualJoin(parentClass, name),
-		Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(decl),
+		Signature: internalast.FirstLineSig(decl, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(decl),
 		Exported: exported, Body: raw, ParentName: qualLast(parentClass),
 		// Lets graph builders tell these apart from the object-literal
 		// variables indexed before 2026-09-26.
@@ -1338,7 +1339,7 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 			Kind:          kind,
 			Name:          name,
 			QualifiedName: qualified,
-			Signature:     internalast.FirstLine(raw),
+			Signature:     pythonDefSig(n, src),
 			Span:          internalast.NodeSpan(n),
 			Exported:      !strings.HasPrefix(name, "_"),
 			Body:          raw,
@@ -1457,7 +1458,7 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 			if typeNode != nil {
 				sig = name + ": " + typeNode.Content(src)
 			} else if right := a.ChildByFieldName("right"); right != nil {
-				sig = internalast.FirstLine(raw)
+				sig = internalast.FirstLineSig(n, src, internalast.IsAttributeSection)
 			}
 			kind := astkit.KindVariable
 			qn := name
@@ -1485,6 +1486,23 @@ func pythonVisitDefinition(n *sitter.Node, filePath, blobSHA string, src []byte,
 // each contained statement so conditionally-defined classes, functions, and
 // module-level annotated variables are still indexed. Condition and iterable
 // expressions are skipped — only block-bearing children are descended.
+// pythonDefSig is a def's header: its first line, or, when the parameter
+// list wraps (`def build(\n    size,\n) -> Gadget:`), the whole header up to
+// the colon, whitespace collapsed. Comments are cut either way.
+func pythonDefSig(n *sitter.Node, src []byte) string {
+	var colon *sitter.Node
+	for i := int(n.ChildCount()) - 1; i >= 0; i-- {
+		if c := n.Child(i); c != nil && c.Type() == ":" {
+			colon = c
+			break
+		}
+	}
+	if colon == nil || colon.StartPoint().Row == n.StartPoint().Row {
+		return internalast.FirstLineSig(n, src, nil)
+	}
+	return strings.Join(strings.Fields(internalast.HeaderText(n, src, n.StartByte(), colon.EndByte(), nil)), " ")
+}
+
 func pythonVisitBlocks(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass, qualifier string, inFunction bool, out *[]astkit.Symbol) {
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)
@@ -1565,7 +1583,7 @@ func pythonModuleAssignments(root *sitter.Node, src []byte, existing []astkit.Sy
 							Kind:          kind,
 							Name:          name,
 							QualifiedName: name,
-							Signature:     internalast.FirstLine(raw),
+							Signature:     internalast.FirstLineSig(n, src, internalast.IsAttributeSection),
 							Span:          internalast.NodeSpan(n),
 							Exported:      !strings.HasPrefix(name, "_"),
 							Body:          raw,
@@ -1913,13 +1931,10 @@ func javaTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 	// continuation lines, and a leading annotation is not a signature.
 	sig := internalast.SignatureBeforeBody(n, src)
 	modifiers := javaModifiers(n, src)
-	exports := strings.Contains(sig, "public")
-	for _, m := range modifiers {
-		if m == "public" {
-			exports = true
-			break
-		}
-	}
+	// Exported comes from the modifiers node's `public` keyword, never
+	// from text: `void publication()` and `String mode = "public"` are
+	// package-private.
+	exports := internalast.HasModifier(modifiers, "public")
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
 		Name:           className,
@@ -1940,8 +1955,34 @@ func javaTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 	if body != nil {
 		before := len(*out)
 		javaVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, className), out)
-		synthesizeLombokAccessors(className, javaAnnotations(n, src), before, out)
+		synthesizeLombokAccessors(className, javaAnnotations(n, src), javaPrimitiveBooleanFields(body, src), before, out)
 	}
+}
+
+// javaPrimitiveBooleanFields returns the names of the fields declared in
+// class body whose type node is the primitive `boolean`.
+func javaPrimitiveBooleanFields(body *sitter.Node, src []byte) map[string]bool {
+	var out map[string]bool
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		fd := body.NamedChild(i)
+		if fd == nil || fd.Type() != "field_declaration" {
+			continue
+		}
+		if t := fd.ChildByFieldName("type"); t == nil || t.Type() != "boolean_type" {
+			continue
+		}
+		for j := 0; j < int(fd.NamedChildCount()); j++ {
+			if d := fd.NamedChild(j); d != nil && d.Type() == "variable_declarator" {
+				if nm := d.ChildByFieldName("name"); nm != nil {
+					if out == nil {
+						out = map[string]bool{}
+					}
+					out[nm.Content(src)] = true
+				}
+			}
+		}
+	}
+	return out
 }
 
 // javaRecordComponents emits the implicit field and public accessor that Java
@@ -2006,11 +2047,17 @@ func javaEnumConstantDecl(n *sitter.Node, src []byte, parentClass string, out *[
 // queries could not be queried at all). Synthesized symbols carry the
 // "lombok-generated" modifier and the FIELD's span, so results point at the
 // declaration a human would edit.
-func synthesizeLombokAccessors(className string, classAnn []string, fieldsFrom int, out *[]astkit.Symbol) {
+//
+// The getter of a primitive `boolean` field is isX; every other type,
+// boxed Boolean included, gets getX. boolFields names the primitive boolean
+// fields, read from the declarations' type nodes.
+func synthesizeLombokAccessors(className string, classAnn []string, boolFields map[string]bool, fieldsFrom int, out *[]astkit.Symbol) {
 	has := func(ann []string, names ...string) bool {
 		// javaAnnotations strips the leading @; match the bare name exactly
-		// or with an argument list ("Getter", "Getter(...)").
+		// or with an argument list ("Getter", "Getter(...)"), plain or
+		// fully qualified ("lombok.Getter").
 		for _, a := range ann {
+			a = strings.TrimPrefix(a, "lombok.")
 			for _, n := range names {
 				if a == n || strings.HasPrefix(a, n+"(") {
 					return true
@@ -2045,7 +2092,7 @@ func synthesizeLombokAccessors(className string, classAnn []string, fieldsFrom i
 		name := f.Name
 		cap := strings.ToUpper(name[:1]) + name[1:]
 		getter := "get" + cap
-		if strings.Contains(f.Signature, "boolean ") {
+		if boolFields[name] {
 			getter = "is" + cap
 		}
 		mk := func(mname, sig string) astkit.Symbol {
@@ -2085,12 +2132,7 @@ func javaMethodDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA st
 		sig += javaCompactConstructorParams(n, src)
 	}
 	modifiers := javaModifiers(n, src)
-	exports := strings.Contains(sig, "public") || n.Type() == "annotation_type_element_declaration"
-	for _, m := range modifiers {
-		if m == "public" {
-			exports = true
-		}
-	}
+	exports := internalast.HasModifier(modifiers, "public") || n.Type() == "annotation_type_element_declaration"
 	body := n.ChildByFieldName("body")
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
@@ -2212,12 +2254,7 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 	// field made FirstLine return just "@Deprecated" as the signature.
 	sig := internalast.SignatureBeforeBody(n, src)
 	modifiers := javaModifiers(n, src)
-	exports := strings.Contains(sig, "public") || n.Type() == "constant_declaration"
-	for _, m := range modifiers {
-		if m == "public" {
-			exports = true
-		}
-	}
+	exports := internalast.HasModifier(modifiers, "public") || n.Type() == "constant_declaration"
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		decl := n.NamedChild(i)
 		if decl == nil || decl.Type() != "variable_declarator" {
@@ -2493,7 +2530,7 @@ func rustEnumVariants(n *sitter.Node, src []byte, out *[]astkit.Symbol) {
 			Kind:          astkit.KindField,
 			Name:          name,
 			QualifiedName: name,
-			Signature:     internalast.FirstLine(raw),
+			Signature:     internalast.FirstLineSig(v, src, internalast.IsAttributeSection),
 			Span:          internalast.NodeSpan(v),
 			Exported:      exported,
 			Body:          raw,
@@ -2515,7 +2552,7 @@ func rustNamedItem(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA str
 		Kind:           kind,
 		Name:           name,
 		QualifiedName:  name,
-		Signature:      internalast.FirstLine(raw),
+		Signature:      internalast.FirstLineSig(n, src, internalast.IsAttributeSection),
 		Span:           internalast.NodeSpan(n),
 		Exported:       strings.HasPrefix(strings.TrimSpace(raw), "pub"),
 		Body:           raw,
@@ -2581,7 +2618,7 @@ func rustStructFields(n *sitter.Node, filePath, blobSHA string, src []byte, impo
 			Kind:          astkit.KindField,
 			Name:          name,
 			QualifiedName: name,
-			Signature:     internalast.FirstLine(raw),
+			Signature:     internalast.FirstLineSig(fd, src, internalast.IsAttributeSection),
 			Span:          internalast.NodeSpan(fd),
 			Exported:      strings.HasPrefix(strings.TrimSpace(raw), "pub"),
 			Body:          raw,
@@ -2690,41 +2727,87 @@ func cMacroSym(n *sitter.Node, filePath, blobSHA, language string, src []byte) *
 	if nameNode == nil {
 		return nil
 	}
-	name := nameNode.Content(src)
+	body := ""
+	if v := n.ChildByFieldName("value"); v != nil {
+		body = v.Content(src)
+	}
+	return cMacroSymbol(nameNode.Content(src), n.ChildByFieldName("parameters"), body,
+		n.Content(src), internalast.NodeSpan(n), language, src)
+}
+
+// cMacroFromError recovers a `#define` the C grammar could not parse. A
+// block comment in the middle of a continued macro body
+// (`do { \ f(); /* note */ \ } while (0)`) turns the whole directive into
+// an ERROR node that still starts with `#define NAME(params)`; without this
+// the macro vanished. The body is the rest of the logical line: physical
+// lines joined by a trailing backslash.
+func cMacroFromError(n *sitter.Node, language string, src []byte) *astkit.Symbol {
+	if n.ChildCount() < 2 || n.Child(0).Type() != "#define" || n.Child(1).Type() != "identifier" {
+		return nil
+	}
+	nameNode := n.Child(1)
+	var params *sitter.Node
+	bodyStart := nameNode.EndByte()
+	if c := n.Child(2); c != nil && c.Type() == "preproc_params" {
+		params = c
+		bodyStart = c.EndByte()
+	}
+	end := int(bodyStart)
+	for end < len(src) {
+		nl := strings.IndexByte(string(src[end:]), '\n')
+		if nl < 0 {
+			end = len(src)
+			break
+		}
+		line := strings.TrimRight(string(src[end:end+nl]), "\r")
+		end += nl
+		if !strings.HasSuffix(line, "\\") {
+			break
+		}
+		end++
+	}
+	start := n.StartPoint()
+	span := astkit.LineRange{Start: int(start.Row) + 1, End: int(start.Row) + 1 + strings.Count(string(src[n.StartByte():end]), "\n")}
+	return cMacroSymbol(nameNode.Content(src), params, string(src[bodyStart:end]),
+		string(src[n.StartByte():end]), span, language, src)
+}
+
+func cMacroSymbol(name string, paramsNode *sitter.Node, body, raw string, span astkit.LineRange, language string, src []byte) *astkit.Symbol {
 	params := ""
 	var paramNames []string
-	if p := n.ChildByFieldName("parameters"); p != nil {
-		params = strings.Join(strings.Fields(p.Content(src)), "")
+	if paramsNode != nil {
+		params = strings.Join(strings.Fields(paramsNode.Content(src)), "")
 		for _, x := range strings.Split(strings.Trim(params, "()"), ",") {
 			if x = strings.TrimSpace(x); x != "" {
 				paramNames = append(paramNames, x)
 			}
 		}
 	}
-	body := ""
-	if v := n.ChildByFieldName("value"); v != nil {
-		body = v.Content(src)
-	}
 	isParam := map[string]bool{}
 	for _, p := range paramNames {
 		isParam[p] = true
 	}
+	// Calls are read from the body with comments and string literals
+	// blanked: `printf("value(%d)", x)` calls printf, not value, and a
+	// comment on a continued line is not code. Argument text is still
+	// classified from the original body (a string argument is "#String").
+	code := textmask.Mask(language, body)
 	var sites []astkit.CallSite
-	for _, m := range cMacroCallRe.FindAllStringSubmatchIndex(body, -1) {
-		callee := body[m[2]:m[3]]
+	for _, m := range cMacroCallRe.FindAllStringSubmatchIndex(code, -1) {
+		callee := code[m[2]:m[3]]
 		if cMacroKeywords[callee] {
 			continue
 		}
 		open := m[1] - 1 // index of '('
-		args, argc := cMacroArgs(body, open)
+		args, argc := cMacroArgs(body, code, open)
 		sites = append(sites, astkit.CallSite{
-			Callee: callee, Line: int(n.StartPoint().Row) + 1, Argc: argc, Args: args,
+			Callee: callee, Line: span.Start, Argc: argc, Args: args,
 		})
 	}
 	sig := "#define " + name + params
 	return &astkit.Symbol{
 		Kind: astkit.KindMacro, Name: name, QualifiedName: name, Signature: sig,
-		Span: internalast.NodeSpan(n), Exported: true, Body: n.Content(src),
+		Span: span, Exported: true, Body: raw,
 		CallSites: sites,
 	}
 }
@@ -2732,20 +2815,22 @@ func cMacroSym(n *sitter.Node, filePath, blobSHA, language string, src []byte) *
 // cMacroArgs tokenizes the argument list opening at body[open]: an
 // identifier stays (a macro parameter name is substituted downstream, a
 // function name becomes a reference), a string or stringized `#param`
-// argument is "#String", a number "#int", anything else "".
-func cMacroArgs(body string, open int) ([]string, int) {
+// argument is "#String", a number "#int", anything else "". Parentheses and
+// commas are read from code (body with comments and literals masked), so a
+// comma inside a string does not split an argument.
+func cMacroArgs(body, code string, open int) ([]string, int) {
 	depth := 0
 	start := open + 1
 	var raw []string
-	for i := open; i < len(body); i++ {
-		switch body[i] {
+	for i := open; i < len(code); i++ {
+		switch code[i] {
 		case '(':
 			depth++
 		case ')':
 			depth--
 			if depth == 0 {
 				raw = append(raw, body[start:i])
-				i = len(body)
+				i = len(code)
 			}
 		case ',':
 			if depth == 1 {
@@ -2841,9 +2926,25 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 			// Declarations in conditional branches are ordinary source symbols.
 			// Tree-sitter nests them below the preprocessor node rather than the
 			// translation unit, so explicitly descend into each guarded region.
+			// An `#if 0` branch is disabled code (often a commented-out
+			// block): only its `#elif`/`#else` alternative is descended.
+			if cPreprocDisabled(n, src) {
+				alt := n.ChildByFieldName("alternative")
+				for alt != nil && cPreprocDisabled(alt, src) {
+					alt = alt.ChildByFieldName("alternative")
+				}
+				if alt != nil {
+					out = append(out, extractCNodes(alt, filePath, blobSHA, language, src, imports)...)
+				}
+				continue
+			}
 			out = append(out, extractCNodes(n, filePath, blobSHA, language, src, imports)...)
 		case "preproc_function_def", "preproc_def":
 			if sym := cMacroSym(n, filePath, blobSHA, language, src); sym != nil {
+				out = append(out, *sym)
+			}
+		case "ERROR":
+			if sym := cMacroFromError(n, language, src); sym != nil {
 				out = append(out, *sym)
 			}
 		case "linkage_specification":
@@ -2885,6 +2986,23 @@ func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []
 	return out
 }
 
+// cPreprocDisabled reports whether n is an `#if 0` / `#elif 0` conditional,
+// the same literal-false test textmask.MaskInactivePreprocessor applies.
+func cPreprocDisabled(n *sitter.Node, src []byte) bool {
+	if n.Type() != "preproc_if" && n.Type() != "preproc_elif" {
+		return false
+	}
+	c := n.ChildByFieldName("condition")
+	if c == nil {
+		return false
+	}
+	switch strings.Join(strings.Fields(c.Content(src)), "") {
+	case "0", "(0)":
+		return true
+	}
+	return false
+}
+
 func cFuncSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, parentClass string) *astkit.Symbol {
 	// function_definition: type declarator body
 	declarator := n.ChildByFieldName("declarator")
@@ -2905,7 +3023,7 @@ func cFuncSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, im
 		return nil
 	}
 	if language == "cpp" && parentClass == "" {
-		parentClass = cppDeclaratorOwner(declarator.Content(src))
+		parentClass = cppDeclaratorOwner(internalast.HeaderText(declarator, src, declarator.StartByte(), declarator.EndByte(), nil))
 	}
 	raw := n.Content(src)
 	modifiers := cStorageModifiers(n, src)
@@ -3198,7 +3316,7 @@ func cTypedefSyms(n *sitter.Node, filePath, blobSHA, language string, src []byte
 		Kind:          kind,
 		Name:          name,
 		QualifiedName: name,
-		Signature:     internalast.FirstLine(raw),
+		Signature:     internalast.FirstLineSig(n, src, internalast.IsAttributeSection),
 		Span:          internalast.NodeSpan(n),
 		Exported:      true,
 		Body:          raw,
@@ -3216,7 +3334,7 @@ func cTypedefSyms(n *sitter.Node, filePath, blobSHA, language string, src []byte
 	if tag != "" && tag != name {
 		out = append(out, astkit.Symbol{
 			Kind: kind, Name: tag, QualifiedName: tag,
-			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(n),
+			Signature: internalast.FirstLineSig(n, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(n),
 			Exported: true, Body: raw,
 		})
 	}
@@ -3513,7 +3631,7 @@ func cNestedRecordSyms(fd *sitter.Node, parent, sep string, src []byte) []astkit
 		raw := spec.Content(src)
 		out := []astkit.Symbol{{
 			Kind: astkit.KindStruct, Name: tag, QualifiedName: tag,
-			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(spec),
+			Signature: internalast.FirstLineSig(spec, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(spec),
 			Exported: true, Body: raw,
 		}}
 		return append(out, cStructFields(spec, tag, src)...)
@@ -3550,7 +3668,7 @@ func cTaggedTypeSym(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA, l
 		Kind:          kind,
 		Name:          name,
 		QualifiedName: name,
-		Signature:     internalast.FirstLine(raw),
+		Signature:     internalast.FirstLineSig(n, src, internalast.IsAttributeSection),
 		Span:          internalast.NodeSpan(n),
 		Exported:      true,
 		Body:          raw,
@@ -3838,7 +3956,7 @@ func cppNestedTypeSyms(fd *sitter.Node, className, access, filePath, blobSHA, la
 		raw := spec.Content(src)
 		enum := astkit.Symbol{
 			Kind: astkit.KindEnum, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
-			ParentName: className, Signature: internalast.FirstLine(raw),
+			ParentName: className, Signature: internalast.FirstLineSig(spec, src, internalast.IsAttributeSection),
 			Span: internalast.NodeSpan(spec), Exported: true, Body: raw,
 		}
 		cppSetMemberAccess(&enum, access)
@@ -3899,7 +4017,7 @@ func cppNamespaceSym(n *sitter.Node, filePath, blobSHA, language string, src []b
 		Kind:          astkit.KindNamespace,
 		Name:          name,
 		QualifiedName: name,
-		Signature:     internalast.FirstLine(raw),
+		Signature:     internalast.FirstLineSig(n, src, internalast.IsAttributeSection),
 		Span:          internalast.NodeSpan(n),
 		Exported:      true,
 		Body:          raw,
@@ -3982,7 +4100,7 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 				Kind:          astkit.KindNamespace,
 				Name:          nsName,
 				QualifiedName: nsName,
-				Signature:     internalast.FirstLine(raw),
+				Signature:     internalast.FirstLineSig(n, src, internalast.IsAttributeSection),
 				Span:          internalast.NodeSpan(n),
 				Exported:      true,
 				Body:          raw,
@@ -3994,7 +4112,9 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			csTypeDecl(n, astkit.KindClass, filePath, blobSHA, src, imports, parentClass, out)
 		case "record_declaration":
 			kind := astkit.KindClass
-			if strings.Contains(internalast.SignatureBeforeBody(n, src), "record struct") {
+			// `record struct` carries an anonymous `struct` keyword token;
+			// text matching also hit "record struct" in a string argument.
+			if internalast.FindChildByType(n, "struct") != nil {
 				kind = astkit.KindStruct
 			}
 			csTypeDecl(n, kind, filePath, blobSHA, src, imports, parentClass, out)
@@ -4142,7 +4262,9 @@ func csEventDecl(n *sitter.Node, src []byte, parentClass string, out *[]astkit.S
 	name := nameNode.Content(src)
 	raw := n.Content(src)
 	modifiers := append(csModifiers(n, src), "event")
-	sig := raw
+	// Attribute sections and comments are cut first: a `{` inside
+	// `[X("{")]` ended the signature early.
+	sig := internalast.HeaderText(n, src, n.StartByte(), n.EndByte(), internalast.IsAttributeSection)
 	if i := strings.IndexByte(sig, '{'); i >= 0 {
 		sig = sig[:i]
 	}
@@ -4431,7 +4553,7 @@ func csTypeLastName(n *sitter.Node, src []byte) string {
 // receiver's indexer.
 func csIndexerDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
 	raw := n.Content(src)
-	sig := raw
+	sig := internalast.HeaderText(n, src, n.StartByte(), n.EndByte(), internalast.IsAttributeSection)
 	if i := strings.IndexByte(sig, '{'); i >= 0 {
 		sig = sig[:i]
 	}
@@ -4469,7 +4591,7 @@ func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, import
 		Kind:          kind,
 		Name:          name,
 		QualifiedName: qualJoin(parentClass, name),
-		Signature:     internalast.FirstLine(raw),
+		Signature:     internalast.FirstLineSig(n, src, internalast.IsAttributeSection),
 		Span:          internalast.NodeSpan(n),
 		Exported:      csIsExported(modifiers),
 		Body:          raw,
@@ -4504,7 +4626,7 @@ func csFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports [
 			raw := decl.Content(src)
 			*out = append(*out, astkit.Symbol{
 				Kind: astkit.KindField, Name: name, QualifiedName: qualJoin(parentClass, name),
-				Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(decl),
+				Signature: internalast.FirstLineSig(decl, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(decl),
 				Exported: csIsExported(modifiers), Body: raw, ParentName: qualLast(parentClass), Modifiers: modifiers,
 			})
 		}
@@ -5261,7 +5383,7 @@ func swiftProtocolDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imp
 			}
 			*out = append(*out, astkit.Symbol{
 				Kind: astkit.KindMethod, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
-				Signature: internalast.FirstLine(m.Content(src)), Span: internalast.NodeSpan(m),
+				Signature: internalast.FirstLineSig(m, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(m),
 				Exported: true, Body: m.Content(src), ParentName: name,
 			})
 		case "protocol_property_declaration":
@@ -5336,7 +5458,7 @@ func swiftPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imp
 		}
 		*out = append(*out, astkit.Symbol{
 			Kind: kind, Name: name, QualifiedName: name,
-			Signature: internalast.FirstLine(raw), Span: internalast.NodeSpan(n),
+			Signature: internalast.FirstLineSig(n, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(n),
 			Exported: swiftIsExported(modifiers), Body: raw, ParentName: qualLast(implType),
 			Modifiers: modifiers, Annotations: swiftAttributes(n, src),
 		})
@@ -5413,7 +5535,7 @@ func swiftSubscriptDecl(n *sitter.Node, filePath, blobSHA string, src []byte, im
 	// "body" field; walking the whole declaration reaches both.
 	*out = append(*out, astkit.Symbol{
 		Kind: astkit.KindMethod, Name: "subscript", QualifiedName: qualJoin(qualLast(implType), "subscript"),
-		Signature: internalast.FirstLine(n.Content(src)), Span: internalast.NodeSpan(n),
+		Signature: internalast.FirstLineSig(n, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(n),
 		Exported: swiftIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType), Modifiers: modifiers,
 		CallSites: sharedNavCallSites(n, src, true),
 	})
@@ -5428,7 +5550,7 @@ func swiftNamedItem(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA st
 	modifiers := swiftModifiers(n, src)
 	*out = append(*out, astkit.Symbol{
 		Kind: kind, Name: name, QualifiedName: name,
-		Signature: internalast.FirstLine(n.Content(src)), Span: internalast.NodeSpan(n),
+		Signature: internalast.FirstLineSig(n, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(n),
 		Exported: swiftIsExported(modifiers), Body: n.Content(src), Modifiers: modifiers,
 		Annotations: swiftAttributes(n, src),
 	})
@@ -5443,7 +5565,7 @@ func swiftModifiers(n *sitter.Node, src []byte) []string {
 		}
 		for j := 0; j < int(c.ChildCount()); j++ {
 			m := c.Child(j)
-			if m == nil || !m.IsNamed() || m.Type() == "attribute" {
+			if m == nil || !m.IsNamed() || m.Type() == "attribute" || internalast.IsComment(m) {
 				continue
 			}
 			out = append(out, strings.TrimSpace(m.Content(src)))
@@ -5523,13 +5645,34 @@ func kotlinBlankFunInterface(src []byte) []byte {
 }
 
 // kotlinIsFunInterface reports whether the interface keyword of class
-// declaration n is preceded by `fun` in the original source.
+// declaration n is preceded by `fun` in the original source. The grammar
+// has no `fun interface` (kotlinBlankFunInterface re-parses with the `fun`
+// blanked), so the token is read from the gap between the keyword and the
+// node before it — the preceding modifiers, or the previous sibling, which
+// is a comment node when one precedes the declaration: `// just for fun`
+// is not the modifier.
 func kotlinIsFunInterface(n *sitter.Node, src []byte) bool {
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)
-		if c != nil && !c.IsNamed() && c.Type() == "interface" {
-			return strings.HasSuffix(strings.TrimRight(string(src[:c.StartByte()]), " \t\r\n"), "fun")
+		if c == nil || c.IsNamed() || c.Type() != "interface" {
+			continue
 		}
+		var gapStart uint32 // file start unless a node precedes
+		if i > 0 {
+			gapStart = n.Child(i - 1).EndByte()
+		} else {
+			for a := n; a != nil; a = a.Parent() {
+				if prev := a.PrevSibling(); prev != nil {
+					gapStart = prev.EndByte()
+					break
+				}
+			}
+		}
+		if gapStart > c.StartByte() {
+			return false
+		}
+		gap := strings.Fields(string(src[gapStart:c.StartByte()]))
+		return len(gap) > 0 && gap[len(gap)-1] == "fun"
 	}
 	return false
 }
@@ -5653,7 +5796,7 @@ func kotlinPrimaryConstructorSites(pc, body *sitter.Node, src []byte) []astkit.C
 func kotlinSecondaryConstructor(n *sitter.Node, src []byte, implType string, out *[]astkit.Symbol) {
 	params := "()"
 	if p := internalast.FindChildByType(n, "function_value_parameters"); p != nil {
-		params = p.Content(src)
+		params = internalast.HeaderText(p, src, p.StartByte(), p.EndByte(), nil)
 	}
 	kotlinConstructorSymbol(qualLast(implType), implType, params, internalast.NodeSpan(n), n.Content(src),
 		kotlinModifiers(n, src), sharedNavCallSites(n, src, false), out)
@@ -5712,7 +5855,7 @@ func kotlinClassDecl(n *sitter.Node, filePath, blobSHA string, src []byte, impor
 		sites := kotlinPrimaryConstructorSites(pc, body, src)
 		switch {
 		case pc != nil:
-			kotlinConstructorSymbol(name, qualJoin(parentChain, name), pc.Content(src), internalast.NodeSpan(pc), pc.Content(src), modifiers, sites, out)
+			kotlinConstructorSymbol(name, qualJoin(parentChain, name), internalast.HeaderText(pc, src, pc.StartByte(), pc.EndByte(), nil), internalast.NodeSpan(pc), pc.Content(src), modifiers, sites, out)
 		case body == nil || internalast.FindChildByType(body, "secondary_constructor") == nil:
 			kotlinConstructorSymbol(name, qualJoin(parentChain, name), "()", internalast.NodeSpan(nameNode), name+"()", modifiers, sites, out)
 		}
@@ -5812,7 +5955,7 @@ func kotlinPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, im
 	}
 	*out = append(*out, astkit.Symbol{
 		Kind: kind, Name: nameNode.Content(src), QualifiedName: nameNode.Content(src),
-		Signature: internalast.FirstLine(n.Content(src)), Span: internalast.NodeSpan(n),
+		Signature: internalast.FirstLineSig(n, src, internalast.IsAttributeSection), Span: internalast.NodeSpan(n),
 		Exported: kotlinIsExported(modifiers), Body: n.Content(src), ParentName: qualLast(implType),
 		Modifiers: modifiers, Annotations: kotlinAnnotations(n, src),
 	})
@@ -5853,14 +5996,14 @@ func kotlinFunctionDecl(n *sitter.Node, filePath, blobSHA string, src []byte, im
 func kotlinFuncSig(n *sitter.Node, src []byte) string {
 	body := internalast.FindChildByType(n, "function_body")
 	if body == nil {
-		return internalast.FirstLine(strings.TrimSpace(n.Content(src)))
+		return internalast.FirstLineSig(n, src, nil)
 	}
 	start := n.StartByte()
 	bodyStart := body.StartByte()
 	if bodyStart <= start {
-		return internalast.FirstLine(n.Content(src))
+		return internalast.FirstLineSig(n, src, nil)
 	}
-	sig := strings.TrimSpace(string(src[start:bodyStart]))
+	sig := strings.TrimSpace(internalast.HeaderText(n, src, start, bodyStart, nil))
 	sig = strings.TrimRight(sig, " \t\n{=")
 	return strings.TrimSpace(sig)
 }
@@ -5876,15 +6019,14 @@ func kotlinSignatureBeforeBody(n *sitter.Node, src []byte) string {
 		body = internalast.FindChildByType(n, "enum_class_body")
 	}
 	if body == nil {
-		return internalast.FirstLine(strings.TrimSpace(n.Content(src)))
+		return internalast.FirstLineSig(n, src, nil)
 	}
 	start := n.StartByte()
 	bodyStart := body.StartByte()
 	if bodyStart <= start {
-		return internalast.FirstLine(n.Content(src))
+		return internalast.FirstLineSig(n, src, nil)
 	}
-	sig := strings.TrimSpace(string(src[start:bodyStart]))
-	return strings.Join(strings.Fields(sig), " ")
+	return strings.Join(strings.Fields(internalast.HeaderText(n, src, start, bodyStart, nil)), " ")
 }
 
 func kotlinModifiers(n *sitter.Node, src []byte) []string {
@@ -5895,7 +6037,7 @@ func kotlinModifiers(n *sitter.Node, src []byte) []string {
 	var out []string
 	for i := 0; i < int(mods.ChildCount()); i++ {
 		c := mods.Child(i)
-		if c == nil || !c.IsNamed() || c.Type() == "annotation" {
+		if c == nil || !c.IsNamed() || c.Type() == "annotation" || internalast.IsComment(c) {
 			continue
 		}
 		out = append(out, strings.TrimSpace(c.Content(src)))
@@ -6023,8 +6165,8 @@ func objcBlockTypedefs(root *sitter.Node, src []byte, out []astkit.Symbol) []ast
 }
 
 // objcMacroEnumRe matches `typedef NS_ENUM(NSInteger, Mode) { ... }` and its
-// NS_OPTIONS / NS_CLOSED_ENUM / NS_ERROR_ENUM / CF_* siblings in
-// comment-blanked source. Group 2 is the enum name, group 3 the members.
+// NS_OPTIONS / NS_CLOSED_ENUM / NS_ERROR_ENUM / CF_* siblings in source
+// with comments, string literals and `#if 0` branches masked. Group 2 is the enum name, group 3 the members.
 var objcMacroEnumRe = regexp.MustCompile(`\btypedef\s+((?:NS|CF)_(?:ENUM|OPTIONS|CLOSED_ENUM|ERROR_ENUM))\s*\(\s*[^,(){};]+?\s*,\s*([A-Za-z_]\w*)\s*\)\s*\{([^{}]*)\}`)
 
 var objcEnumMemberRe = regexp.MustCompile(`^\s*([A-Za-z_]\w*)`)
@@ -6040,7 +6182,9 @@ func objcMacroEnums(src []byte, out []astkit.Symbol) []astkit.Symbol {
 	if !strings.Contains(string(src), "_ENUM") && !strings.Contains(string(src), "_OPTIONS") {
 		return out
 	}
-	text := blankCComments(src)
+	// A typedef inside a string literal, a comment or an `#if 0` branch
+	// declares nothing.
+	text := textmask.Mask("objc", textmask.MaskInactivePreprocessor("objc", string(src)))
 	type memberAt struct {
 		name string
 		line int
@@ -6059,14 +6203,16 @@ func objcMacroEnums(src []byte, out []astkit.Symbol) []astkit.Symbol {
 		span := astkit.LineRange{Start: startLine, End: endLine}
 		added = append(added, astkit.Symbol{
 			Kind: astkit.KindEnum, Name: name, QualifiedName: name,
-			Signature: strings.Join(strings.Fields(string(src[m[0]:m[6]-1])), " "),
+			Signature: strings.Join(strings.Fields(text[m[0]:m[6]-1]), " "),
 			Span:      span, Exported: true, Body: raw,
 		})
 		var members []memberAt
 		bodyStart := m[6]
 		depth, itemStart := 0, bodyStart
 		flush := func(itemEnd int) {
-			item := text[itemStart:itemEnd]
+			// A conditional around a member (`#if X\n  ModeB,\n#endif`)
+			// puts directive lines in the item; they are not members.
+			item := objcBlankDirectiveLines(text[itemStart:itemEnd])
 			if mm := objcEnumMemberRe.FindStringSubmatchIndex(item); mm != nil {
 				members = append(members, memberAt{
 					name: item[mm[2]:mm[3]],
@@ -6111,34 +6257,28 @@ func objcMacroEnums(src []byte, out []astkit.Symbol) []astkit.Symbol {
 	return append(kept, added...)
 }
 
-// blankCComments returns src as a string with // and /* */ comments
-// replaced by spaces (newlines kept), so offsets and line numbers match src.
-func blankCComments(src []byte) string {
-	b := []byte(string(src))
-	for i := 0; i < len(b); i++ {
-		switch {
-		case b[i] == '"':
-			for i++; i < len(b) && b[i] != '"' && b[i] != '\n'; i++ {
-				if b[i] == '\\' {
-					i++
-				}
-			}
-		case b[i] == '/' && i+1 < len(b) && b[i+1] == '/':
-			for ; i < len(b) && b[i] != '\n'; i++ {
-				b[i] = ' '
-			}
-		case b[i] == '/' && i+1 < len(b) && b[i+1] == '*':
-			j := i
-			for ; j < len(b) && !(b[j] == '*' && j+1 < len(b) && b[j+1] == '/' && j > i+1); j++ {
-				if b[j] != '\n' {
-					b[j] = ' '
-				}
-			}
-			if j+1 < len(b) {
-				b[j], b[j+1] = ' ', ' '
-			}
-			i = j + 1
+// objcBlankDirectiveLines blanks every line of s whose first non-blank
+// character is '#' (a preprocessor directive), keeping offsets.
+func objcBlankDirectiveLines(s string) string {
+	if !strings.Contains(s, "#") {
+		return s
+	}
+	b := []byte(s)
+	for ls := 0; ls < len(b); {
+		le := strings.IndexByte(s[ls:], '\n')
+		if le < 0 {
+			le = len(b)
+		} else {
+			le += ls
 		}
+		if strings.HasPrefix(strings.TrimLeft(s[ls:le], " \t"), "#") {
+			for k := ls; k < le; k++ {
+				if b[k] != '\r' {
+					b[k] = ' '
+				}
+			}
+		}
+		ls = le + 1
 	}
 	return string(b)
 }
@@ -6177,9 +6317,11 @@ func objcHeaderText(n *sitter.Node, src []byte) string {
 		end = uint32(len(src))
 	}
 	if start >= end {
-		return internalast.FirstLine(n.Content(src))
+		return internalast.FirstLineSig(n, src, nil)
 	}
-	return strings.Join(strings.Fields(string(src[start:end])), " ")
+	// Comments are cut so `@interface M : Sup /* <Old> */ <P>` names
+	// only P as a protocol.
+	return strings.Join(strings.Fields(internalast.HeaderText(n, src, start, end, nil)), " ")
 }
 
 // objcCategoryName returns the category name of `@interface Foo (Bar)` — a
@@ -6391,31 +6533,31 @@ func objcMethodDefSym(n *sitter.Node, parentName string, src []byte, out *[]astk
 func objcMethodSigBeforeBody(n *sitter.Node, src []byte) string {
 	body := internalast.FindChildByType(n, "compound_statement")
 	if body == nil {
-		return internalast.FirstLine(strings.TrimSpace(n.Content(src)))
+		return internalast.FirstLineSig(n, src, nil)
 	}
 	start := n.StartByte()
 	bodyStart := body.StartByte()
 	if bodyStart <= start {
-		return internalast.FirstLine(n.Content(src))
+		return internalast.FirstLineSig(n, src, nil)
 	}
-	sig := strings.TrimSpace(string(src[start:bodyStart]))
-	return strings.Join(strings.Fields(sig), " ")
+	return strings.Join(strings.Fields(internalast.HeaderText(n, src, start, bodyStart, nil)), " ")
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
-// funcSig returns the function/method signature without the body.
+// funcSig returns the function/method signature without the body, its
+// comments, or its C#/PHP attribute sections (those are on Annotations).
 func funcSig(n *sitter.Node, src []byte) string {
 	body := n.ChildByFieldName("body")
 	if body == nil {
-		return strings.TrimSpace(n.Content(src))
+		return strings.TrimSpace(internalast.HeaderText(n, src, n.StartByte(), n.EndByte(), internalast.IsAttributeSection))
 	}
 	start := n.StartByte()
 	bodyStart := body.StartByte()
 	if bodyStart <= start {
-		return internalast.FirstLine(n.Content(src))
+		return internalast.FirstLineSig(n, src, internalast.IsAttributeSection)
 	}
-	sig := strings.TrimSpace(string(src[start:bodyStart]))
+	sig := strings.TrimSpace(internalast.HeaderText(n, src, start, bodyStart, internalast.IsAttributeSection))
 	sig = strings.TrimRight(sig, " \t\n{")
 	return strings.TrimSpace(sig)
 }
