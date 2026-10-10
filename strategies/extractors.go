@@ -1931,13 +1931,10 @@ func javaTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 	// continuation lines, and a leading annotation is not a signature.
 	sig := internalast.SignatureBeforeBody(n, src)
 	modifiers := javaModifiers(n, src)
-	exports := strings.Contains(sig, "public")
-	for _, m := range modifiers {
-		if m == "public" {
-			exports = true
-			break
-		}
-	}
+	// Exported comes from the modifiers node's `public` keyword, never
+	// from text: `void publication()` and `String mode = "public"` are
+	// package-private.
+	exports := internalast.HasModifier(modifiers, "public")
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
 		Name:           className,
@@ -1958,8 +1955,34 @@ func javaTypeDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA stri
 	if body != nil {
 		before := len(*out)
 		javaVisit(body, filePath, blobSHA, src, imports, qualJoin(parentClass, className), out)
-		synthesizeLombokAccessors(className, javaAnnotations(n, src), before, out)
+		synthesizeLombokAccessors(className, javaAnnotations(n, src), javaPrimitiveBooleanFields(body, src), before, out)
 	}
+}
+
+// javaPrimitiveBooleanFields returns the names of the fields declared in
+// class body whose type node is the primitive `boolean`.
+func javaPrimitiveBooleanFields(body *sitter.Node, src []byte) map[string]bool {
+	var out map[string]bool
+	for i := 0; i < int(body.NamedChildCount()); i++ {
+		fd := body.NamedChild(i)
+		if fd == nil || fd.Type() != "field_declaration" {
+			continue
+		}
+		if t := fd.ChildByFieldName("type"); t == nil || t.Type() != "boolean_type" {
+			continue
+		}
+		for j := 0; j < int(fd.NamedChildCount()); j++ {
+			if d := fd.NamedChild(j); d != nil && d.Type() == "variable_declarator" {
+				if nm := d.ChildByFieldName("name"); nm != nil {
+					if out == nil {
+						out = map[string]bool{}
+					}
+					out[nm.Content(src)] = true
+				}
+			}
+		}
+	}
+	return out
 }
 
 // javaRecordComponents emits the implicit field and public accessor that Java
@@ -2024,11 +2047,17 @@ func javaEnumConstantDecl(n *sitter.Node, src []byte, parentClass string, out *[
 // queries could not be queried at all). Synthesized symbols carry the
 // "lombok-generated" modifier and the FIELD's span, so results point at the
 // declaration a human would edit.
-func synthesizeLombokAccessors(className string, classAnn []string, fieldsFrom int, out *[]astkit.Symbol) {
+//
+// The getter of a primitive `boolean` field is isX; every other type,
+// boxed Boolean included, gets getX. boolFields names the primitive boolean
+// fields, read from the declarations' type nodes.
+func synthesizeLombokAccessors(className string, classAnn []string, boolFields map[string]bool, fieldsFrom int, out *[]astkit.Symbol) {
 	has := func(ann []string, names ...string) bool {
 		// javaAnnotations strips the leading @; match the bare name exactly
-		// or with an argument list ("Getter", "Getter(...)").
+		// or with an argument list ("Getter", "Getter(...)"), plain or
+		// fully qualified ("lombok.Getter").
 		for _, a := range ann {
+			a = strings.TrimPrefix(a, "lombok.")
 			for _, n := range names {
 				if a == n || strings.HasPrefix(a, n+"(") {
 					return true
@@ -2063,7 +2092,7 @@ func synthesizeLombokAccessors(className string, classAnn []string, fieldsFrom i
 		name := f.Name
 		cap := strings.ToUpper(name[:1]) + name[1:]
 		getter := "get" + cap
-		if strings.Contains(f.Signature, "boolean ") {
+		if boolFields[name] {
 			getter = "is" + cap
 		}
 		mk := func(mname, sig string) astkit.Symbol {
@@ -2103,12 +2132,7 @@ func javaMethodDecl(n *sitter.Node, kind astkit.SymbolKind, filePath, blobSHA st
 		sig += javaCompactConstructorParams(n, src)
 	}
 	modifiers := javaModifiers(n, src)
-	exports := strings.Contains(sig, "public") || n.Type() == "annotation_type_element_declaration"
-	for _, m := range modifiers {
-		if m == "public" {
-			exports = true
-		}
-	}
+	exports := internalast.HasModifier(modifiers, "public") || n.Type() == "annotation_type_element_declaration"
 	body := n.ChildByFieldName("body")
 	*out = append(*out, astkit.Symbol{
 		Kind:           kind,
@@ -2230,12 +2254,7 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 	// field made FirstLine return just "@Deprecated" as the signature.
 	sig := internalast.SignatureBeforeBody(n, src)
 	modifiers := javaModifiers(n, src)
-	exports := strings.Contains(sig, "public") || n.Type() == "constant_declaration"
-	for _, m := range modifiers {
-		if m == "public" {
-			exports = true
-		}
-	}
+	exports := internalast.HasModifier(modifiers, "public") || n.Type() == "constant_declaration"
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		decl := n.NamedChild(i)
 		if decl == nil || decl.Type() != "variable_declarator" {
@@ -4093,7 +4112,9 @@ func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []
 			csTypeDecl(n, astkit.KindClass, filePath, blobSHA, src, imports, parentClass, out)
 		case "record_declaration":
 			kind := astkit.KindClass
-			if strings.Contains(internalast.SignatureBeforeBody(n, src), "record struct") {
+			// `record struct` carries an anonymous `struct` keyword token;
+			// text matching also hit "record struct" in a string argument.
+			if internalast.FindChildByType(n, "struct") != nil {
 				kind = astkit.KindStruct
 			}
 			csTypeDecl(n, kind, filePath, blobSHA, src, imports, parentClass, out)
@@ -5624,13 +5645,34 @@ func kotlinBlankFunInterface(src []byte) []byte {
 }
 
 // kotlinIsFunInterface reports whether the interface keyword of class
-// declaration n is preceded by `fun` in the original source.
+// declaration n is preceded by `fun` in the original source. The grammar
+// has no `fun interface` (kotlinBlankFunInterface re-parses with the `fun`
+// blanked), so the token is read from the gap between the keyword and the
+// node before it — the preceding modifiers, or the previous sibling, which
+// is a comment node when one precedes the declaration: `// just for fun`
+// is not the modifier.
 func kotlinIsFunInterface(n *sitter.Node, src []byte) bool {
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)
-		if c != nil && !c.IsNamed() && c.Type() == "interface" {
-			return strings.HasSuffix(strings.TrimRight(string(src[:c.StartByte()]), " \t\r\n"), "fun")
+		if c == nil || c.IsNamed() || c.Type() != "interface" {
+			continue
 		}
+		var gapStart uint32 // file start unless a node precedes
+		if i > 0 {
+			gapStart = n.Child(i - 1).EndByte()
+		} else {
+			for a := n; a != nil; a = a.Parent() {
+				if prev := a.PrevSibling(); prev != nil {
+					gapStart = prev.EndByte()
+					break
+				}
+			}
+		}
+		if gapStart > c.StartByte() {
+			return false
+		}
+		gap := strings.Fields(string(src[gapStart:c.StartByte()]))
+		return len(gap) > 0 && gap[len(gap)-1] == "fun"
 	}
 	return false
 }
@@ -6123,8 +6165,8 @@ func objcBlockTypedefs(root *sitter.Node, src []byte, out []astkit.Symbol) []ast
 }
 
 // objcMacroEnumRe matches `typedef NS_ENUM(NSInteger, Mode) { ... }` and its
-// NS_OPTIONS / NS_CLOSED_ENUM / NS_ERROR_ENUM / CF_* siblings in
-// comment-blanked source. Group 2 is the enum name, group 3 the members.
+// NS_OPTIONS / NS_CLOSED_ENUM / NS_ERROR_ENUM / CF_* siblings in source
+// with comments, string literals and `#if 0` branches masked. Group 2 is the enum name, group 3 the members.
 var objcMacroEnumRe = regexp.MustCompile(`\btypedef\s+((?:NS|CF)_(?:ENUM|OPTIONS|CLOSED_ENUM|ERROR_ENUM))\s*\(\s*[^,(){};]+?\s*,\s*([A-Za-z_]\w*)\s*\)\s*\{([^{}]*)\}`)
 
 var objcEnumMemberRe = regexp.MustCompile(`^\s*([A-Za-z_]\w*)`)
