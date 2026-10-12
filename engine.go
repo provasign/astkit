@@ -191,7 +191,11 @@ func (r *Registry) Extract(lang LanguageKey, tree *sitter.Tree, src []byte) ([]S
 	if err := guardDepth(tree); err != nil {
 		return nil, err
 	}
-	return s.Extract(tree, src)
+	syms, err := s.Extract(tree, src)
+	if err == nil {
+		fillCallColumns(string(lang), syms, src)
+	}
+	return syms, err
 }
 
 // ExtractImports is a convenience analogous to Extract.
