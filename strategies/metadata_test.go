@@ -1412,3 +1412,39 @@ public class Outer2 {
 		}
 	}
 }
+
+// gson TypeAdapters.java (2026-10-12): 25 of its 31 TypeAdapter.write
+// overrides live in anonymous classes assigned to static fields, and none
+// was indexed. Anonymous classes and lambdas in field initializers and
+// initializer blocks are declarations of the enclosing class.
+func TestJava_AnonymousClassesInFieldInitializersAndBlocks(t *testing.T) {
+	src := `class Adapters {
+  static final Adapter CLASS = new Adapter() {
+    @Override public void write(Out out, Object v) { out.nullValue(); }
+  };
+  final Runnable r = () -> { run(); };
+  static {
+    REGISTRY.add(new Adapter() { public void write(Out out, Object v) {} });
+  }
+  { helper = new Adapter() { public void write(Out out, Object v) {} }; }
+  abstract static class Adapter { public abstract void write(Out out, Object v); }
+}`
+	syms, _ := extract(t, astkit.LangJava, src)
+	var anon, writes, lambdas int
+	for _, s := range syms {
+		switch {
+		case s.Kind == astkit.KindClass && strings.HasPrefix(s.Name, "<anonymous@"):
+			anon++
+			if s.ParentName != "Adapters" {
+				t.Errorf("anonymous class %s parent=%q want Adapters", s.Name, s.ParentName)
+			}
+		case s.Kind == astkit.KindMethod && s.Name == "write" && strings.Contains(s.ParentName, "<anonymous@"):
+			writes++
+		case s.Kind == astkit.KindFunction && strings.HasPrefix(s.Name, "<lambda@"):
+			lambdas++
+		}
+	}
+	if anon != 3 || writes != 3 || lambdas != 1 {
+		t.Errorf("anonymous=%d write overrides=%d lambdas=%d; want 3, 3, 1", anon, writes, lambdas)
+	}
+}

@@ -1908,6 +1908,12 @@ func javaVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 			javaMethodDecl(n, astkit.KindMethod, filePath, blobSHA, src, imports, parentClass, out)
 		case "enum_body_declarations":
 			javaVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "static_initializer", "block":
+			// `static { ... }` and instance initializer blocks: anonymous
+			// classes and lambdas declared inside them belong to the class.
+			if parentClass != "" {
+				javaNestedExecutables(n, filePath, blobSHA, src, imports, parentClass, out)
+			}
 		case "enum_constant":
 			if parentClass == "" {
 				continue
@@ -2277,6 +2283,13 @@ func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports
 			Modifiers:     modifiers,
 			Annotations:   javaAnnotations(n, src),
 		})
+		// An initializer declares code too: `CLASS = new TypeAdapter<>() {
+		// write(...) {...} }` (gson TypeAdapters has 25 such adapters; none
+		// was indexed, so change_impact on TypeAdapter.write reported the
+		// family closed at 6 of 31 overrides, 2026-10-12). Lambdas likewise.
+		// Walk the declarator, not its value: the value node is often the
+		// anonymous class or lambda itself, and the walker inspects children.
+		javaNestedExecutables(decl, filePath, blobSHA, src, imports, parentClass, out)
 	}
 }
 
