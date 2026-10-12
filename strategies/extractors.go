@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
+	"github.com/smacker/go-tree-sitter/rust"
 
 	"github.com/provasign/astkit"
 	"github.com/provasign/astkit/internalast"
@@ -2420,6 +2421,8 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 		case "enum_item":
 			rustNamedItem(n, astkit.KindEnum, filePath, blobSHA, src, imports, out)
 			rustEnumVariants(n, src, out)
+		case "macro_invocation":
+			rustMacroItems(n, filePath, blobSHA, src, imports, implType, implBounds, implTrait, out)
 		case "macro_definition":
 			// macro_rules! name { ... }: a named item callers invoke as name!.
 			rustNamedItem(n, astkit.KindMacro, filePath, blobSHA, src, imports, out)
@@ -2502,6 +2505,45 @@ func rustVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 			}
 		}
 	}
+}
+
+// rustMacroItems indexes the items written out inside an item-level macro
+// invocation: `cfg_rt! { pub fn spawn(...) {...} }`, `pin_project! { pub
+// struct Framed {...} }`. tree-sitter leaves a macro's body as an unparsed
+// token tree, so tokio's cfg-gated API had no symbols at all. The body is
+// re-parsed as Rust over its own byte range (positions stay those of the
+// file) and visited like any item list; nested wrappers recurse on a
+// strictly smaller range. Only brace bodies outside function bodies and
+// macro_rules templates are read: a call-like `m!(a, b)` is arguments, not
+// items, and a name a macro generates (`rgtest!(r16, ..)` -> fn r16) is the
+// compiler's to report.
+func rustMacroItems(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, implType string, implBounds []string, implTrait string, out *[]astkit.Symbol) {
+	tt := internalast.FindChildByType(n, "token_tree")
+	if tt == nil || tt.EndByte()-tt.StartByte() < 2 || src[tt.StartByte()] != '{' || src[tt.EndByte()-1] != '}' {
+		return
+	}
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		switch p.Type() {
+		case "function_item", "closure_expression", "macro_definition":
+			return
+		}
+	}
+	if len(strings.TrimSpace(string(src[tt.StartByte()+1:tt.EndByte()-1]))) == 0 {
+		return
+	}
+	start, end := tt.StartPoint(), tt.EndPoint()
+	start.Column++
+	end.Column--
+	p := sitter.NewParser()
+	defer p.Close()
+	p.SetLanguage(rust.GetLanguage())
+	p.SetIncludedRanges([]sitter.Range{{StartPoint: start, EndPoint: end, StartByte: tt.StartByte() + 1, EndByte: tt.EndByte() - 1}})
+	tree, err := p.ParseCtx(context.Background(), nil, src)
+	if err != nil || tree == nil {
+		return
+	}
+	defer tree.Close()
+	rustVisit(tree.RootNode(), filePath, blobSHA, src, imports, implType, implBounds, implTrait, out)
 }
 
 // rustScopeQualify prefixes a symbol found inside a module or function body
