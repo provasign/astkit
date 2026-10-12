@@ -40,6 +40,10 @@ type LineRange struct {
 type CallSite struct {
 	Callee string `json:"callee"`
 	Line   int    `json:"line"`
+	// Col is the 1-based character column of the called name on Line
+	// (0 = unknown): with it a consumer edits exactly that token, even with
+	// several same-named calls on one line.
+	Col int `json:"col,omitempty"`
 	// Write marks an attribute site used as an assignment target. It is false
 	// for calls and ordinary reads, preserving older serialized indexes.
 	Write bool `json:"write,omitempty"`
