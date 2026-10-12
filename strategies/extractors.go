@@ -1919,6 +1919,12 @@ func javaVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 				continue
 			}
 			javaEnumConstantDecl(n, src, parentClass, out)
+			// `TWEETS(new TypeToken<List<Tweet>>() {})`: anonymous classes
+			// and lambdas passed as constructor arguments are declarations of
+			// the enum (gson ParseBenchmark, 2026-10-12).
+			if args := n.ChildByFieldName("arguments"); args != nil {
+				javaNestedExecutables(args, filePath, blobSHA, src, imports, parentClass, out)
+			}
 			if body := n.ChildByFieldName("body"); body != nil {
 				javaVisit(body, filePath, blobSHA, src, imports, parentClass, out)
 			}
@@ -2251,7 +2257,11 @@ func javaLambdaDecl(n *sitter.Node, filePath, blobSHA string, src []byte, import
 		Span: internalast.NodeSpan(n), Body: n.Content(src), Modifiers: []string{"lambda"},
 		CallSites: javaCallSites(body, src),
 	})
-	javaNestedExecutables(body, filePath, blobSHA, src, imports, parentClass, out)
+	// Walk the lambda node, not its body: an expression body can itself be
+	// the anonymous class or lambda (`url -> new Monitor() {...}`, dubbo;
+	// `() -> new SubTypeToken<Integer>() {}`, gson), and the walker only
+	// inspects children (2026-10-12).
+	javaNestedExecutables(n, filePath, blobSHA, src, imports, parentClass, out)
 }
 
 func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {

@@ -1448,3 +1448,34 @@ func TestJava_AnonymousClassesInFieldInitializersAndBlocks(t *testing.T) {
 		t.Errorf("anonymous=%d write overrides=%d lambdas=%d; want 3, 3, 1", anon, writes, lambdas)
 	}
 }
+
+// dubbo MonitorFilterTest / gson TypeTokenTest / gson ParseBenchmark
+// (2026-10-12): an anonymous class that IS a lambda's expression body, or an
+// enum constant's constructor argument, was never declared; javac found them.
+func TestJava_AnonymousClassesAsLambdaBodiesAndEnumArguments(t *testing.T) {
+	src := `class Holder {
+  Factory f = url -> new Monitor() {
+    public String getUrl() { return url; }
+  };
+  void m() { run(() -> new Token<Integer>() {}); }
+  enum Api {
+    TWEETS(new Token<String>() {}, x -> x);
+    Api(Token<?> t, Fn f) {}
+  }
+}`
+	syms, _ := extract(t, astkit.LangJava, src)
+	var anon, getURL, lambdas int
+	for _, s := range syms {
+		switch {
+		case s.Kind == astkit.KindClass && strings.HasPrefix(s.Name, "<anonymous@"):
+			anon++
+		case s.Kind == astkit.KindMethod && s.Name == "getUrl" && strings.HasPrefix(s.ParentName, "<anonymous@"):
+			getURL++
+		case s.Kind == astkit.KindFunction && strings.HasPrefix(s.Name, "<lambda@"):
+			lambdas++
+		}
+	}
+	if anon != 3 || getURL != 1 || lambdas != 3 {
+		t.Errorf("anonymous=%d getUrl=%d lambdas=%d; want 3, 1, 3", anon, getURL, lambdas)
+	}
+}
