@@ -106,3 +106,67 @@ func TestRustUnionIsIndexedWithFields(t *testing.T) {
 		"Bits": astkit.KindStruct, "Bits.i": astkit.KindField, "Bits.f": astkit.KindField,
 	})
 }
+
+func TestRustItemMacroBodiesAreIndexed(t *testing.T) {
+	src := `cfg_rt! {
+    pub fn spawn(task: Task) -> Handle {
+        start(task)
+    }
+    cfg_net! {
+        pub struct TcpStream { fd: i32 }
+    }
+}
+pub struct Runtime;
+impl Runtime {
+    cfg_rt! {
+        pub fn block_on(&self) {}
+    }
+}
+macro_rules! cfg_rt {
+    ($($item:item)*) => { $($item)* };
+}
+rgtest!(r16, |dir: Dir| {
+    dir.create("x");
+});
+fn body() {
+    helper! { struct Hidden; }
+}
+`
+	syms, _ := extract(t, astkit.LangRust, src)
+	gprWantDecls(t, syms, map[string]astkit.SymbolKind{
+		"spawn": astkit.KindFunction, "TcpStream": astkit.KindStruct,
+		"Runtime.block_on": astkit.KindMethod,
+	})
+	for _, s := range syms {
+		switch s.Name {
+		case "spawn":
+			if s.Span.Start != 2 || s.Span.End != 4 || len(s.CallSites) == 0 {
+				t.Errorf("spawn keeps its file position and its calls: %+v", s)
+			}
+		case "fd":
+			if s.ParentName != "TcpStream" || s.Span.Start != 6 {
+				t.Errorf("nested wrapper field: %+v", s)
+			}
+		case "r16", "Hidden", "item":
+			t.Errorf("not an item written in a brace body at item level: %+v", s)
+		}
+	}
+}
+
+// A wrapper body that defines a helper macro_rules (tokio's AsyncReadExt)
+// still declares its items.
+func TestRustItemMacroBodyWithHelperMacro(t *testing.T) {
+	src := `cfg_io_util! {
+    macro_rules! read_impl {
+        ($name:ident) => { fn $name(&mut self) {} };
+    }
+    pub trait AsyncReadExt {
+        fn read(&mut self) {}
+    }
+}
+`
+	syms, _ := extract(t, astkit.LangRust, src)
+	gprWantDecls(t, syms, map[string]astkit.SymbolKind{
+		"AsyncReadExt": astkit.KindTrait, "AsyncReadExt.read": astkit.KindMethod, "read_impl": astkit.KindMacro,
+	})
+}
