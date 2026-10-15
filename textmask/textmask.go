@@ -24,13 +24,13 @@
 // Known gaps, all heuristic boundaries a lexer cannot settle without a
 // parser:
 //   - JavaScript/TypeScript regex literals are told from division by the
-//     previous token. `)` and `]` mean division (so `if (x) /re/.test(s)` is
-//     misread), `}` means regex, except `{x} />` (a JSX self-closing tag).
-//     A TypeScript non-null `x! / 2` is division.
-//   - JSX/TSX text between tags is lexed as code: an apostrophe in
-//     `<p>Don't</p>` opens a quote that runs to the end of that line, and
-//     `//` in `<a>http://x</a>` starts a comment. A quoted string right
-//     after `=` may span lines (a JSX attribute value).
+//     previous token. `]` means division, `)` too unless it closes an
+//     if/while/for/with condition, `}` means regex, except `{x} />` (a JSX
+//     self-closing tag). A TypeScript non-null `x! / 2` is division.
+//   - JSX elements are recognised where an expression starts, in TSX and
+//     JavaScript (not plain TypeScript, where `<T>x` is a type assertion);
+//     their text children are literal text. JSX that does not close
+//     masks to the end of the source.
 //   - Swift regex literals (`/.../`, `#/.../#`) are not recognized.
 //   - C/C++ strings inside `#define` bodies are masked although tree-sitter
 //     treats a macro body as opaque text; `#error`/`#warning` text is kept.
@@ -416,6 +416,11 @@ func (s *scanner) code(i int, closer byte, fmtStop bool) int {
 	if s.fam == famJS {
 		s.regexOK = true
 	}
+	// condParens marks each open '(' that follows if/while/for/with: after
+	// its ')' a statement starts, so `/` opens a regex (`if (x) /re/.test(s)`
+	// was read as division).
+	var condParens []bool
+	lastWord := ""
 	for i < n {
 		c := s.src[i]
 		switch c {
@@ -424,6 +429,10 @@ func (s *scanner) code(i int, closer byte, fmtStop bool) int {
 			continue
 		case '(', '[', '{':
 			depth++
+			if c == '(' {
+				condParens = append(condParens, lastWord == "if" || lastWord == "while" || lastWord == "for" || lastWord == "with")
+			}
+			lastWord = ""
 			i++
 			s.regexOK = true
 			continue
@@ -434,8 +443,14 @@ func (s *scanner) code(i int, closer byte, fmtStop bool) int {
 			if depth > 0 {
 				depth--
 			}
+			cond := false
+			if c == ')' && len(condParens) > 0 {
+				cond = condParens[len(condParens)-1]
+				condParens = condParens[:len(condParens)-1]
+			}
+			lastWord = ""
 			i++
-			s.regexOK = c == '}'
+			s.regexOK = c == '}' || cond
 			continue
 		case ':':
 			if fmtStop && depth == 0 && !s.at(i+1, ":") && !s.at(i-1, ":") {
@@ -459,12 +474,14 @@ func (s *scanner) code(i int, closer byte, fmtStop bool) int {
 			if s.fam == famJS {
 				s.regexOK = jsRegexKeyword(s.src[i:k])
 			}
+			lastWord = s.src[i:k]
 			i = k
 			continue
 		}
 		if isDigit(c) {
 			i = s.number(i)
 			s.regexOK = false
+			lastWord = ""
 			continue
 		}
 		j := s.token(i)
@@ -474,9 +491,11 @@ func (s *scanner) code(i int, closer byte, fmtStop bool) int {
 		if j > i {
 			i = j
 			s.regexOK = false
+			lastWord = ""
 			continue
 		}
 		// Plain punctuation.
+		lastWord = ""
 		if s.fam == famJS {
 			s.regexOK = jsRegexAfter(c)
 			if c == '!' && i > 0 && (isIdentByte(s.src[i-1]) || s.src[i-1] == ')' || s.src[i-1] == ']') {
@@ -640,6 +659,15 @@ func (s *scanner) token(i int) int {
 			// `{expr} />` closes a JSX tag; `(/>/g)` is a regex.
 			if s.regexOK && !(next == '>' && s.prevByte(i) == '}') {
 				return s.jsRegex(i)
+			}
+		case '<':
+			// Where an expression starts, `<` is never a comparison: in
+			// TSX/JSX it opens an element, whose text children are prose
+			// (`<code>src/*.ts</code>` opened a block comment to EOF, an
+			// apostrophe or backtick a literal). Plain TypeScript reads
+			// `<T>x` as a type assertion, so it is excluded.
+			if s.regexOK && s.lang != "typescript" && s.jsxTagStart(i) {
+				return s.jsxElement(i)
 			}
 		}
 	case famPython:
@@ -1560,4 +1588,102 @@ func (s *scanner) jcl() {
 		}
 		ls = le + 1
 	}
+}
+
+// jsxTagStart reports whether `<` at i opens a JSX element or fragment: `<>`
+// or a tag name followed by whitespace, `>`, `/` or an attribute — never a
+// generic parameter list (`<T,>(x) =>`).
+func (s *scanner) jsxTagStart(i int) bool {
+	k := i + 1
+	if k < len(s.src) && s.src[k] == '>' {
+		return true // fragment
+	}
+	if k >= len(s.src) || !isIdentStart(s.src[k]) {
+		return false
+	}
+	for k < len(s.src) && (isIdentByte(s.src[k]) || s.src[k] == '.' || s.src[k] == '-' || s.src[k] == ':') {
+		k++
+	}
+	if k >= len(s.src) {
+		return false
+	}
+	switch s.src[k] {
+	case ' ', '\t', '\n', '\r', '>', '/':
+		return true
+	}
+	return false
+}
+
+// jsxTag lexes an opening or self-closing tag from `<` at i: attribute
+// strings are literals, `{...}` attribute values are code. It returns the
+// offset after the tag and whether it closed itself.
+func (s *scanner) jsxTag(i int) (int, bool) {
+	n := len(s.src)
+	k := i + 1
+	for k < n {
+		switch c := s.src[k]; c {
+		case '"', '\'':
+			k = s.quoted(k, k, c, false, true)
+		case '{':
+			k = s.hole(k+1, '}')
+		case '/':
+			if k+1 < n && s.src[k+1] == '>' {
+				return k + 2, true
+			}
+			k++
+		case '>':
+			return k + 1, false
+		default:
+			k++
+		}
+	}
+	return n, false
+}
+
+// jsxElement lexes a JSX element from `<` at i through its closing tag:
+// text children are literal text, `{...}` children are code, nested
+// elements are followed. It returns the offset after the element.
+func (s *scanner) jsxElement(i int) int {
+	n := len(s.src)
+	k, self := s.jsxTag(i)
+	if self {
+		return k
+	}
+	depth, seg := 1, k
+	for k < n {
+		switch s.src[k] {
+		case '{':
+			s.lit(seg, k)
+			k = s.hole(k+1, '}')
+			seg = k
+		case '<':
+			s.lit(seg, k)
+			if k+1 < n && s.src[k+1] == '/' {
+				j := strings.IndexByte(s.src[k:], '>')
+				if j < 0 {
+					return n
+				}
+				k += j + 1
+				seg = k
+				if depth--; depth == 0 {
+					return k
+				}
+				continue
+			}
+			if !s.jsxTagStart(k) {
+				k++ // a stray `<` in text
+				seg = k - 1
+				continue
+			}
+			j, closed := s.jsxTag(k)
+			k, seg = j, j
+			if !closed {
+				depth++
+			}
+		default:
+			k++
+		}
+	}
+	s.lit(seg, n)
+	return n
 }
