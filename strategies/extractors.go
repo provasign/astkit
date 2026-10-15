@@ -4633,6 +4633,11 @@ func csCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
 				if qual == "" {
 					qual = csTypedReceiver(recv, src)
 				}
+				if qual == "" && recv != nil {
+					// A receiver no name describes (o["x"].Children(),
+					// (a ?? b).M()): untyped, but never a bare call.
+					qual = "<expr>"
+				}
 				return joinQualified(qual, method)
 			case "conditional_access_expression":
 				// `a?.M()`: the function is the conditional access itself,
@@ -4659,6 +4664,9 @@ func csCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
 					})
 				if qual == "" {
 					qual = csTypedReceiver(recv, src)
+				}
+				if qual == "" && recv != nil {
+					qual = "<expr>"
 				}
 				return joinQualified(qual, method)
 			}

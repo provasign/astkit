@@ -660,6 +660,8 @@ func TestCSharp_CallSiteTypedConstantArgs(t *testing.T) {
     W(a == b);
     W(!ok);
     W(nameof(F));
+    W(new[] { "a", "b" });
+    W(new[] { 1, 2 });
   }
 }`
 	syms, _ := extract(t, astkit.LangCSharp, src)
@@ -671,7 +673,7 @@ func TestCSharp_CallSiteTypedConstantArgs(t *testing.T) {
 			}
 		}
 	}
-	want := []string{"#double", "#decimal", "#uint", "#ulong", "#long", "#DateTime", "#int", "#double", "#Guid", "#String", "#TimeSpan", "#Uri", "#boolean", "#boolean", "#String"}
+	want := []string{"#double", "#decimal", "#uint", "#ulong", "#long", "#DateTime", "#int", "#double", "#Guid", "#String", "#TimeSpan", "#Uri", "#boolean", "#boolean", "#String", "#String[]", "#int[]"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("args\n got %v\nwant %v", got, want)
 	}
