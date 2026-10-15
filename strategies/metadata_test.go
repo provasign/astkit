@@ -639,6 +639,44 @@ func TestCSharp_CallSiteArgMarkers(t *testing.T) {
 	}
 }
 
+// Typed constants and operators the Roslyn overload choice depends on:
+// suffixed and negated literals, BCL static values, `as`, comparisons and
+// nameof (newtonsoft JValue/WriteValue overloads, oracle review 2026-10-16).
+func TestCSharp_CallSiteTypedConstantArgs(t *testing.T) {
+	src := `class A {
+  void F(object o) {
+    W(-0.0d);
+    W(9.0m);
+    W(1u);
+    W(1UL);
+    W(-5L);
+    W(DateTime.Now);
+    W(Int32.MaxValue);
+    W(double.NaN);
+    W(Guid.Empty);
+    W(string.Empty);
+    W(TimeSpan.Zero);
+    W(o as Uri);
+    W(a == b);
+    W(!ok);
+    W(nameof(F));
+  }
+}`
+	syms, _ := extract(t, astkit.LangCSharp, src)
+	var got []string
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			if cs.Callee == "W" {
+				got = append(got, strings.Join(cs.Args, ","))
+			}
+		}
+	}
+	want := []string{"#double", "#decimal", "#uint", "#ulong", "#long", "#DateTime", "#int", "#double", "#Guid", "#String", "#TimeSpan", "#Uri", "#boolean", "#boolean", "#String"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("args\n got %v\nwant %v", got, want)
+	}
+}
+
 // A C prototype for a function defined in the same file is not a second
 // function; a prototype without a definition (a header) stays.
 func TestC_PrototypeCollapsesIntoDefinition(t *testing.T) {

@@ -467,8 +467,12 @@ func (c *csharpStrategy) ExtractImports(tree *sitter.Tree, src []byte) ([]astkit
 	// whole test files in `#if !(NET20 || ...)`) and inside namespace
 	// blocks; walk the tree, not just the root's children, or such a
 	// file reports no imports at all.
+	inactive := csAlternateInactiveLines(src)
 	internalast.WalkTree(tree.RootNode(), func(n *sitter.Node) {
 		if n == nil || n.Type() != "using_directive" {
+			return
+		}
+		if inactive[int(n.StartPoint().Row)+1] {
 			return
 		}
 		raw := strings.TrimSpace(internalast.NodeText(n, src))
