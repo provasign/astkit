@@ -306,6 +306,57 @@ func argToken(c *sitter.Node, src []byte) string {
 		return "#lambda"
 	case "method_reference", "arrow_function", "lambda":
 		return "#lambda"
+	case "parenthesized_expression":
+		if c.NamedChildCount() == 1 {
+			return argToken(c.NamedChild(0), src)
+		}
+	case "postfix_unary_expression":
+		// C# null-forgiving `x!` is x.
+		if c.NamedChildCount() == 1 && strings.HasSuffix(strings.TrimSpace(string(c.Content(src))), "!") {
+			return argToken(c.NamedChild(0), src)
+		}
+	case "binary_expression":
+		// C#: `"#" + hex` is a string whenever either operand is one.
+		if op := c.ChildByFieldName("operator"); op != nil && string(op.Content(src)) == "+" {
+			l, r := c.ChildByFieldName("left"), c.ChildByFieldName("right")
+			if l != nil && argToken(l, src) == "#String" || r != nil && argToken(r, src) == "#String" {
+				return "#String"
+			}
+		}
+	case "array_creation_expression":
+		// C#: `new byte[] {...}` / `new JToken[n]`.
+		if t := c.ChildByFieldName("type"); t != nil {
+			typ := strings.TrimSpace(string(t.Content(src)))
+			if i := strings.IndexByte(typ, '['); i > 0 {
+				return "#" + strings.TrimSpace(typ[:i]) + "[]"
+			}
+		}
+	case "typeof_expression":
+		return "#Type"
+	case "invocation_expression":
+		// C#: x.ToString() is a string; another call is typed by the
+		// called method's declared return type, which a consumer resolves.
+		if fn := c.ChildByFieldName("function"); fn != nil {
+			name := ""
+			switch fn.Type() {
+			case "identifier":
+				name = string(fn.Content(src))
+			case "member_access_expression":
+				if n := fn.ChildByFieldName("name"); n != nil {
+					name = string(n.Content(src))
+				}
+			case "generic_name":
+				if fn.NamedChildCount() > 0 {
+					name = string(fn.NamedChild(0).Content(src))
+				}
+			}
+			if name == "ToString" {
+				return "#String"
+			}
+			if name != "" {
+				return "call:" + name
+			}
+		}
 	case "method_invocation", "call_expression", "call":
 		// Consumers can resolve the called function's return type.
 		if n := c.ChildByFieldName("name"); n != nil {

@@ -4550,7 +4550,7 @@ func csCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
 				if method == "" {
 					return ""
 				}
-				recv := fn.ChildByFieldName("expression")
+				recv := csUnwrapReceiver(fn.ChildByFieldName("expression"), src)
 				qual := qualifierName(recv, src,
 					// tree-sitter-c-sharp names the receiver keywords plainly
 					// ("this", "base"); the *_expression spellings matched
@@ -4568,10 +4568,46 @@ func csCallSites(decl *sitter.Node, src []byte) []astkit.CallSite {
 					qual = csTypedReceiver(recv, src)
 				}
 				return joinQualified(qual, method)
+			case "conditional_access_expression":
+				// `a?.M()`: the function is the conditional access itself,
+				// its condition the receiver and its member binding the name
+				// (JProperty: ((JObject?)Parent)?.Changed(this)).
+				var nameNode *sitter.Node
+				for i := 0; i < int(fn.NamedChildCount()); i++ {
+					if c := fn.NamedChild(i); c != nil && c.Type() == "member_binding_expression" {
+						nameNode = c.ChildByFieldName("name")
+					}
+				}
+				if nameNode == nil {
+					return ""
+				}
+				method := csNameToken(nameNode, src)
+				recv := fn.ChildByFieldName("condition")
+				recv = csUnwrapReceiver(recv, src)
+				qual := qualifierName(recv, src,
+					[]string{"identifier", "this", "base", "this_expression", "base_expression", "predefined_type"},
+					map[string]string{"member_access_expression": "name"},
+					map[string]string{
+						"invocation_expression":      "function",
+						"object_creation_expression": "type",
+					})
+				if qual == "" {
+					qual = csTypedReceiver(recv, src)
+				}
+				return joinQualified(qual, method)
 			}
 			return ""
 		},
 	})
+}
+
+// csUnwrapReceiver strips the null-forgiving `x!` from a receiver.
+func csUnwrapReceiver(recv *sitter.Node, src []byte) *sitter.Node {
+	for recv != nil && recv.Type() == "postfix_unary_expression" && recv.NamedChildCount() == 1 &&
+		strings.HasSuffix(strings.TrimSpace(string(recv.Content(src))), "!") {
+		recv = recv.NamedChild(0)
+	}
+	return recv
 }
 
 // csTypedReceiver names the static type of a receiver qualifierName cannot

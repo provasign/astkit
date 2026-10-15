@@ -64,3 +64,22 @@ func TestTSCallReceiversThroughNonNullAndSubscript(t *testing.T) {
 		}
 	}
 }
+
+// C#: x!.M() keeps its receiver; a?.M() is a call with receiver a.
+func TestCSharpNullForgivingAndConditionalAccess(t *testing.T) {
+	src := "class S {\n  void F() {\n    TraceWriter!.Trace(1);\n    ((JObject?)Parent)?.Changed(this);\n    item?.Run();\n  }\n}\n"
+	syms, _ := extract(t, astkit.LangCSharp, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		if s.Name == "F" {
+			for _, cs := range s.CallSites {
+				got[cs.Callee] = true
+			}
+		}
+	}
+	for _, want := range []string{"TraceWriter.Trace", "JObject.Changed", "item.Run"} {
+		if !got[want] {
+			t.Errorf("missing call site %q in %v", want, got)
+		}
+	}
+}
