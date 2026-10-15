@@ -206,7 +206,17 @@ func argToken(c *sitter.Node, src []byte) string {
 	case "decimal_integer_literal", "hex_integer_literal", "octal_integer_literal",
 		"binary_integer_literal", "int_literal", "integer", "integer_literal", "number_literal":
 		text := string(c.Content(src))
+		lower := strings.ToLower(text)
+		hex := strings.HasPrefix(lower, "0x")
 		switch {
+		case strings.HasSuffix(lower, "ul") || strings.HasSuffix(lower, "lu"):
+			return "#ulong" // C#
+		case strings.HasSuffix(lower, "u") && c.Type() == "integer_literal":
+			return "#uint" // C#
+		case strings.HasSuffix(lower, "m") && c.Type() == "integer_literal":
+			return "#decimal" // C#
+		case hex && !strings.HasSuffix(lower, "l"):
+			return "#int" // 0x1F: F and D are hex digits, not suffixes
 		case strings.HasSuffix(text, "L") || strings.HasSuffix(text, "l"):
 			return "#long"
 		case strings.HasSuffix(text, "F") || strings.HasSuffix(text, "f"):
@@ -222,7 +232,31 @@ func argToken(c *sitter.Node, src []byte) string {
 		if strings.HasSuffix(text, "F") || strings.HasSuffix(text, "f") {
 			return "#float"
 		}
+		if c.Type() == "real_literal" && (strings.HasSuffix(text, "M") || strings.HasSuffix(text, "m")) {
+			return "#decimal" // C# 9.0m
+		}
 		return "#double"
+	case "prefix_unary_expression", "unary_expression":
+		// -1L, -0.0d, +x, ~mask keep the operand's type; !x is a bool.
+		text := strings.TrimSpace(string(c.Content(src)))
+		if strings.HasPrefix(text, "!") && !strings.HasPrefix(text, "!=") {
+			return "#boolean"
+		}
+		if (strings.HasPrefix(text, "-") || strings.HasPrefix(text, "+") || strings.HasPrefix(text, "~")) &&
+			!strings.HasPrefix(text, "--") && !strings.HasPrefix(text, "++") && c.NamedChildCount() == 1 {
+			if v := argToken(c.NamedChild(0), src); strings.HasPrefix(v, "#") {
+				return v
+			}
+		}
+	case "as_expression":
+		// C#: `o as Uri` is typed Uri (or null).
+		if t := c.ChildByFieldName("right"); t != nil {
+			if name := csTypeLastName(t, src); name != "" {
+				return "#" + name
+			}
+		}
+	case "is_expression", "is_pattern_expression":
+		return "#boolean"
 	case "true", "false":
 		return "#boolean"
 	case "cast_expression":
@@ -272,11 +306,8 @@ func argToken(c *sitter.Node, src []byte) string {
 		if name != nil && obj != nil {
 			n := string(name.Content(src))
 			t := string(obj.Content(src))
-			if n == "MaxValue" || n == "MinValue" {
-				switch t {
-				case "int", "long", "short", "byte", "char", "double", "float", "decimal", "uint", "ulong", "ushort", "sbyte":
-					return "#" + t
-				}
+			if typ := csStaticValueType(t, n); typ != "" {
+				return "#" + typ
 			}
 			// Formatting.Indented: a PascalCase member of a PascalCase
 			// identifier is an enum value (or a static member) — "%Type"
@@ -316,8 +347,18 @@ func argToken(c *sitter.Node, src []byte) string {
 			return argToken(c.NamedChild(0), src)
 		}
 	case "binary_expression":
+		op := c.ChildByFieldName("operator")
+		if op != nil && c.ChildByFieldName("left") != nil {
+			switch string(op.Content(src)) {
+			case "==", "!=", "<", ">", "<=", ">=", "&&", "||":
+				// Comparisons and logical operators are bool in every
+				// C-family language here (C# overloads `operator ==` only
+				// to return bool by convention; tree-sitter C# names it).
+				return "#boolean"
+			}
+		}
 		// C#: `"#" + hex` is a string whenever either operand is one.
-		if op := c.ChildByFieldName("operator"); op != nil && string(op.Content(src)) == "+" {
+		if op != nil && string(op.Content(src)) == "+" {
 			l, r := c.ChildByFieldName("left"), c.ChildByFieldName("right")
 			if l != nil && argToken(l, src) == "#String" || r != nil && argToken(r, src) == "#String" {
 				return "#String"
@@ -350,7 +391,7 @@ func argToken(c *sitter.Node, src []byte) string {
 					name = string(fn.NamedChild(0).Content(src))
 				}
 			}
-			if name == "ToString" {
+			if name == "ToString" || name == "nameof" && fn.Type() == "identifier" {
 				return "#String"
 			}
 			if name != "" {
@@ -2053,4 +2094,63 @@ func rustExprReceiver(value *sitter.Node, src []byte) string {
 	// Any other expression receiver (`x()?.m()`, `(a + b).m()`): a method
 	// call on a value of unknown type — never a bare call to a function.
 	return rustExprReceiverMark
+}
+
+// csStaticValueType types a C# BCL static value by its declaring type:
+// DateTime.Now, Int32.MaxValue, double.NaN, Guid.Empty, string.Empty.
+// Only well-known members whose type is the declaring type itself (or
+// string for String.Empty); anything else is "".
+func csStaticValueType(typ, member string) string {
+	kw := map[string]string{
+		"Int16": "short", "Int32": "int", "Int64": "long", "UInt16": "ushort", "UInt32": "uint", "UInt64": "ulong",
+		"Byte": "byte", "SByte": "sbyte", "Single": "float", "Double": "double", "Decimal": "decimal", "Char": "char",
+		"short": "short", "int": "int", "long": "long", "ushort": "ushort", "uint": "uint", "ulong": "ulong",
+		"byte": "byte", "sbyte": "sbyte", "float": "float", "double": "double", "decimal": "decimal", "char": "char",
+	}
+	if k, ok := kw[typ]; ok {
+		switch member {
+		case "MaxValue", "MinValue":
+			return k
+		case "NaN", "PositiveInfinity", "NegativeInfinity", "Epsilon":
+			if k == "double" || k == "float" {
+				return k
+			}
+		case "One", "Zero", "MinusOne":
+			if k == "decimal" {
+				return k
+			}
+		}
+		return ""
+	}
+	switch typ {
+	case "String", "string":
+		if member == "Empty" {
+			return "String"
+		}
+	case "DateTime":
+		switch member {
+		case "Now", "UtcNow", "Today", "MinValue", "MaxValue", "UnixEpoch":
+			return typ
+		}
+	case "DateTimeOffset":
+		switch member {
+		case "Now", "UtcNow", "MinValue", "MaxValue", "UnixEpoch":
+			return typ
+		}
+	case "TimeSpan":
+		switch member {
+		case "Zero", "MinValue", "MaxValue":
+			return typ
+		}
+	case "Guid":
+		if member == "Empty" {
+			return typ
+		}
+	case "BigInteger":
+		switch member {
+		case "One", "Zero", "MinusOne":
+			return typ
+		}
+	}
+	return ""
 }
