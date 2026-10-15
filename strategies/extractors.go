@@ -1860,7 +1860,43 @@ func qualLast(path string) string {
 func extractJavaNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
 	javaVisit(root, filePath, blobSHA, src, imports, "", &out)
+	javaReattachOrphans(out)
 	return out
+}
+
+// javaReattachOrphans gives a member with no enclosing type the innermost
+// type whose span contains it. Java has no top-level methods or fields: a
+// parentless one comes from error recovery splitting a class body around a
+// broken statement mid-edit (15 BeanDeserializer methods lost their class
+// after an unterminated char literal, 2026-10-14).
+func javaReattachOrphans(out []astkit.Symbol) {
+	for i := range out {
+		m := &out[i]
+		if m.ParentName != "" || (m.Kind != astkit.KindMethod && m.Kind != astkit.KindConstructor && m.Kind != astkit.KindField) {
+			continue
+		}
+		best := -1
+		for j := range out {
+			t := out[j]
+			switch t.Kind {
+			case astkit.KindClass, astkit.KindInterface, astkit.KindEnum:
+			default:
+				continue
+			}
+			if t.Span.Start > m.Span.Start || t.Span.End < m.Span.End {
+				continue
+			}
+			if best < 0 || t.Span.End-t.Span.Start < out[best].Span.End-out[best].Span.Start {
+				best = j
+			}
+		}
+		if best < 0 {
+			continue
+		}
+		owner := out[best]
+		m.ParentName = owner.Name
+		m.QualifiedName = owner.QualifiedName + "." + m.Name
+	}
 }
 
 func javaVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
@@ -1882,9 +1918,18 @@ func javaVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports 
 			if parentClass == "" {
 				continue
 			}
+			if name := n.ChildByFieldName("name"); name == nil || javaReservedWord[name.Content(src)] {
+				continue // recovered from statements, not a declaration
+			}
 			javaMethodDecl(n, astkit.KindMethod, filePath, blobSHA, src, imports, parentClass, out)
 		case "constructor_declaration":
 			if parentClass == "" {
+				continue
+			}
+			// A constructor is named after its class. Error recovery reads
+			// `if (x) {` after an unterminated literal as a constructor
+			// named "if" (jackson BeanDeserializer edit, 2026-10-14).
+			if name := n.ChildByFieldName("name"); name == nil || name.Content(src) != parentClass[strings.LastIndexByte(parentClass, '.')+1:] {
 				continue
 			}
 			javaMethodDecl(n, astkit.KindConstructor, filePath, blobSHA, src, imports, parentClass, out)
@@ -2265,7 +2310,24 @@ func javaLambdaDecl(n *sitter.Node, filePath, blobSHA string, src []byte, import
 	javaNestedExecutables(n, filePath, blobSHA, src, imports, parentClass, out)
 }
 
+// javaReservedWord holds Java keywords and literals that can never be a
+// declared name or a field's type. Error recovery around a broken statement
+// (`return bean;`, `if (...) {`) produces such "declarations".
+var javaReservedWord = map[string]bool{
+	"abstract": true, "assert": true, "break": true, "case": true, "catch": true, "class": true,
+	"const": true, "continue": true, "default": true, "do": true, "else": true, "enum": true,
+	"extends": true, "final": true, "finally": true, "for": true, "goto": true, "if": true,
+	"implements": true, "import": true, "instanceof": true, "interface": true, "native": true,
+	"new": true, "package": true, "private": true, "protected": true, "public": true,
+	"return": true, "static": true, "strictfp": true, "super": true, "switch": true,
+	"synchronized": true, "this": true, "throw": true, "throws": true, "transient": true,
+	"try": true, "volatile": true, "while": true, "true": true, "false": true, "null": true,
+}
+
 func javaFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]astkit.Symbol) {
+	if t := n.ChildByFieldName("type"); t != nil && javaReservedWord[strings.TrimSpace(t.Content(src))] {
+		return // `return bean;` recovered as a field of type "return"
+	}
 	raw := n.Content(src)
 	// Full header, not FirstLine: an annotation on its own line before the
 	// field made FirstLine return just "@Deprecated" as the signature.

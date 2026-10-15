@@ -489,3 +489,26 @@ func BenchmarkMask(b *testing.B) {
 		})
 	}
 }
+
+// JSX text is prose: `/*`, a backtick or an apostrophe in it opens nothing,
+// and the code after the element is lexed as code. A regex after the `)` of
+// an if condition is a regex, not division (grove phantom callers,
+// 2026-10-14).
+func TestMaskJSXTextAndConditionRegex(t *testing.T) {
+	for _, tc := range []struct{ lang, src, keep string }{
+		{"tsx", "const a = <p><code>src/*.ts</code></p>\nfunction helper() {}\n", "function helper() {}"},
+		{"tsx", "const a = <p>use `x` here</p>\nfunction helper() {}\n", "function helper() {}"},
+		{"tsx", "const a = <p>Don't {name} go</p>\nfunction helper() {}\n", "function helper() {}"},
+		{"javascript", "return (<div a=\"b\" c={x}><br/>text /* not */ </div>)\nfunction helper() {}\n", "function helper() {}"},
+		{"tsx", "const id = <T,>(x: T) => x\nfunction helper() {}\n", "function helper() {}"},
+		{"typescript", "if (x) /`/.test(s)\nfunction helper() {}\n", "function helper() {}"},
+	} {
+		got := Mask(tc.lang, tc.src)
+		if !strings.Contains(got, tc.keep) {
+			t.Errorf("%s %q: code after it was masked:\n%q", tc.lang, tc.src, got)
+		}
+	}
+	if got := Mask("tsx", "const a = <p>{name}</p>\n"); !strings.Contains(got, "{name}") {
+		t.Errorf("a {expr} child is code: %q", got)
+	}
+}
