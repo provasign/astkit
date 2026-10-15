@@ -26,6 +26,9 @@ type callSpec struct {
 	// genericFn reports whether a call carries explicit type arguments
 	// (DeserializeObject<T>(...)); nil means "never generic" for the language.
 	genericFn func(call *sitter.Node, src []byte) bool
+	// skip reports a nested node whose calls belong to another symbol (a
+	// JS/TS function declaration inside a function body is its own symbol).
+	skip func(n *sitter.Node) bool
 }
 
 // qualifierName reduces a callee's receiver operand to one identifier so
@@ -98,6 +101,9 @@ func collectCallSites(body *sitter.Node, src []byte, spec callSpec) []astkit.Cal
 	var walk func(*sitter.Node)
 	walk = func(n *sitter.Node) {
 		if n == nil {
+			return
+		}
+		if n != body && spec.skip != nil && spec.skip(n) {
 			return
 		}
 		for _, t := range spec.nodeTypes {
@@ -511,6 +517,7 @@ func goCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 func jsCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	return collectCallSites(body, src, callSpec{
 		nodeTypes: []string{"call_expression", "new_expression", "jsx_opening_element", "jsx_self_closing_element"},
+		skip:      jsNestedFunctionDecl,
 		calleeFn: func(call *sitter.Node, src []byte) string {
 			if call.Type() == "jsx_opening_element" || call.Type() == "jsx_self_closing_element" {
 				if name := call.ChildByFieldName("name"); name != nil {

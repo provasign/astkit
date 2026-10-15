@@ -369,6 +369,7 @@ func goIdentifierNames(n *sitter.Node, src []byte) []string {
 func extractJSNodes(root *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []astkit.Symbol {
 	var out []astkit.Symbol
 	jsVisit(root, filePath, blobSHA, language, src, imports, "", false, &out)
+	jsLocalFunctions(root, filePath, blobSHA, language, src, imports, &out)
 	out = jsDedupeThisFields(out)
 	for name := range jsNamedExports(root, src) {
 		for i := range out {
@@ -2950,7 +2951,9 @@ func cMacroSymbol(name string, paramsNode *sitter.Node, body, raw string, span a
 // (`log:message:`) or one unary name.
 func objcMacroSends(code string, line int) []astkit.CallSite {
 	var out []astkit.CallSite
-	isIdent := func(b byte) bool { return b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' }
+	isIdent := func(b byte) bool {
+		return b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+	}
 	for i := 0; i < len(code); i++ {
 		if code[i] != '[' {
 			continue
@@ -6859,4 +6862,83 @@ func funcSig(n *sitter.Node, src []byte) string {
 	sig := strings.TrimSpace(internalast.HeaderText(n, src, start, bodyStart, internalast.IsAttributeSection))
 	sig = strings.TrimRight(sig, " \t\n{")
 	return strings.TrimSpace(sig)
+}
+
+// jsFunctionLike reports the JS/TS nodes that open a function body.
+func jsFunctionLike(t string) bool {
+	switch t {
+	case "function_declaration", "generator_function_declaration", "function_expression", "function",
+		"generator_function", "arrow_function", "method_definition", "class_static_block":
+		return true
+	}
+	return false
+}
+
+// jsNestedFunctionDecl reports a function declaration written inside a
+// function body (`function encodeOne(packet) {...}` inside encodePayload):
+// it is a symbol of its own, so its calls are not its encloser's.
+func jsNestedFunctionDecl(n *sitter.Node) bool {
+	if n.Type() != "function_declaration" && n.Type() != "generator_function_declaration" {
+		return false
+	}
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		if jsFunctionLike(p.Type()) {
+			return true
+		}
+	}
+	return false
+}
+
+// jsLocalFunctions emits every nested function declaration as a function
+// symbol marked "local": visible only inside the function that declares it
+// (consumers scope bare calls by that). socket.io's parser-v3 encodeOne
+// was unindexed and its calls were credited to encodePayload.
+func jsLocalFunctions(root *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, out *[]astkit.Symbol) {
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if jsNestedFunctionDecl(n) {
+			if sym := jsNamedSym(n, "name", filePath, blobSHA, language, src, imports, astkit.KindFunction, "", false); sym != nil {
+				// Named like the TypeScript pass's declaration of it:
+				// qualified by the enclosing declarations, no parent type.
+				sym.QualifiedName = qualJoin(jsEnclosingQualifier(n, src), sym.Name)
+				sym.Modifiers = append(sym.Modifiers, "local")
+				*out = append(*out, *sym)
+			}
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(root)
+}
+
+// jsEnclosingQualifier names the declarations enclosing n, outermost first:
+// functions, classes, methods and `const f = () => ...` bindings
+// ("Socket.onClose" for a function declared inside that method). Anonymous
+// enclosers add nothing.
+func jsEnclosingQualifier(n *sitter.Node, src []byte) string {
+	var parts []string
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		name := ""
+		switch p.Type() {
+		case "function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration",
+			"method_definition", "internal_module", "module":
+			if nn := p.ChildByFieldName("name"); nn != nil {
+				name = nn.Content(src)
+			}
+		case "arrow_function", "function_expression", "function", "generator_function":
+			if d := p.Parent(); d != nil && d.Type() == "variable_declarator" {
+				if nn := d.ChildByFieldName("name"); nn != nil && nn.Type() == "identifier" {
+					name = nn.Content(src)
+				}
+			}
+		}
+		if name != "" {
+			parts = append([]string{name}, parts...)
+		}
+	}
+	return strings.Join(parts, ".")
 }
