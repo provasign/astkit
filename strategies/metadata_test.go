@@ -1479,3 +1479,27 @@ func TestJava_AnonymousClassesAsLambdaBodiesAndEnumArguments(t *testing.T) {
 		t.Errorf("anonymous=%d getUrl=%d lambdas=%d; want 3, 1, 3", anon, getURL, lambdas)
 	}
 }
+
+// A method call on a string literal or a range index keeps a receiver
+// marker instead of arriving bare: `"x".as_bytes()` is a str method and
+// `doc[start..].find(..)` a slice method, not any same-named function.
+func TestRust_LiteralAndSliceReceiversAreMarked(t *testing.T) {
+	src := `fn f(doc: &str, start: usize) {
+    let a = "test".as_bytes();
+    let b = doc[start..].find('}');
+    let c = vec!["x".parse().unwrap()];
+}
+`
+	syms, _ := extract(t, astkit.LangRust, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[cs.Callee] = true
+		}
+	}
+	for _, want := range []string{"<str>.as_bytes", "<slice>.find", "<str>.parse"} {
+		if !got[want] {
+			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+}

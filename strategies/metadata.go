@@ -772,10 +772,14 @@ func rustCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 					// SearcherTester::new(...).line_number(false) gives
 					// line_number the "new()" call-result qualifier
 					// instead of arriving bare.
-					qual := qualifierName(fn.ChildByFieldName("value"), src,
+					value := fn.ChildByFieldName("value")
+					qual := qualifierName(value, src,
 						[]string{"identifier", "self"},
 						map[string]string{"field_expression": "field", "scoped_identifier": "name"},
 						map[string]string{"call_expression": "function"})
+					if qual == "" {
+						qual = rustExprReceiver(value)
+					}
 					return joinQualified(qual, string(field.Content(src)))
 				}
 			case "scoped_identifier":
@@ -845,7 +849,8 @@ func rustMacroCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			if tt := internalast.FindChildByType(n, "token_tree"); tt != nil {
 				// Comments and string/char literals in the token tree
 				// are prose, not calls: `assert!(ok, "see bar(1)")`.
-				text := textmask.Mask("rust", tt.Content(src))
+				raw := tt.Content(src)
+				text := textmask.Mask("rust", raw)
 				line := int(n.StartPoint().Row) + 1
 				for _, m := range rustMacroCallRe.FindAllStringSubmatchIndex(text, -1) {
 					path := text[m[2]:m[3]]
@@ -857,6 +862,8 @@ func rustMacroCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 					} else if i := strings.LastIndexByte(path, '.'); i >= 0 {
 						name = path[i+1:]
 						qual = rustLastSegment(path[:i])
+					} else if m[0] >= 2 && raw[m[0]-1] == '.' && raw[m[0]-2] == '"' {
+						qual = rustStrReceiver // `"match:fg:magenta".parse()` in vec![...]
 					} else if q := rustMacroChainQualifier(text, m[0]); q != "" {
 						// `ig.matched("", false).is_ignore()`: the regex
 						// scan (no nested-structure awareness) matches
@@ -1851,4 +1858,29 @@ func findChildByType(n *sitter.Node, typeName string) *sitter.Node {
 		}
 	}
 	return nil
+}
+
+// Receivers that are not a path: a string literal is a str and a range
+// index (`doc[start..]`) a slice, so the call is a std method unless the
+// repository implements one on those types. Left bare, the call matched
+// every same-named function and method (ripgrep: "test".as_bytes(),
+// doc[start..].find(...)).
+const (
+	rustStrReceiver   = "<str>"
+	rustSliceReceiver = "<slice>"
+)
+
+func rustExprReceiver(value *sitter.Node) string {
+	if value == nil {
+		return ""
+	}
+	switch value.Type() {
+	case "string_literal", "raw_string_literal":
+		return rustStrReceiver
+	case "index_expression":
+		if internalast.FindChildByType(value, "range_expression") != nil {
+			return rustSliceReceiver
+		}
+	}
+	return ""
 }
