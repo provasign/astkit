@@ -1488,6 +1488,10 @@ func TestRust_LiteralAndSliceReceiversAreMarked(t *testing.T) {
     let a = "test".as_bytes();
     let b = doc[start..].find('}');
     let c = vec!["x".parse().unwrap()];
+    let d = (*self).find(doc);
+    let e = args.walk_builder()?.build_parallel();
+    assert!(!dents[0].path_is_symlink());
+    let f = paths[0].is_dir();
 }
 `
 	syms, _ := extract(t, astkit.LangRust, src)
@@ -1497,7 +1501,7 @@ func TestRust_LiteralAndSliceReceiversAreMarked(t *testing.T) {
 			got[cs.Callee] = true
 		}
 	}
-	for _, want := range []string{"<str>.as_bytes", "<slice>.find", "<str>.parse"} {
+	for _, want := range []string{"<str>.as_bytes", "<slice>.find", "<str>.parse", "self.find", "walk_builder()?.build_parallel", "<expr>.path_is_symlink", "<expr>.is_dir"} {
 		if !got[want] {
 			t.Errorf("missing %q in %v", want, got)
 		}

@@ -81,8 +81,9 @@ func joinQualified(qualifier, name string) string {
 		return name
 	}
 	// Identifier tokens can't contain whitespace; reject anything that
-	// slipped through except the deliberate "name()" call-result marker.
-	bare := strings.TrimSuffix(qualifier, "()")
+	// slipped through except the deliberate "name()" call-result marker
+	// (and Rust's "name()?", the result after `?`).
+	bare := strings.TrimSuffix(strings.TrimSuffix(qualifier, "?"), "()")
 	if strings.ContainsAny(bare, " \t\n().") {
 		return name
 	}
@@ -778,7 +779,7 @@ func rustCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 						map[string]string{"field_expression": "field", "scoped_identifier": "name"},
 						map[string]string{"call_expression": "function"})
 					if qual == "" {
-						qual = rustExprReceiver(value)
+						qual = rustExprReceiver(value, src)
 					}
 					return joinQualified(qual, string(field.Content(src)))
 				}
@@ -864,6 +865,8 @@ func rustMacroCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 						qual = rustLastSegment(path[:i])
 					} else if m[0] >= 2 && raw[m[0]-1] == '.' && raw[m[0]-2] == '"' {
 						qual = rustStrReceiver // `"match:fg:magenta".parse()` in vec![...]
+					} else if m[0] >= 1 && raw[m[0]-1] == '.' && rustMacroChainQualifier(text, m[0]) == "" {
+						qual = rustExprReceiverMark // `dents[0].path_is_symlink()`: a method on something
 					} else if q := rustMacroChainQualifier(text, m[0]); q != "" {
 						// `ig.matched("", false).is_ignore()`: the regex
 						// scan (no nested-structure awareness) matches
@@ -1866,11 +1869,12 @@ func findChildByType(n *sitter.Node, typeName string) *sitter.Node {
 // every same-named function and method (ripgrep: "test".as_bytes(),
 // doc[start..].find(...)).
 const (
-	rustStrReceiver   = "<str>"
-	rustSliceReceiver = "<slice>"
+	rustStrReceiver      = "<str>"
+	rustSliceReceiver    = "<slice>"
+	rustExprReceiverMark = "<expr>"
 )
 
-func rustExprReceiver(value *sitter.Node) string {
+func rustExprReceiver(value *sitter.Node, src []byte) string {
 	if value == nil {
 		return ""
 	}
@@ -1881,6 +1885,30 @@ func rustExprReceiver(value *sitter.Node) string {
 		if internalast.FindChildByType(value, "range_expression") != nil {
 			return rustSliceReceiver
 		}
+		return rustExprReceiverMark
+	case "try_expression":
+		// `args.walk_builder()?.build_parallel()`: the receiver is the
+		// call's result after `?`, written "walk_builder()?".
+		if inner := value.NamedChild(0); inner != nil && inner.Type() == "call_expression" {
+			if fn := inner.ChildByFieldName("function"); fn != nil {
+				name := fn.Content(src)
+				if i := strings.LastIndexAny(name, ".:"); i >= 0 {
+					name = name[i+1:]
+				}
+				if name != "" {
+					return name + "()?" // the `?` unwraps its Result/Option
+				}
+			}
+		}
+	case "parenthesized_expression", "unary_expression", "reference_expression":
+		// `(*self).find(..)`, `(**self).begin(..)`: a dereferenced self
+		// is self (ripgrep's blanket impls forward this way).
+		inner := strings.TrimLeft(strings.Trim(strings.TrimSpace(value.Content(src)), "()"), "*& ")
+		if inner == "self" {
+			return "self"
+		}
 	}
-	return ""
+	// Any other expression receiver (`x()?.m()`, `(a + b).m()`): a method
+	// call on a value of unknown type — never a bare call to a function.
+	return rustExprReceiverMark
 }
