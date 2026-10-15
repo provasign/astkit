@@ -44,3 +44,23 @@ func TestCallSitesCarryTheNameColumn(t *testing.T) {
 		}
 	}
 }
+
+// A TS receiver behind a non-null assertion or parentheses is kept, and a
+// receiver no name describes is "<expr>": neither is a bare call.
+func TestTSCallReceiversThroughNonNullAndSubscript(t *testing.T) {
+	src := "class S {\n  f() {\n    this.m.get(1)!.createChild(2);\n    (this.x).run();\n    this.clients[3].close(true);\n  }\n}\n"
+	syms, _ := extract(t, astkit.LangTypeScript, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		if s.QualifiedName == "S.f" {
+			for _, cs := range s.CallSites {
+				got[cs.Callee] = true
+			}
+		}
+	}
+	for _, want := range []string{"get().createChild", "x.run", "<expr>.close"} {
+		if !got[want] {
+			t.Errorf("missing call site %q in %v", want, got)
+		}
+	}
+}

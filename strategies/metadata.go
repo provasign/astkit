@@ -444,13 +444,26 @@ func jsCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			case "member_expression":
 				prop := fn.ChildByFieldName("property")
 				if prop != nil {
-					qual := qualifierName(fn.ChildByFieldName("object"), src,
+					// `x!.m()` and `(x).m()` call m on x: a non-null
+					// assertion or parentheses lost the receiver, and the
+					// call read as a bare m() (socket.io
+					// this.parentNsps.get(v)!.createChild(name)).
+					obj := fn.ChildByFieldName("object")
+					for obj != nil && (obj.Type() == "non_null_expression" || obj.Type() == "parenthesized_expression") && obj.NamedChildCount() > 0 {
+						obj = obj.NamedChild(0)
+					}
+					qual := qualifierName(obj, src,
 						[]string{"identifier", "property_identifier", "this", "super"},
 						map[string]string{"member_expression": "property"},
 						map[string]string{
 							"call_expression": "function",
 							"new_expression":  "constructor",
 						})
+					if qual == "" && obj != nil {
+						// A receiver no name describes (this.clients[id].close()):
+						// untyped, but never a bare call.
+						qual = "<expr>"
+					}
 					return joinQualified(qual, string(prop.Content(src)))
 				}
 			}
