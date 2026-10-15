@@ -44,3 +44,62 @@ func TestCallSitesCarryTheNameColumn(t *testing.T) {
 		}
 	}
 }
+
+// A TS receiver behind a non-null assertion or parentheses is kept, and a
+// receiver no name describes is "<expr>": neither is a bare call.
+func TestTSCallReceiversThroughNonNullAndSubscript(t *testing.T) {
+	src := "class S {\n  f() {\n    this.m.get(1)!.createChild(2);\n    (this.x).run();\n    this.clients[3].close(true);\n  }\n}\n"
+	syms, _ := extract(t, astkit.LangTypeScript, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		if s.QualifiedName == "S.f" {
+			for _, cs := range s.CallSites {
+				got[cs.Callee] = true
+			}
+		}
+	}
+	for _, want := range []string{"get().createChild", "x.run", "<expr>.close"} {
+		if !got[want] {
+			t.Errorf("missing call site %q in %v", want, got)
+		}
+	}
+}
+
+// C#: x!.M() keeps its receiver; a?.M() is a call with receiver a.
+func TestCSharpNullForgivingAndConditionalAccess(t *testing.T) {
+	src := "class S {\n  void F() {\n    TraceWriter!.Trace(1);\n    ((JObject?)Parent)?.Changed(this);\n    item?.Run();\n  }\n}\n"
+	syms, _ := extract(t, astkit.LangCSharp, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		if s.Name == "F" {
+			for _, cs := range s.CallSites {
+				got[cs.Callee] = true
+			}
+		}
+	}
+	for _, want := range []string{"TraceWriter.Trace", "JObject.Changed", "item.Run"} {
+		if !got[want] {
+			t.Errorf("missing call site %q in %v", want, got)
+		}
+	}
+}
+
+// Objective-C: dot syntax sends the accessor (setter on assignment), a C
+// function call in a method is a call, and a macro body's message sends
+// are its calls.
+func TestObjCPropertyAccessCFunctionsAndMacroSends(t *testing.T) {
+	src := "#define ASSERT_Q() NSAssert(![self isOnQueue], @\"x\")\n" +
+		"@implementation L\n- (void)run {\n  dispatch_sync(self.loggerQueue, nil);\n  self.error = nil;\n  size_t n = DDDefault();\n}\n@end\n"
+	syms, _ := extract(t, astkit.LangObjC, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[s.Name+" "+cs.Callee] = true
+		}
+	}
+	for _, want := range []string{"run self.loggerQueue", "run self.setError:", "run DDDefault", "ASSERT_Q self.isOnQueue"} {
+		if !got[want] {
+			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+}

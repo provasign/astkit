@@ -32,6 +32,26 @@ func fillCallColumns(lang string, syms []Symbol, src []byte) {
 		line int
 		name string
 	}
+	// A declaration's own name ("public int walk(int n)") reads like a call;
+	// a call on the same line ("... : walk(n - 1)") must not take its
+	// column. Each symbol's first name occurrence from its start line is
+	// its declaration.
+	declared := map[[2]int]bool{}
+	for i := range syms {
+		if syms[i].Name == "" || syms[i].Span.Start <= 0 {
+			continue
+		}
+		end := syms[i].Span.End
+		if end < syms[i].Span.Start || end > syms[i].Span.Start+30 {
+			end = syms[i].Span.Start + 30
+		}
+		for ln := syms[i].Span.Start; ln <= end; ln++ {
+			if cols := nameColumns(lineOf(ln), syms[i].Name); len(cols) > 0 {
+				declared[[2]int{ln, cols[0]}] = true
+				break
+			}
+		}
+	}
 	cache := map[key][]int{}
 	used := map[key]int{}
 	for i := range syms {
@@ -52,7 +72,11 @@ func fillCallColumns(lang string, syms []Symbol, src []byte) {
 			k := key{cs.Line, name}
 			cols, ok := cache[k]
 			if !ok {
-				cols = nameColumns(lineOf(cs.Line), name)
+				for _, c := range nameColumns(lineOf(cs.Line), name) {
+					if !declared[[2]int{cs.Line, c}] {
+						cols = append(cols, c)
+					}
+				}
 				cache[k] = cols
 			}
 			if n := used[k]; n < len(cols) {

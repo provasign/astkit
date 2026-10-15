@@ -306,6 +306,57 @@ func argToken(c *sitter.Node, src []byte) string {
 		return "#lambda"
 	case "method_reference", "arrow_function", "lambda":
 		return "#lambda"
+	case "parenthesized_expression":
+		if c.NamedChildCount() == 1 {
+			return argToken(c.NamedChild(0), src)
+		}
+	case "postfix_unary_expression":
+		// C# null-forgiving `x!` is x.
+		if c.NamedChildCount() == 1 && strings.HasSuffix(strings.TrimSpace(string(c.Content(src))), "!") {
+			return argToken(c.NamedChild(0), src)
+		}
+	case "binary_expression":
+		// C#: `"#" + hex` is a string whenever either operand is one.
+		if op := c.ChildByFieldName("operator"); op != nil && string(op.Content(src)) == "+" {
+			l, r := c.ChildByFieldName("left"), c.ChildByFieldName("right")
+			if l != nil && argToken(l, src) == "#String" || r != nil && argToken(r, src) == "#String" {
+				return "#String"
+			}
+		}
+	case "array_creation_expression":
+		// C#: `new byte[] {...}` / `new JToken[n]`.
+		if t := c.ChildByFieldName("type"); t != nil {
+			typ := strings.TrimSpace(string(t.Content(src)))
+			if i := strings.IndexByte(typ, '['); i > 0 {
+				return "#" + strings.TrimSpace(typ[:i]) + "[]"
+			}
+		}
+	case "typeof_expression":
+		return "#Type"
+	case "invocation_expression":
+		// C#: x.ToString() is a string; another call is typed by the
+		// called method's declared return type, which a consumer resolves.
+		if fn := c.ChildByFieldName("function"); fn != nil {
+			name := ""
+			switch fn.Type() {
+			case "identifier":
+				name = string(fn.Content(src))
+			case "member_access_expression":
+				if n := fn.ChildByFieldName("name"); n != nil {
+					name = string(n.Content(src))
+				}
+			case "generic_name":
+				if fn.NamedChildCount() > 0 {
+					name = string(fn.NamedChild(0).Content(src))
+				}
+			}
+			if name == "ToString" {
+				return "#String"
+			}
+			if name != "" {
+				return "call:" + name
+			}
+		}
 	case "method_invocation", "call_expression", "call":
 		// Consumers can resolve the called function's return type.
 		if n := c.ChildByFieldName("name"); n != nil {
@@ -444,13 +495,26 @@ func jsCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 			case "member_expression":
 				prop := fn.ChildByFieldName("property")
 				if prop != nil {
-					qual := qualifierName(fn.ChildByFieldName("object"), src,
+					// `x!.m()` and `(x).m()` call m on x: a non-null
+					// assertion or parentheses lost the receiver, and the
+					// call read as a bare m() (socket.io
+					// this.parentNsps.get(v)!.createChild(name)).
+					obj := fn.ChildByFieldName("object")
+					for obj != nil && (obj.Type() == "non_null_expression" || obj.Type() == "parenthesized_expression") && obj.NamedChildCount() > 0 {
+						obj = obj.NamedChild(0)
+					}
+					qual := qualifierName(obj, src,
 						[]string{"identifier", "property_identifier", "this", "super"},
 						map[string]string{"member_expression": "property"},
 						map[string]string{
 							"call_expression": "function",
 							"new_expression":  "constructor",
 						})
+					if qual == "" && obj != nil {
+						// A receiver no name describes (this.clients[id].close()):
+						// untyped, but never a bare call.
+						qual = "<expr>"
+					}
 					return joinQualified(qual, string(prop.Content(src)))
 				}
 			}
@@ -1055,6 +1119,21 @@ func sharedNavCallSites(body *sitter.Node, src []byte, labelArgs bool) []astkit.
 			}
 			return
 		}
+		if n.Type() == "constructor_expression" {
+			// `Storage<File>(path: p)`: a generic type's initializer is a
+			// constructor_expression, not a call_expression (Files).
+			if t := n.ChildByFieldName("constructed_type"); t != nil {
+				if id := internalast.FindChildByType(t, "type_identifier"); id != nil {
+					out = append(out, astkit.CallSite{
+						Callee: id.Content(src),
+						Line:   int(n.StartPoint().Row) + 1,
+						Argc:   navCallArgc(n),
+						Args:   navCallArgs(n, src, labelArgs),
+					})
+				}
+			}
+			return
+		}
 		if n.Type() != "call_expression" || n.NamedChildCount() < 1 {
 			return
 		}
@@ -1241,7 +1320,7 @@ func navIsSubscript(call *sitter.Node, src []byte) bool {
 func navCallArguments(call *sitter.Node) *sitter.Node {
 	for i := 0; i < int(call.ChildCount()); i++ {
 		c := call.Child(i)
-		if c != nil && c.Type() == "call_suffix" {
+		if c != nil && (c.Type() == "call_suffix" || c.Type() == "constructor_suffix") {
 			return internalast.FindChildByType(c, "value_arguments")
 		}
 	}
@@ -1413,7 +1492,28 @@ func objcCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	}
 	var out []astkit.CallSite
 	internalast.WalkTree(body, func(n *sitter.Node) {
-		if n == nil || n.Type() != "message_expression" {
+		if n == nil {
+			return
+		}
+		switch n.Type() {
+		case "call_expression":
+			// A C function called from a method body
+			// (DDGetDefaultBufferSizeBytes()).
+			if fn := n.ChildByFieldName("function"); fn != nil && fn.Type() == "identifier" {
+				out = append(out, astkit.CallSite{Callee: fn.Content(src), Line: int(n.StartPoint().Row) + 1,
+					Argc: callArgc(n), Args: callArgs(n, src)})
+			}
+			return
+		case "field_expression":
+			// Dot syntax sends the property's accessor: `self.loggerQueue`
+			// the getter, `obj.error = e` the setter (clang records both;
+			// Grove links only accessors the project implements).
+			if cs, ok := objcPropertyAccess(n, src); ok {
+				out = append(out, cs)
+			}
+			return
+		case "message_expression":
+		default:
 			return
 		}
 		sel := objcCallSelector(n, src)
@@ -1442,6 +1542,48 @@ func objcCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 		})
 	})
 	return out
+}
+
+// objcPropertyAccess reads `base.prop` (base an identifier) as the getter
+// send, or as `setProp:` when it is an assignment's target. A field
+// expression that is a message receiver or a called function is not an
+// access of its own.
+func objcPropertyAccess(n *sitter.Node, src []byte) (astkit.CallSite, bool) {
+	if n.NamedChildCount() < 2 {
+		return astkit.CallSite{}, false
+	}
+	base, field := n.NamedChild(0), n.NamedChild(1)
+	if base == nil || field == nil || base.Type() != "identifier" || field.Type() != "field_identifier" {
+		return astkit.CallSite{}, false
+	}
+	if strings.Contains(string(src[n.StartByte():n.EndByte()]), "->") {
+		return astkit.CallSite{}, false // ivar access, not a property
+	}
+	parent := n.Parent()
+	if parent != nil {
+		switch parent.Type() {
+		case "message_expression":
+			if r := parent.ChildByFieldName("receiver"); r != nil && r.StartByte() == n.StartByte() && r.EndByte() == n.EndByte() {
+				return astkit.CallSite{}, false
+			}
+		case "call_expression":
+			if f := parent.ChildByFieldName("function"); f != nil && f.StartByte() == n.StartByte() {
+				return astkit.CallSite{}, false
+			}
+		}
+	}
+	name := field.Content(src)
+	line := int(n.StartPoint().Row) + 1
+	if parent != nil && parent.Type() == "assignment_expression" {
+		if l := parent.ChildByFieldName("left"); l != nil && l.StartByte() == n.StartByte() && l.EndByte() == n.EndByte() {
+			op := parent.ChildByFieldName("operator")
+			if op == nil || op.Content(src) == "=" {
+				setter := "set" + strings.ToUpper(name[:1]) + name[1:] + ":"
+				return astkit.CallSite{Callee: joinQualified(base.Content(src), setter), Line: line, Argc: 1}, true
+			}
+		}
+	}
+	return astkit.CallSite{Callee: joinQualified(base.Content(src), name), Line: line}, true
 }
 
 // objcReceiverQualifier reduces a message send's receiver to one identifier:
