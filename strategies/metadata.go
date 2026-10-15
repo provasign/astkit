@@ -378,6 +378,13 @@ func argToken(c *sitter.Node, src []byte) string {
 				return "#" + strings.TrimSpace(typ[:i]) + "[]"
 			}
 		}
+	case "implicit_array_creation_expression":
+		// C#: new[] { "a", "b" } is a string[]: the first element's type.
+		if init := internalast.FindChildByType(c, "initializer_expression"); init != nil && init.NamedChildCount() > 0 {
+			if t := argToken(init.NamedChild(0), src); strings.HasPrefix(t, "#") && !strings.HasSuffix(t, "[]") && t != "#lambda" {
+				return t + "[]"
+			}
+		}
 	case "typeof_expression":
 		return "#Type"
 	case "invocation_expression":
