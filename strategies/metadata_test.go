@@ -662,6 +662,8 @@ func TestCSharp_CallSiteTypedConstantArgs(t *testing.T) {
     W(nameof(F));
     W(new[] { "a", "b" });
     W(new[] { 1, 2 });
+    W(string.Join(",", xs));
+    W(int.Parse(s));
   }
 }`
 	syms, _ := extract(t, astkit.LangCSharp, src)
@@ -673,7 +675,7 @@ func TestCSharp_CallSiteTypedConstantArgs(t *testing.T) {
 			}
 		}
 	}
-	want := []string{"#double", "#decimal", "#uint", "#ulong", "#long", "#DateTime", "#int", "#double", "#Guid", "#String", "#TimeSpan", "#Uri", "#boolean", "#boolean", "#String", "#String[]", "#int[]"}
+	want := []string{"#double", "#decimal", "#uint", "#ulong", "#long", "#DateTime", "#int", "#double", "#Guid", "#String", "#TimeSpan", "#Uri", "#boolean", "#boolean", "#String", "#String[]", "#int[]", "#String", ""}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("args\n got %v\nwant %v", got, want)
 	}
@@ -1544,6 +1546,65 @@ func TestRust_LiteralAndSliceReceiversAreMarked(t *testing.T) {
 	for _, want := range []string{"<str>.as_bytes", "<slice>.find", "<str>.parse", "self.find", "walk_builder()?.build_parallel", "<expr>.path_is_symlink", "<expr>.is_dir"} {
 		if !got[want] {
 			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+}
+
+// Receivers that are not a plain variable: a clone keeps its operand's
+// name, a construction names its class, anything else is "<expr>" (never
+// a bare function call).
+func TestPHP_UnnamedReceivers(t *testing.T) {
+	src := `<?php
+class T {
+  function run($b, $xs) {
+    (clone $b)->makePublic();
+    (new Foo())->bar();
+    $xs[0]->baz();
+  }
+}`
+	syms, _ := extract(t, astkit.LangPHP, src)
+	for _, sym := range syms {
+		if sym.Name != "run" {
+			continue
+		}
+		var got []string
+		for _, cs := range sym.CallSites {
+			got = append(got, cs.Callee)
+		}
+		want := map[string]bool{"b.makePublic": true, "Foo.bar": true, "<expr>.baz": true}
+		for _, g := range got {
+			delete(want, g)
+		}
+		if len(want) > 0 {
+			t.Errorf("call sites %v, missing %v", got, want)
+		}
+	}
+}
+
+// Iterating an object calls its getIterator (or Iterator protocol): the
+// sites carry the iterated receiver and sit after the expression.
+func TestPHP_IterationSites(t *testing.T) {
+	src := `<?php
+class T {
+  function run($rs) {
+    foreach ($rs as $row) {}
+    $all = [...$this->stmt->process($rs)];
+  }
+}`
+	syms, _ := extract(t, astkit.LangPHP, src)
+	for _, sym := range syms {
+		if sym.Name != "run" {
+			continue
+		}
+		got := map[string]int{}
+		for _, cs := range sym.CallSites {
+			got[cs.Callee] = cs.Col
+		}
+		if c, ok := got["rs.getIterator"]; !ok || c != 17 {
+			t.Errorf("foreach site: %v", got)
+		}
+		if _, ok := got["process().current"]; !ok {
+			t.Errorf("unpacking site: %v", got)
 		}
 	}
 }

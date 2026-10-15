@@ -399,6 +399,14 @@ func argToken(c *sitter.Node, src []byte) string {
 				if n := fn.ChildByFieldName("name"); n != nil {
 					name = string(n.Content(src))
 				}
+				if e := fn.ChildByFieldName("expression"); e != nil && e.Type() == "predefined_type" {
+					// string.Join(..) is the runtime's, never a project
+					// method of that name.
+					if name == "ToString" || string(e.Content(src)) == "string" && (name == "Join" || name == "Format" || name == "Concat") {
+						return "#String"
+					}
+					return ""
+				}
 			case "generic_name":
 				if fn.NamedChildCount() > 0 {
 					name = string(fn.NamedChild(0).Content(src))

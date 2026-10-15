@@ -5186,6 +5186,54 @@ func phpFuncSym(n *sitter.Node, filePath, blobSHA string, src []byte, imports []
 // ($repo->save → "repo.save", $this->run → "this.run") so the graph layer
 // can narrow by the receiver's inferred type instead of name alone.
 func phpCallSites(decl *sitter.Node, src []byte, parentClass string) []astkit.CallSite {
+	return append(phpExplicitCallSites(decl, src, parentClass), phpIterationSites(decl, src)...)
+}
+
+// phpIteratorMethods are the methods iterating an object runs: an
+// IteratorAggregate's getIterator, or an Iterator's protocol. Which ones a
+// receiver's class defines is the consumer's to resolve.
+var phpIteratorMethods = []string{"getIterator", "rewind", "valid", "current", "key", "next"}
+
+// phpIterationSites records the calls `foreach ($x as ..)` and `...$x`
+// unpacking make on $x. They sit at the end of the iterated expression
+// (the column where `->getIterator()` would be written); the expression's
+// receiver qualifies them exactly as an explicit call would.
+func phpIterationSites(decl *sitter.Node, src []byte) []astkit.CallSite {
+	var out []astkit.CallSite
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		var expr *sitter.Node
+		switch n.Type() {
+		case "foreach_statement":
+			if n.NamedChildCount() > 0 {
+				expr = n.NamedChild(0)
+			}
+		case "variadic_unpacking":
+			if n.NamedChildCount() == 1 {
+				expr = n.NamedChild(0)
+			}
+		}
+		if expr != nil {
+			qual := phpReceiverName(expr, src)
+			if qual != "" && qual != "this" {
+				end := expr.EndPoint()
+				for _, m := range phpIteratorMethods {
+					out = append(out, astkit.CallSite{Callee: qual + "." + m, Line: int(end.Row) + 1, Col: int(end.Column) + 1})
+				}
+			}
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(decl)
+	return out
+}
+
+func phpExplicitCallSites(decl *sitter.Node, src []byte, parentClass string) []astkit.CallSite {
 	return collectCallSites(decl, src, callSpec{
 		nodeTypes: []string{
 			"function_call_expression", "member_call_expression",
@@ -5205,7 +5253,13 @@ func phpCallSites(decl *sitter.Node, src []byte, parentClass string) []astkit.Ca
 				if name == nil {
 					return ""
 				}
-				qual := phpReceiverName(call.ChildByFieldName("object"), src)
+				obj := call.ChildByFieldName("object")
+				qual := phpReceiverName(obj, src)
+				if qual == "" && obj != nil {
+					// A receiver no name describes ($a[0]->m(), (fn())->m()):
+					// never a bare function call.
+					qual = "<expr>"
+				}
 				return joinQualified(qual, name.Content(src))
 			case "scoped_call_expression":
 				name := call.ChildByFieldName("name")
@@ -5231,6 +5285,14 @@ func phpReceiverName(obj *sitter.Node, src []byte) string {
 	switch obj.Type() {
 	case "variable_name":
 		return strings.TrimPrefix(obj.Content(src), "$")
+	case "parenthesized_expression", "clone_expression":
+		// (clone $builder)->m(): a clone has its operand's class.
+		if obj.NamedChildCount() == 1 {
+			return phpReceiverName(obj.NamedChild(0), src)
+		}
+	case "object_creation_expression":
+		// (new Foo())->m(): the receiver's class is named.
+		return phpNewClassName(obj, src, "")
 	case "member_access_expression":
 		if f := obj.ChildByFieldName("name"); f != nil {
 			return f.Content(src)
