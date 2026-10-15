@@ -1119,6 +1119,21 @@ func sharedNavCallSites(body *sitter.Node, src []byte, labelArgs bool) []astkit.
 			}
 			return
 		}
+		if n.Type() == "constructor_expression" {
+			// `Storage<File>(path: p)`: a generic type's initializer is a
+			// constructor_expression, not a call_expression (Files).
+			if t := n.ChildByFieldName("constructed_type"); t != nil {
+				if id := internalast.FindChildByType(t, "type_identifier"); id != nil {
+					out = append(out, astkit.CallSite{
+						Callee: id.Content(src),
+						Line:   int(n.StartPoint().Row) + 1,
+						Argc:   navCallArgc(n),
+						Args:   navCallArgs(n, src, labelArgs),
+					})
+				}
+			}
+			return
+		}
 		if n.Type() != "call_expression" || n.NamedChildCount() < 1 {
 			return
 		}
@@ -1305,7 +1320,7 @@ func navIsSubscript(call *sitter.Node, src []byte) bool {
 func navCallArguments(call *sitter.Node) *sitter.Node {
 	for i := 0; i < int(call.ChildCount()); i++ {
 		c := call.Child(i)
-		if c != nil && c.Type() == "call_suffix" {
+		if c != nil && (c.Type() == "call_suffix" || c.Type() == "constructor_suffix") {
 			return internalast.FindChildByType(c, "value_arguments")
 		}
 	}
