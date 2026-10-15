@@ -83,3 +83,23 @@ func TestCSharpNullForgivingAndConditionalAccess(t *testing.T) {
 		}
 	}
 }
+
+// Objective-C: dot syntax sends the accessor (setter on assignment), a C
+// function call in a method is a call, and a macro body's message sends
+// are its calls.
+func TestObjCPropertyAccessCFunctionsAndMacroSends(t *testing.T) {
+	src := "#define ASSERT_Q() NSAssert(![self isOnQueue], @\"x\")\n" +
+		"@implementation L\n- (void)run {\n  dispatch_sync(self.loggerQueue, nil);\n  self.error = nil;\n  size_t n = DDDefault();\n}\n@end\n"
+	syms, _ := extract(t, astkit.LangObjC, src)
+	got := map[string]bool{}
+	for _, s := range syms {
+		for _, cs := range s.CallSites {
+			got[s.Name+" "+cs.Callee] = true
+		}
+	}
+	for _, want := range []string{"run self.loggerQueue", "run self.setError:", "run DDDefault", "ASSERT_Q self.isOnQueue"} {
+		if !got[want] {
+			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+}

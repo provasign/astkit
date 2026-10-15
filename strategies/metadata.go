@@ -1477,7 +1477,28 @@ func objcCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 	}
 	var out []astkit.CallSite
 	internalast.WalkTree(body, func(n *sitter.Node) {
-		if n == nil || n.Type() != "message_expression" {
+		if n == nil {
+			return
+		}
+		switch n.Type() {
+		case "call_expression":
+			// A C function called from a method body
+			// (DDGetDefaultBufferSizeBytes()).
+			if fn := n.ChildByFieldName("function"); fn != nil && fn.Type() == "identifier" {
+				out = append(out, astkit.CallSite{Callee: fn.Content(src), Line: int(n.StartPoint().Row) + 1,
+					Argc: callArgc(n), Args: callArgs(n, src)})
+			}
+			return
+		case "field_expression":
+			// Dot syntax sends the property's accessor: `self.loggerQueue`
+			// the getter, `obj.error = e` the setter (clang records both;
+			// Grove links only accessors the project implements).
+			if cs, ok := objcPropertyAccess(n, src); ok {
+				out = append(out, cs)
+			}
+			return
+		case "message_expression":
+		default:
 			return
 		}
 		sel := objcCallSelector(n, src)
@@ -1506,6 +1527,48 @@ func objcCallSites(body *sitter.Node, src []byte) []astkit.CallSite {
 		})
 	})
 	return out
+}
+
+// objcPropertyAccess reads `base.prop` (base an identifier) as the getter
+// send, or as `setProp:` when it is an assignment's target. A field
+// expression that is a message receiver or a called function is not an
+// access of its own.
+func objcPropertyAccess(n *sitter.Node, src []byte) (astkit.CallSite, bool) {
+	if n.NamedChildCount() < 2 {
+		return astkit.CallSite{}, false
+	}
+	base, field := n.NamedChild(0), n.NamedChild(1)
+	if base == nil || field == nil || base.Type() != "identifier" || field.Type() != "field_identifier" {
+		return astkit.CallSite{}, false
+	}
+	if strings.Contains(string(src[n.StartByte():n.EndByte()]), "->") {
+		return astkit.CallSite{}, false // ivar access, not a property
+	}
+	parent := n.Parent()
+	if parent != nil {
+		switch parent.Type() {
+		case "message_expression":
+			if r := parent.ChildByFieldName("receiver"); r != nil && r.StartByte() == n.StartByte() && r.EndByte() == n.EndByte() {
+				return astkit.CallSite{}, false
+			}
+		case "call_expression":
+			if f := parent.ChildByFieldName("function"); f != nil && f.StartByte() == n.StartByte() {
+				return astkit.CallSite{}, false
+			}
+		}
+	}
+	name := field.Content(src)
+	line := int(n.StartPoint().Row) + 1
+	if parent != nil && parent.Type() == "assignment_expression" {
+		if l := parent.ChildByFieldName("left"); l != nil && l.StartByte() == n.StartByte() && l.EndByte() == n.EndByte() {
+			op := parent.ChildByFieldName("operator")
+			if op == nil || op.Content(src) == "=" {
+				setter := "set" + strings.ToUpper(name[:1]) + name[1:] + ":"
+				return astkit.CallSite{Callee: joinQualified(base.Content(src), setter), Line: line, Argc: 1}, true
+			}
+		}
+	}
+	return astkit.CallSite{Callee: joinQualified(base.Content(src), name), Line: line}, true
 }
 
 // objcReceiverQualifier reduces a message send's receiver to one identifier:

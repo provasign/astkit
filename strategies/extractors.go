@@ -2931,12 +2931,75 @@ func cMacroSymbol(name string, paramsNode *sitter.Node, body, raw string, span a
 			Callee: callee, Line: span.Start, Argc: argc, Args: args,
 		})
 	}
+	if language == "objc" {
+		// Message sends in the body run in every expansion
+		// (DDAbstractLoggerAssertNotOnGlobalLoggingQueue() sends
+		// [self isOnGlobalLoggingQueue], CocoaLumberjack).
+		sites = append(sites, objcMacroSends(code, span.Start)...)
+	}
 	sig := "#define " + name + params
 	return &astkit.Symbol{
 		Kind: astkit.KindMacro, Name: name, QualifiedName: name, Signature: sig,
 		Span: span, Exported: true, Body: raw,
 		CallSites: sites,
 	}
+}
+
+// objcMacroSends reads `[receiver selector...]` sends from a masked macro
+// body: the receiver is an identifier, the selector its keyword parts
+// (`log:message:`) or one unary name.
+func objcMacroSends(code string, line int) []astkit.CallSite {
+	var out []astkit.CallSite
+	isIdent := func(b byte) bool { return b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' }
+	for i := 0; i < len(code); i++ {
+		if code[i] != '[' {
+			continue
+		}
+		j := i + 1
+		for j < len(code) && (code[j] == ' ' || code[j] == '\t') {
+			j++
+		}
+		rs := j
+		for j < len(code) && isIdent(code[j]) {
+			j++
+		}
+		if j == rs || code[rs] >= '0' && code[rs] <= '9' || j >= len(code) || code[j] != ' ' && code[j] != '\t' {
+			continue // not `[ident ...`
+		}
+		recv := code[rs:j]
+		depth, k := 1, j
+		var parts []string
+		unary := ""
+		for ; k < len(code) && depth > 0; k++ {
+			switch c := code[k]; {
+			case c == '[' || c == '(':
+				depth++
+			case c == ']' || c == ')':
+				depth--
+			case depth == 1 && isIdent(c) && (k == 0 || !isIdent(code[k-1])):
+				e := k
+				for e < len(code) && isIdent(code[e]) {
+					e++
+				}
+				word := code[k:e]
+				if e < len(code) && code[e] == ':' {
+					parts = append(parts, word+":")
+				} else if len(parts) == 0 && unary == "" {
+					unary = word
+				}
+				k = e - 1
+			}
+		}
+		sel := strings.Join(parts, "")
+		if sel == "" {
+			sel = unary
+		}
+		if sel == "" || depth != 0 {
+			continue
+		}
+		out = append(out, astkit.CallSite{Callee: recv + "." + sel, Line: line, Argc: len(parts)})
+	}
+	return out
 }
 
 // cMacroArgs tokenizes the argument list opening at body[open]: an
