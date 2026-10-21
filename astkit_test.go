@@ -14,6 +14,10 @@ func TestDetectLanguage(t *testing.T) {
 	cases := map[string]astkit.LanguageKey{
 		"a.go":        astkit.LangGo,
 		"a.ts":        astkit.LangTypeScript,
+		"a.mts":       astkit.LangTypeScript,
+		"a.cts":       astkit.LangTypeScript,
+		"a.d.mts":     astkit.LangTypeScript,
+		"A.CTS":       astkit.LangTypeScript,
 		"a.tsx":       astkit.LangTSX,
 		"a.js":        astkit.LangJavaScript,
 		"a.jsx":       astkit.LangJavaScript,
