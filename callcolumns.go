@@ -13,20 +13,32 @@ import (
 // masked) as an identifier followed by "(", "<" (type arguments) or "!" (a
 // Rust macro). Several same-named calls on one line take the occurrences
 // in order. A site whose name cannot be found keeps 0 (unknown).
+//
+// Matching runs on the masked text, but the column counts characters in the
+// original line: masking keeps byte offsets yet turns a multibyte character
+// into several single-byte blanks, so counting the masked prefix would
+// overstate the column.
 func fillCallColumns(lang string, syms []Symbol, src []byte) {
-	text := string(src)
+	orig := string(src)
+	text := orig
 	if textmask.Supported(lang) {
 		text = textmask.MaskFile(lang, text)
 	}
-	var lines []string
-	lineOf := func(n int) string {
+	var lines, origLines []string
+	lineOf := func(n int) (string, string) {
 		if lines == nil {
 			lines = strings.Split(text, "\n")
+			origLines = strings.Split(orig, "\n")
 		}
 		if n < 1 || n > len(lines) {
-			return ""
+			return "", ""
 		}
-		return lines[n-1]
+		if n > len(origLines) || len(origLines[n-1]) != len(lines[n-1]) {
+			// Masking changed the line's length; fall back to the masked
+			// line, whose prefix is then the best available count.
+			return lines[n-1], lines[n-1]
+		}
+		return lines[n-1], origLines[n-1]
 	}
 	type key struct {
 		line int
@@ -46,7 +58,8 @@ func fillCallColumns(lang string, syms []Symbol, src []byte) {
 			end = syms[i].Span.Start + 30
 		}
 		for ln := syms[i].Span.Start; ln <= end; ln++ {
-			if cols := nameColumns(lineOf(ln), syms[i].Name); len(cols) > 0 {
+			masked, line := lineOf(ln)
+			if cols := nameColumns(masked, line, syms[i].Name); len(cols) > 0 {
 				declared[[2]int{ln, cols[0]}] = true
 				break
 			}
@@ -72,7 +85,8 @@ func fillCallColumns(lang string, syms []Symbol, src []byte) {
 			k := key{cs.Line, name}
 			cols, ok := cache[k]
 			if !ok {
-				for _, c := range nameColumns(lineOf(cs.Line), name) {
+				masked, line := lineOf(cs.Line)
+				for _, c := range nameColumns(masked, line, name) {
 					if !declared[[2]int{cs.Line, c}] {
 						cols = append(cols, c)
 					}
@@ -87,9 +101,10 @@ func fillCallColumns(lang string, syms []Symbol, src []byte) {
 	}
 }
 
-// nameColumns returns the 1-based character columns where name occurs in
-// line as a called identifier.
-func nameColumns(line, name string) []int {
+// nameColumns returns the 1-based character columns where name occurs as a
+// called identifier. It searches masked (comments and strings blanked, same
+// byte length as orig) and counts characters in orig, the source line.
+func nameColumns(line, orig, name string) []int {
 	var out []int
 	for start := 0; ; {
 		i := strings.Index(line[start:], name)
@@ -106,7 +121,7 @@ func nameColumns(line, name string) []int {
 		if rest == "" || !strings.ContainsRune("(<!", rune(rest[0])) {
 			continue
 		}
-		out = append(out, utf8.RuneCountInString(line[:at])+1)
+		out = append(out, utf8.RuneCountInString(orig[:at])+1)
 	}
 }
 

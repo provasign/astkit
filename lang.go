@@ -123,7 +123,7 @@ func DetectLanguage(path, content string) LanguageKey {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".go":
 		return LangGo
-	case ".ts":
+	case ".ts", ".mts", ".cts":
 		return LangTypeScript
 	case ".tsx":
 		return LangTSX

@@ -1,7 +1,9 @@
 package strategies_test
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/provasign/astkit"
 )
@@ -42,6 +44,62 @@ func TestCallSitesCarryTheNameColumn(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A column counts characters of the source line, not bytes: a multibyte or
+// non-BMP character in a string or comment before the call (blanked byte
+// for byte by masking) counts once. Each fixture's last line holds f's body,
+// and every "g(" on it outside strings and comments is a call to g.
+func TestCallColumnsCountCharactersBeforeTheCall(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		lang astkit.LanguageKey
+		src  string
+	}{
+		{"go string", astkit.LangGo, "package p\nfunc g() {}\nfunc f() { _ = \"é\"; g() }"},
+		{"go rune and comment", astkit.LangGo, "package p\nfunc g() {}\nfunc f() { _ = 'é'; /* ü 🎉 */ g() }"},
+		{"go emoji repeated", astkit.LangGo, "package p\nfunc g() {}\nfunc f() { _ = \"😀é\"; g(); _ = \"🎉\"; g() }"},
+		{"go identifier", astkit.LangGo, "package p\nfunc g() {}\nfunc f() { café := 1; _ = café; g() }"},
+		{"typescript string", astkit.LangTypeScript, "function g() {}\nfunction f() { const s = \"é\"; g(); }"},
+		{"typescript template repeated", astkit.LangTypeScript, "function g() {}\nfunction f() { const s = `🎉 ${1}`; g(); /* é */ g(); }"},
+		{"python string", astkit.LangPython, "def g(): pass\ndef f(): s = \"é\"; g()"},
+		{"python emoji repeated", astkit.LangPython, "def g(): pass\ndef f(): s = \"🎉 ünï\"; g(); t = '😀'; g()"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			syms, _ := extract(t, c.lang, c.src)
+			lines := strings.Split(c.src, "\n")
+			last := lines[len(lines)-1]
+			var want []int
+			for off := 0; ; {
+				i := strings.Index(last[off:], "g(")
+				if i < 0 {
+					break
+				}
+				want = append(want, utf8.RuneCountInString(last[:off+i])+1)
+				off += i + 2
+			}
+			var got []int
+			for _, s := range syms {
+				if s.Name != "f" {
+					continue
+				}
+				for _, cs := range s.CallSites {
+					if cs.Callee == "g" && cs.Line == len(lines) {
+						got = append(got, cs.Col)
+					}
+				}
+			}
+			if len(got) != len(want) {
+				t.Fatalf("columns %v, want %v in %q", got, want, last)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("columns %v, want %v in %q", got, want, last)
+					break
+				}
+			}
+		})
 	}
 }
 

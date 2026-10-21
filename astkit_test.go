@@ -2,6 +2,7 @@ package astkit_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -13,6 +14,10 @@ func TestDetectLanguage(t *testing.T) {
 	cases := map[string]astkit.LanguageKey{
 		"a.go":        astkit.LangGo,
 		"a.ts":        astkit.LangTypeScript,
+		"a.mts":       astkit.LangTypeScript,
+		"a.cts":       astkit.LangTypeScript,
+		"a.d.mts":     astkit.LangTypeScript,
+		"A.CTS":       astkit.LangTypeScript,
 		"a.tsx":       astkit.LangTSX,
 		"a.js":        astkit.LangJavaScript,
 		"a.jsx":       astkit.LangJavaScript,
@@ -158,6 +163,30 @@ func TestEngineValidate(t *testing.T) {
 	}
 	if err := eng.Validate(context.Background(), astkit.LangJSON, []byte("{}")); err != nil {
 		t.Errorf("Validate non-AST returns err: %v", err)
+	}
+}
+
+// Source that parses to a tree with ERROR or MISSING nodes does not
+// validate; the error wraps ErrSyntax and names the first error's position.
+func TestEngineValidateRejectsSyntaxErrors(t *testing.T) {
+	eng := astkit.NewEngine()
+	for _, c := range []struct {
+		lang astkit.LanguageKey
+		src  string
+	}{
+		{astkit.LangGo, "package main\nfunc broken( {\n"},
+		{astkit.LangPython, "def f(:\n    pass\n"},
+		{astkit.LangTypeScript, "function f( {\n"},
+		{astkit.LangJava, "class C { void f() { int x = ; } }\n"},
+	} {
+		err := eng.Validate(context.Background(), c.lang, []byte(c.src))
+		if err == nil {
+			t.Errorf("%s: Validate(%q) = nil, want a syntax error", c.lang, c.src)
+			continue
+		}
+		if !errors.Is(err, astkit.ErrSyntax) {
+			t.Errorf("%s: error %v does not wrap ErrSyntax", c.lang, err)
+		}
 	}
 }
 
