@@ -2,6 +2,7 @@ package astkit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -76,14 +77,48 @@ func (e *Engine) Parse(ctx context.Context, lang LanguageKey, src []byte) (*sitt
 	return tree, nil
 }
 
-// Validate parses src and immediately discards the tree — useful for input
-// validation endpoints.
+// ErrSyntax is wrapped by the error Validate returns for source whose
+// tree contains syntax errors (ERROR or MISSING nodes).
+var ErrSyntax = errors.New("syntax error")
+
+// Validate parses src and discards the tree. It returns the parse error, an
+// error wrapping ErrSyntax (naming the first error's 1-based line and
+// column) when the tree contains syntax errors, or nil. Languages without a
+// grammar (config/data formats) parse to no tree and always validate.
 func (e *Engine) Validate(ctx context.Context, lang LanguageKey, src []byte) error {
 	tree, err := e.Parse(ctx, lang, src)
-	if tree != nil {
-		tree.Close()
+	if err != nil || tree == nil {
+		return err
 	}
-	return err
+	defer tree.Close()
+	root := tree.RootNode()
+	if !root.HasError() {
+		return nil
+	}
+	p := firstSyntaxError(root).StartPoint()
+	return fmt.Errorf("astkit: %s %w at %d:%d", lang, ErrSyntax, p.Row+1, p.Column+1)
+}
+
+// firstSyntaxError returns the first ERROR or MISSING node under n in
+// source order, or n itself when none is found below it.
+func firstSyntaxError(n *sitter.Node) *sitter.Node {
+	for n != nil {
+		if n.IsError() || n.IsMissing() {
+			return n
+		}
+		var next *sitter.Node
+		for i := 0; i < int(n.ChildCount()); i++ {
+			if c := n.Child(i); c != nil && (c.HasError() || c.IsMissing()) {
+				next = c
+				break
+			}
+		}
+		if next == nil {
+			return n
+		}
+		n = next
+	}
+	return n
 }
 
 // treeSitterLanguage maps a LanguageKey to its tree-sitter grammar.
