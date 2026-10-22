@@ -15,7 +15,11 @@ other for parsing.
 - **Language identification** — `LanguageKey` + file-extension detection
   (`DetectLanguage`).
 - **Tree-sitter dispatch** — `Engine.Parse` / `Engine.Validate`, one place
-  for every supported grammar, with a parse timeout.
+  for every supported grammar, with a parse timeout. `Parse` returns
+  tree-sitter's best-effort tree even for broken source; `Validate`
+  (v0.16.10+) returns an error wrapping `ErrSyntax`, naming the first error's
+  1-based line and column, when that tree contains syntax errors. Languages
+  without a grammar (JSON, YAML, TOML) always validate.
 - **Symbol extraction** — a `Registry` of per-language `Strategy`
   implementations emitting `Symbol` (with spans, signatures, receivers,
   call sites) and `ImportStatement`.
@@ -25,6 +29,10 @@ other for parsing.
 | AST extraction | Detection only (no symbols) |
 |---|---|
 | Go, Python, Java, Rust, JavaScript, TypeScript, TSX, C, C++, C#, PHP, Swift, Kotlin, Objective-C, COBOL, JCL | JSON, YAML, TOML |
+
+TypeScript detection covers `.ts`, `.mts` and `.cts` (`.mts`/`.cts` since
+v0.16.10), TSX covers `.tsx`, and JavaScript covers `.js`, `.jsx`, `.mjs`
+and `.cjs`. Extensions are matched case-insensitively.
 
 Swift, Kotlin and Objective-C (v0.13.0+) extract classes, structs, enums,
 protocols/interfaces, extensions, categories, methods, constructors (named
@@ -67,6 +75,10 @@ Each `Symbol` carries its kind (function, method, class, interface, …),
 line spans, declaration signature, receiver/container, and resolved-name
 `CallSite` records — everything a caller needs to build reference graphs
 or structural diffs without touching tree-sitter directly.
+
+`CallSite.Col` is the 1-based character column of the called name, counted
+in the original line, so multibyte text before a call (accented letters,
+emoji in strings or comments) does not shift it (fixed in v0.16.10).
 
 ## Development
 
